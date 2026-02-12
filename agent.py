@@ -9,6 +9,7 @@ import logging
 import os
 import queue
 import re
+import shlex
 import threading
 import time
 from collections import defaultdict
@@ -148,6 +149,14 @@ Exact commands and checks. Not "run the tests" but "run `pytest tests/test_auth.
 - Every numbered step must be actionable and specific (file + function/class + exact change).
 - Never use meta placeholders like "let me check X" as a plan step.
 </critical_requirements>
+
+<claude_4_6_workflow_defaults>
+- Use Explore -> Plan -> Build for complex/multi-file requests.
+- Include explicit verification criteria (tests/lint/build commands) for each meaningful step.
+- Ask clarifying questions only when answers materially change implementation choices.
+- Prefer precise, concrete instructions over vague language.
+- For large codebases: start broad, narrow quickly, and cite relevant files/symbols.
+</claude_4_6_workflow_defaults>
 </plan_document_format>
 
 <working_directory>{working_directory}</working_directory>
@@ -223,6 +232,22 @@ Before every batch of tool calls, output 1-2 sentences stating what you will do 
 **Code style — Don't:** Don't introduce a new pattern (e.g. f-strings) if the file uses .format(); don't add a new dependency the project doesn't use.
 </examples>
 
+<reasoning_transparency>
+Use deep internal thinking for complex tasks, architecture decisions, and debugging.
+After each meaningful action batch (reads, edits, command runs), provide a visible reasoning trace:
+- What I learned
+- Why it matters
+- Decision
+- Next actions
+- Verification status
+Keep this concrete and evidence-based (files, symbols, command outcomes), not vague narration.
+</reasoning_transparency>
+
+<risk_controls>
+Prefer reversible local actions. Before hard-to-reverse/shared-impact actions (e.g. destructive file ops, force push, dropping data), ask for confirmation.
+Do not bypass safety checks as a shortcut.
+</risk_controls>
+
 <working_directory>{working_directory}</working_directory>
 
 No preambles. No filler. Implement with precision and care."""
@@ -295,6 +320,23 @@ Before every batch of tool calls, output 1-2 sentences stating your next move(s)
 **Code — Do:** Match existing style (naming, error handling, imports). Your change should look like the same author wrote it.
 **Code — Don't:** Don't refactor unrelated code; don't add new dependencies or patterns the codebase doesn't use.
 </examples>
+
+<claude_4_6_defaults>
+- For non-trivial requests, explicitly follow Explore -> Plan -> Implement -> Verify.
+- Always define what "done" means using concrete verification (tests/lint/build/output checks).
+- Prefer direct, explicit instructions and outputs over implicit assumptions.
+- Maintain context discipline: summarize old state and keep focus on active files/tasks.
+</claude_4_6_defaults>
+
+<reasoning_transparency>
+Use deep internal thinking for complex tasks and provide structured progress, not vague chatter.
+Make your process understandable to the user with concise reasoning traces after meaningful actions:
+1) What changed / what was discovered
+2) Why it matters
+3) What you will do next
+4) How you'll verify correctness
+Use concrete references (file paths, symbols, commands, outcomes).
+</reasoning_transparency>
 
 <working_directory>{working_directory}</working_directory>
 
@@ -498,6 +540,8 @@ class CodingAgent:
         self._file_cache: Dict[str, tuple] = {}
         # Per-step checkpoints: {step_num: {abs_path: content_or_None}}
         self._step_checkpoints: Dict[int, Dict[str, Optional[str]]] = {}
+        # Deterministic verification gate status for current run/build
+        self._deterministic_verification_done: bool = False
 
     @property
     def total_tokens(self) -> int:
@@ -535,6 +579,7 @@ class CodingAgent:
         self._plan_step_index = 0
         self._file_cache = {}
         self._step_checkpoints = {}
+        self._deterministic_verification_done = False
 
     # ------------------------------------------------------------------
     # Plan step progress tracking
@@ -603,14 +648,15 @@ class CodingAgent:
         return reverted
 
     # ------------------------------------------------------------------
-    # Project rules (Cursor-style .cursor/rules, .cursorrules, RULE.md)
+    # Project rules (.cursor/rules, .cursorrules, RULE.md, CLAUDE.md)
     # ------------------------------------------------------------------
 
     _PROJECT_RULES_MAX_CHARS = 8000
 
     def _load_project_rules(self) -> str:
         """Load project rule files and return concatenated content for system prompt.
-        Tries: .cursorrules, RULE.md, .cursor/RULE.md, .cursor/rules/*.mdc, .cursor/rules/*.md.
+        Tries: .cursorrules, RULE.md, CLAUDE.md, .claude/CLAUDE.md,
+        .cursor/RULE.md, .cursor/rules/*.mdc, .cursor/rules/*.md.
         Capped at _PROJECT_RULES_MAX_CHARS."""
         parts: List[str] = []
         total = 0
@@ -635,6 +681,8 @@ class CodingAgent:
 
         _add(".cursorrules", "cursorrules")
         _add("RULE.md", "RULE.md")
+        _add("CLAUDE.md", "CLAUDE.md")
+        _add(".claude/CLAUDE.md", ".claude/CLAUDE.md")
         _add(".cursor/RULE.md", ".cursor/RULE.md")
 
         try:
@@ -861,6 +909,7 @@ class CodingAgent:
             "scout_context": self._scout_context,
             "file_snapshots": snapshots,
             "plan_step_index": self._plan_step_index,
+            "deterministic_verification_done": self._deterministic_verification_done,
         }
 
     def from_dict(self, data: Dict[str, Any]) -> None:
@@ -876,6 +925,7 @@ class CodingAgent:
         self._current_plan = data.get("current_plan")
         self._scout_context = data.get("scout_context")
         self._plan_step_index = data.get("plan_step_index", 0)
+        self._deterministic_verification_done = data.get("deterministic_verification_done", False)
         self._cancelled = False
         # Restore file snapshots
         raw_snapshots = data.get("file_snapshots", {})
@@ -891,6 +941,8 @@ class CodingAgent:
             max_tokens=model_config.max_tokens,
             enable_thinking=model_config.enable_thinking and supports_thinking(model_id),
             thinking_budget=model_config.thinking_budget if supports_thinking(model_id) else 0,
+            use_adaptive_thinking=model_config.use_adaptive_thinking,
+            adaptive_thinking_effort=model_config.adaptive_thinking_effort,
             throughput_mode=model_config.throughput_mode,
         )
 
@@ -1140,17 +1192,17 @@ class CodingAgent:
     def _trim_history(self) -> None:
         """Proactive, multi-tier context management. Runs every iteration.
 
-        Tier 1 (>50% full): Gentle — strip old thinking, compress cold file reads.
-        Tier 2 (>70% full): Aggressive — summarize old messages, compress hot files.
-        Tier 3 (>85% full): Emergency — drop to summary + recent messages only.
+        Tier 1 (>60% full): Gentle — compress bulky tool results/text first.
+        Tier 2 (>78% full): Aggressive — summarize old messages and trim old thinking.
+        Tier 3 (>90% full): Emergency — drop to summary + recent messages only.
 
         Because tool results are already capped at ingestion (_cap_tool_results),
         Tier 1 is usually sufficient. Tiers 2-3 are safety nets.
         """
         context_window = get_context_window(self.service.model_id)
-        tier1_limit = int(context_window * 0.50)   # gentle compression starts
-        tier2_limit = int(context_window * 0.70)    # aggressive compression
-        tier3_limit = int(context_window * 0.85)    # emergency
+        tier1_limit = int(context_window * 0.60)    # gentle compression starts
+        tier2_limit = int(context_window * 0.78)    # aggressive compression
+        tier3_limit = int(context_window * 0.90)    # emergency
 
         current = self._current_token_estimate()
         if current <= tier1_limit:
@@ -1181,14 +1233,9 @@ class CodingAgent:
                     continue
                 btype = block.get("type", "")
 
-                # Always strip old thinking — it's huge and the model doesn't need it
-                if btype == "thinking":
-                    content[j] = {"type": "thinking", "thinking": "..."}
-                    if block.get("signature"):
-                        content[j]["signature"] = block["signature"]
-
-                # Compress tool results (cold files aggressively, hot files gently)
-                elif btype == "tool_result":
+                # Tier 1 keeps thinking blocks intact to preserve transparent reasoning.
+                # Compress tool results first (cold files aggressively, hot files gently).
+                if btype == "tool_result":
                     text = block.get("content", "")
                     if isinstance(text, str) and len(text) > 400:
                         tool_name = self._find_tool_name_for_result(
@@ -1218,8 +1265,20 @@ class CodingAgent:
             logger.info(f"Context tier 1 sufficient: ~{current:,} tokens")
             return
 
-        # ── Tier 2: Aggressive — summarize old messages (>70%) ────────
+        # ── Tier 2: Aggressive — summarize old messages (>78%) ────────
         logger.info(f"Context tier 2: ~{current:,} tokens > {tier2_limit:,}. Summarizing.")
+
+        # Before summarizing, trim old thinking blocks to placeholders.
+        for i in range(max(0, len(self.history) - safe_tail)):
+            msg = self.history[i]
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for j, block in enumerate(content):
+                if isinstance(block, dict) and block.get("type") == "thinking":
+                    content[j] = {"type": "thinking", "thinking": "..."}
+                    if block.get("signature"):
+                        content[j]["signature"] = block["signature"]
 
         ratio = current / tier2_limit
         if ratio > 3:
@@ -2161,6 +2220,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         """
         self._cancelled = False
         self._file_snapshots = {}  # fresh snapshot tracking per build
+        self._deterministic_verification_done = False
 
         await on_event(AgentEvent(type="phase_start", content="build"))
 
@@ -2274,6 +2334,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         """
         self._cancelled = False
         self._file_snapshots = {}  # fresh snapshot tracking per run
+        self._deterministic_verification_done = False
 
         # Run scout for first message — controlled by intent classification
         scout_context = None
@@ -2297,6 +2358,122 @@ Keep the whole response under 300 words. If the request is already very clear an
 
         await self._agent_loop(on_event, request_approval, config)
 
+    def _extract_assistant_text(self, assistant_content: List[Dict[str, Any]]) -> str:
+        """Concatenate assistant text blocks for lightweight output validation."""
+        parts: List[str] = []
+        for block in assistant_content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                txt = block.get("text", "")
+                if isinstance(txt, str) and txt.strip():
+                    parts.append(txt.strip())
+        return "\n\n".join(parts)
+
+    def _last_user_message_has_tool_results(self) -> bool:
+        """True if the latest user message is a tool_result payload."""
+        if not self.history:
+            return False
+        last = self.history[-1]
+        if last.get("role") != "user":
+            return False
+        content = last.get("content", [])
+        if not isinstance(content, list):
+            return False
+        return any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+
+    def _has_structured_reasoning_trace(self, text: str) -> bool:
+        """Require visible reasoning-trace headings in final user-visible explanations."""
+        if not text or len(text.strip()) < 40:
+            return False
+        patterns = [
+            r"what\s+i\s+learned",
+            r"why\s+it\s+matters",
+            r"\bdecision\b",
+            r"next\s+actions?",
+            r"verification\s+status",
+        ]
+        hits = sum(1 for pat in patterns if re.search(pat, text, flags=re.IGNORECASE))
+        return hits >= 4
+
+    async def _run_deterministic_verification_gate(
+        self,
+        on_event: Callable[[AgentEvent], Awaitable[None]],
+    ) -> tuple[bool, str]:
+        """Run deterministic verification checks before final done.
+        Checks:
+        - lint_file for each modified file
+        - targeted pytest for discovered Python test files (optional)
+        """
+        modified_abs = list(self._file_snapshots.keys())
+        if not modified_abs:
+            return True, "No modified files."
+
+        loop = asyncio.get_event_loop()
+        failures: List[str] = []
+        checks_run: List[str] = []
+
+        # 1) Per-file lint gate
+        for idx, abs_path in enumerate(modified_abs, start=1):
+            rel_path = os.path.relpath(abs_path, self.working_directory)
+            lint_result = await loop.run_in_executor(
+                None,
+                lambda rp=rel_path: execute_tool(
+                    "lint_file",
+                    {"path": rp},
+                    self.working_directory,
+                    backend=self.backend,
+                ),
+            )
+            lint_text = lint_result.output if lint_result.success else (lint_result.error or lint_result.output or "Unknown lint error")
+            checks_run.append(f"lint_file {rel_path}")
+            await on_event(AgentEvent(
+                type="tool_result",
+                content=lint_text,
+                data={
+                    "tool_name": "lint_file",
+                    "tool_use_id": f"deterministic-lint-{idx}",
+                    "success": lint_result.success,
+                    "deterministic_gate": True,
+                },
+            ))
+            if not lint_result.success:
+                failures.append(f"lint_file {rel_path}: {lint_text[:1000]}")
+
+        # 2) Targeted Python tests if discovered
+        if app_config.deterministic_verification_run_tests:
+            test_files = [p for p in self._discover_test_files(modified_abs) if p.endswith(".py")]
+            if test_files:
+                cmd = "pytest -q " + " ".join(shlex.quote(p) for p in test_files[:20])
+                test_result = await loop.run_in_executor(
+                    None,
+                    lambda: execute_tool(
+                        "run_command",
+                        {"command": cmd, "timeout": 180},
+                        self.working_directory,
+                        backend=self.backend,
+                    ),
+                )
+                test_text = test_result.output if test_result.success else (test_result.error or test_result.output or "Unknown test failure")
+                checks_run.append(cmd)
+                await on_event(AgentEvent(
+                    type="tool_result",
+                    content=test_text,
+                    data={
+                        "tool_name": "run_command",
+                        "tool_use_id": "deterministic-tests",
+                        "success": test_result.success,
+                        "deterministic_gate": True,
+                    },
+                ))
+                if not test_result.success:
+                    failures.append(f"{cmd}: {test_text[:1600]}")
+
+        summary = "Deterministic verification checks:\n- " + "\n- ".join(checks_run[:30])
+        if failures:
+            summary += "\n\nFailures:\n- " + "\n- ".join(failures[:20])
+            return False, summary
+        summary += "\n\nAll deterministic verification checks passed."
+        return True, summary
+
     # ------------------------------------------------------------------
     # Core agent loop (used by both run and run_build)
     # ------------------------------------------------------------------
@@ -2310,6 +2487,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         """Core streaming agent loop with tool execution."""
         gen_config = config or self._default_config()
         iteration = 0
+        reasoning_trace_repairs = 0
 
         while iteration < self.max_iterations and not self._cancelled:
             iteration += 1
@@ -2601,6 +2779,69 @@ Keep the whole response under 300 words. If the request is already very clear an
             tool_uses = [b for b in assistant_content if b.get("type") == "tool_use"]
 
             if not tool_uses:
+                assistant_text = self._extract_assistant_text(assistant_content)
+
+                # Hard gate: if we just processed tool results, require structured
+                # user-visible reasoning trace before final completion.
+                if (
+                    app_config.enforce_reasoning_trace
+                    and self._last_user_message_has_tool_results()
+                    and not self._has_structured_reasoning_trace(assistant_text)
+                ):
+                    if reasoning_trace_repairs < 2:
+                        reasoning_trace_repairs += 1
+                        self.history.append({
+                            "role": "user",
+                            "content": (
+                                "[SYSTEM] Before finishing, provide a structured reasoning trace using these exact headings:\n"
+                                "- What I learned\n"
+                                "- Why it matters\n"
+                                "- Decision\n"
+                                "- Next actions\n"
+                                "- Verification status\n\n"
+                                "Then conclude."
+                            ),
+                        })
+                        await on_event(AgentEvent(
+                            type="stream_recovering",
+                            content="Requesting structured reasoning trace before completion...",
+                        ))
+                        continue
+                else:
+                    reasoning_trace_repairs = 0
+
+                # Deterministic verification gate before done
+                if (
+                    app_config.deterministic_verification_gate
+                    and self._file_snapshots
+                    and not self._deterministic_verification_done
+                ):
+                    gate_ok, gate_summary = await self._run_deterministic_verification_gate(on_event)
+                    if not gate_ok:
+                        self.history.append({
+                            "role": "user",
+                            "content": (
+                                "[SYSTEM] Deterministic verification gate failed. "
+                                "Fix all issues below before finishing:\n\n"
+                                + gate_summary
+                            ),
+                        })
+                        await on_event(AgentEvent(
+                            type="stream_recovering",
+                            content="Deterministic verification failed — requesting fixes...",
+                        ))
+                        continue
+                    self._deterministic_verification_done = True
+                    self.history.append({
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM] Deterministic verification gate passed:\n\n"
+                            + gate_summary
+                            + "\n\nProvide final completion update (with structured reasoning trace headings) and finish."
+                        ),
+                    })
+                    continue
+
                 # No tool calls — agent is done
                 ctx_est = self._current_token_estimate()
                 ctx_window = get_context_window(self.service.model_id)
@@ -2619,6 +2860,7 @@ Keep the whole response under 300 words. If the request is already very clear an
             tool_results = await self._execute_tools_parallel(
                 tool_uses, on_event, request_approval
             )
+            reasoning_trace_repairs = 0
 
             # Cap tool results before they enter history (prevention > cure)
             capped_results = self._cap_tool_results(tool_results)

@@ -44,6 +44,9 @@ class ModelConfig:
     # Extended thinking settings
     enable_thinking: bool = os.getenv("ENABLE_THINKING", "true").lower() == "true"
     thinking_budget: int = int(os.getenv("THINKING_BUDGET", "120000"))
+    # Claude 4.6 adaptive thinking defaults (can be overridden per-request)
+    use_adaptive_thinking: bool = os.getenv("USE_ADAPTIVE_THINKING", "true").lower() == "true"
+    adaptive_thinking_effort: str = os.getenv("ADAPTIVE_THINKING_EFFORT", "high")
 
 
 @dataclass
@@ -70,6 +73,12 @@ class AppConfig:
     fast_model: str = os.getenv("FAST_MODEL", "us.anthropic.claude-sonnet-4-20250514-v1:0")
     # Refine user task into output spec + constraints before planning (Cursor-style)
     task_refinement_enabled: bool = os.getenv("TASK_REFINEMENT_ENABLED", "true").lower() == "true"
+    # Enforce structured reasoning traces in user-visible responses
+    enforce_reasoning_trace: bool = os.getenv("ENFORCE_REASONING_TRACE", "true").lower() == "true"
+    # Deterministic verification gate before final "done"
+    deterministic_verification_gate: bool = os.getenv("DETERMINISTIC_VERIFICATION_GATE", "true").lower() == "true"
+    # Run targeted tests in deterministic gate when test files are discovered
+    deterministic_verification_run_tests: bool = os.getenv("DETERMINISTIC_VERIFICATION_RUN_TESTS", "true").lower() == "true"
 
 
 # ============================================================

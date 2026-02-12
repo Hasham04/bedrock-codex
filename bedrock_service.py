@@ -52,6 +52,10 @@ class GenerationConfig:
     # Extended thinking settings
     enable_thinking: bool = True
     thinking_budget: int = 10000
+    # Adaptive thinking (Claude 4.6+). If None, use model/project default.
+    use_adaptive_thinking: Optional[bool] = None
+    # Effort hint for adaptive thinking: low|medium|high|max
+    adaptive_thinking_effort: Optional[str] = None
     
     # Whether to stream thinking content
     stream_thinking: bool = True
@@ -246,25 +250,39 @@ class BedrockService:
         }
         
         # --- Thinking configuration ---
-        # NOTE: We intentionally skip adaptive thinking for coding agents.
-        # Adaptive lets the model decide its thinking budget and it tends to
-        # be conservative (short chains).  A fixed high budget produces the
-        # deep, Cursor-style reasoning chains needed for complex coding tasks.
         if use_thinking:
-            max_thinking_budget = get_thinking_max_budget(model_id)
-            thinking_budget = min(config.thinking_budget, max_thinking_budget)
-            
-            # thinking_budget must be strictly less than max_tokens, and we need
-            # room for the actual response text (at least 4K tokens)
-            max_allowed = effective_max_tokens - 4000
-            if thinking_budget > max_allowed:
-                thinking_budget = max(max_allowed, 1000)
-            
-            body["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": thinking_budget
-            }
-            logger.info(f"Extended thinking enabled with budget: {thinking_budget} tokens")
+            # Prefer adaptive thinking for Claude 4.6 when enabled in config.
+            use_adaptive_cfg = config.use_adaptive_thinking
+            if use_adaptive_cfg is None:
+                use_adaptive_cfg = model_config.use_adaptive_thinking
+
+            if use_adaptive and use_adaptive_cfg:
+                body["thinking"] = {"type": "adaptive"}
+                effort = (config.adaptive_thinking_effort or model_config.adaptive_thinking_effort or "").strip().lower()
+                if effort in {"low", "medium", "high", "max"}:
+                    # Anthropic-style effort hint for adaptive thinking.
+                    # If your Bedrock region/model rejects this field, disable via env:
+                    # USE_ADAPTIVE_THINKING=false
+                    body["output_config"] = {"effort": effort}
+                logger.info(
+                    "Adaptive thinking enabled%s",
+                    f" (effort={effort})" if effort else "",
+                )
+            else:
+                max_thinking_budget = get_thinking_max_budget(model_id)
+                thinking_budget = min(config.thinking_budget, max_thinking_budget)
+
+                # thinking_budget must be strictly less than max_tokens, and we need
+                # room for the actual response text (at least 4K tokens)
+                max_allowed = effective_max_tokens - 4000
+                if thinking_budget > max_allowed:
+                    thinking_budget = max(max_allowed, 1000)
+
+                body["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": thinking_budget
+                }
+                logger.info(f"Extended thinking enabled with budget: {thinking_budget} tokens")
         else:
             if config.temperature is not None:
                 body["temperature"] = config.temperature
