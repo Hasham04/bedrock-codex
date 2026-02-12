@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bedrock Codex</title>
+    <link rel="stylesheet" href="/static/style.css?v=8">
+    <!-- Markdown rendering -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- Syntax highlighting for chat code blocks -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+
+    <!-- ══════════════════════════════════════════════════════════
+         WELCOME SCREEN — shown on load, hidden once a project opens
+         ══════════════════════════════════════════════════════════ -->
+    <div id="welcome-screen">
+        <div class="welcome-container">
+
+            <!-- Branding -->
+            <div class="welcome-brand">
+                <div class="welcome-logo">&#x2B21;</div>
+                <h1 class="welcome-title">Bedrock Codex</h1>
+                <p class="welcome-subtitle">AI-powered coding agent &mdash; your mini Cursor in the browser</p>
+            </div>
+
+            <!-- Action cards -->
+            <div class="welcome-actions">
+                <button class="welcome-card" id="welcome-open-local">
+                    <div class="welcome-card-icon">
+                        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                        </svg>
+                    </div>
+                    <div class="welcome-card-text">
+                        <span class="welcome-card-title">Open Local Project</span>
+                        <span class="welcome-card-desc">Open a folder on this machine</span>
+                    </div>
+                </button>
+
+                <button class="welcome-card" id="welcome-ssh-connect">
+                    <div class="welcome-card-icon">
+                        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <rect x="2" y="3" width="20" height="14" rx="2"/>
+                            <path d="M8 21h8"/><path d="M12 17v4"/>
+                            <path d="M7 9l3 3-3 3" opacity="0.8"/><line x1="13" y1="15" x2="17" y2="15" opacity="0.8"/>
+                        </svg>
+                    </div>
+                    <div class="welcome-card-text">
+                        <span class="welcome-card-title">Connect via SSH</span>
+                        <span class="welcome-card-desc">Open a remote project over SSH</span>
+                    </div>
+                </button>
+            </div>
+
+            <!-- Recent projects -->
+            <div class="welcome-recents">
+                <h3 class="welcome-section-title">Recent Projects</h3>
+                <div id="welcome-project-list" class="welcome-project-list">
+                    <div class="welcome-loading">Loading projects...</div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Local project modal (inline in welcome) -->
+        <div id="welcome-local-modal" class="welcome-modal hidden">
+            <div class="welcome-modal-overlay"></div>
+            <div class="welcome-modal-body">
+                <h3>Open Local Project</h3>
+                <p class="welcome-modal-hint">Enter the full path to a project folder. Supports <code>~</code> for home.</p>
+                <input id="welcome-local-path" type="text" placeholder="~/Desktop/my-project" spellcheck="false" autofocus>
+                <div id="welcome-local-error" class="welcome-modal-error hidden"></div>
+                <div class="welcome-modal-actions">
+                    <button id="welcome-local-cancel" class="wm-btn secondary">Cancel</button>
+                    <button id="welcome-local-open" class="wm-btn primary">Open Project</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- SSH modal -->
+        <div id="welcome-ssh-modal" class="welcome-modal hidden">
+            <div class="welcome-modal-overlay"></div>
+            <div class="welcome-modal-body">
+                <h3>Connect via SSH</h3>
+                <p class="welcome-modal-hint">Enter connection details for the remote machine.</p>
+                <div class="ssh-form-grid">
+                    <label>Host <span class="ssh-required">*</span></label>
+                    <input id="ssh-host" type="text" placeholder="192.168.1.50 or hostname" spellcheck="false">
+
+                    <label>User <span class="ssh-required">*</span></label>
+                    <input id="ssh-user" type="text" placeholder="deploy" spellcheck="false">
+
+                    <label>Port</label>
+                    <input id="ssh-port" type="text" placeholder="22" value="22" spellcheck="false">
+
+                    <label>Key file</label>
+                    <input id="ssh-key" type="text" placeholder="~/.ssh/id_rsa (optional)" spellcheck="false">
+
+                    <label>Remote directory <span class="ssh-required">*</span></label>
+                    <input id="ssh-dir" type="text" placeholder="/home/user/project" spellcheck="false">
+                </div>
+                <div id="welcome-ssh-error" class="welcome-modal-error hidden"></div>
+                <div class="welcome-modal-actions">
+                    <button id="welcome-ssh-cancel" class="wm-btn secondary">Cancel</button>
+                    <button id="welcome-ssh-open" class="wm-btn primary">Connect</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════════════
+         IDE — hidden until a project is opened
+         ══════════════════════════════════════════════════════════ -->
+    <div id="ide-wrapper" class="hidden">
+
+        <!-- ── Top Bar ──────────────────────────────────────────── -->
+        <header id="top-bar">
+            <div class="top-left">
+                <span class="logo" id="logo-home" title="Back to welcome screen" style="cursor:pointer;">&#x2B21; Bedrock Codex</span>
+                <button id="open-project-btn" class="icon-btn" title="Open project folder">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                    </svg>
+                </button>
+                <span id="working-dir" class="path-badge" title="Working directory"></span>
+            </div>
+            <div class="top-center">
+                <span id="model-name" class="model-badge">loading...</span>
+                <span id="session-name" class="session-badge">default</span>
+            </div>
+            <div class="top-right">
+                <span id="token-count" class="token-badge" title="Total tokens used">0 tokens</span>
+                <div id="context-gauge" class="context-gauge" title="Context window usage">
+                    <div id="context-gauge-fill" class="context-gauge-fill"></div>
+                </div>
+                <span id="connection-status" class="status-dot disconnected" title="Disconnected"></span>
+            </div>
+        </header>
+
+        <!-- ── Three-Panel IDE Layout ───────────────────────────── -->
+        <div id="ide-container">
+
+            <!-- Left: File Explorer -->
+            <aside id="file-explorer">
+                <div class="panel-header">
+                    <span class="panel-title">Explorer</span>
+                    <div class="panel-header-actions">
+                        <button id="search-toggle-btn" class="icon-btn-sm" title="Toggle search panel">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/>
+                            </svg>
+                        </button>
+                        <button id="refresh-tree-btn" class="icon-btn-sm" title="Refresh file tree">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <!-- Search Panel (hidden by default) -->
+                <div id="search-panel" class="search-panel hidden">
+                    <div class="search-input-row">
+                        <input id="search-input" type="text" placeholder="Search in project..." spellcheck="false">
+                        <div class="search-options">
+                            <button id="search-regex-btn" class="search-opt-btn" title="Use Regex">.*</button>
+                            <button id="search-case-btn" class="search-opt-btn" title="Match Case">Aa</button>
+                        </div>
+                    </div>
+                    <div class="search-input-row">
+                        <input id="search-include" type="text" placeholder="Files to include (e.g. *.py)" spellcheck="false">
+                    </div>
+                    <div class="search-replace-row hidden" id="replace-row">
+                        <input id="replace-input" type="text" placeholder="Replace with..." spellcheck="false">
+                        <button id="replace-all-btn" class="search-action-btn" title="Replace All">Replace All</button>
+                    </div>
+                    <div class="search-actions-row">
+                        <button id="search-go-btn" class="search-action-btn">Search</button>
+                        <button id="search-replace-toggle" class="search-action-btn secondary" title="Toggle replace">Replace...</button>
+                    </div>
+                    <div id="search-status" class="search-status"></div>
+                    <div id="search-results" class="search-results"></div>
+                </div>
+                <div id="file-tree" class="file-tree"></div>
+            </aside>
+
+            <!-- Resize handle: explorer | editor -->
+            <div class="resize-handle" id="resize-left" title="Drag to resize"></div>
+
+            <!-- Center: Code Editor -->
+            <main id="editor-panel">
+                <div id="tab-bar"></div>
+                <div id="editor-container">
+                    <div id="editor-welcome">
+                        <div class="editor-welcome-inner">
+                            <h2>Bedrock Codex</h2>
+                            <p>Select a file from the explorer<br>or give the agent a task.</p>
+                        </div>
+                    </div>
+                    <div id="monaco-container"></div>
+                </div>
+            </main>
+
+            <!-- Resize handle: editor | chat -->
+            <div class="resize-handle" id="resize-right" title="Drag to resize"></div>
+
+            <!-- Right: Agent Chat -->
+            <aside id="chat-panel">
+                <div class="panel-header">
+                    <span class="panel-title">Agent</span>
+                    <button id="reset-btn" class="icon-btn-sm" title="New session">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2v4m0 12v4M4.93 4.93l2.83 2.83m8.49 8.49l2.83 2.83M2 12h4m12 0h4M4.93 19.07l2.83-2.83m8.49-8.49l2.83-2.83"/>
+                        </svg>
+                    </button>
+                </div>
+
+                <div id="chat-messages"></div>
+
+                <!-- Action bar (plan/build/keep/revert) -->
+                <div id="action-bar" class="hidden">
+                    <div id="action-buttons"></div>
+                </div>
+
+                <!-- Input -->
+                <div id="chat-input-area">
+                    <div class="chat-input-wrapper">
+                        <textarea id="user-input" placeholder="Describe a task... (Enter to send)" rows="1"></textarea>
+                        <button id="send-btn" title="Send (Enter)">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/>
+                            </svg>
+                        </button>
+                        <button id="cancel-btn" class="hidden" title="Cancel">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="3" y="3" width="18" height="18" rx="2"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            </aside>
+        </div>
+    </div>
+
+    <!-- Project directory modal (used from IDE top bar) -->
+    <div id="dir-modal" class="modal hidden">
+        <div class="modal-overlay"></div>
+        <div class="modal-content">
+            <h3>Open Project</h3>
+            <p class="modal-hint">Enter the full path to a project folder. Supports <code>~</code> for home.</p>
+            <input id="dir-input" type="text" placeholder="~/Desktop/my-project" spellcheck="false">
+            <div id="dir-error" class="dir-error hidden"></div>
+            <div class="modal-actions">
+                <button id="dir-cancel" class="action-btn secondary">Cancel</button>
+                <button id="dir-open" class="action-btn primary">Open</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Monaco Editor loader -->
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.50.0/min/vs/loader.js"></script>
+    <script>
+        require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.50.0/min/vs' } });
+        window.monacoReady = new Promise(resolve => {
+            require(['vs/editor/editor.main'], function () { resolve(monaco); });
+        });
+    </script>
+    <script src="/static/app.js?v=8"></script>
+</body>
+</html>

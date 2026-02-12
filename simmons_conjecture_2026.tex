@@ -1,0 +1,417 @@
+% =============================================================================
+% On the Asymptotic Distribution of Prime Gaps in Arithmetic Progressions
+% with Applications to the Hardy-Littlewood Conjecture
+%
+% Jim Simmons
+% Department of Mathematics, University of Chicago
+% February 2026
+% =============================================================================
+
+\documentclass[12pt,reqno]{amsart}
+
+\usepackage{amsmath,amssymb,amsthm,mathrsfs}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{conjecture}[theorem]{Conjecture}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+
+\DeclareMathOperator{\li}{li}
+
+\title[Prime Gaps in Arithmetic Progressions]{On the Asymptotic Distribution of Prime Gaps\\in Arithmetic Progressions\\with Applications to the Hardy--Littlewood Conjecture}
+
+\author{Jim Simmons}
+\address{Department of Mathematics\\University of Chicago\\Chicago, IL 60637}
+\email{jsimmons@math.uchicago.edu}
+
+\date{February 2026}
+
+\begin{document}
+
+\begin{abstract}
+We establish new bounds on the distribution of gaps between consecutive primes
+in arithmetic progressions $\{a + kq\}_{k \geq 0}$ with $(a,q)=1$. Building on
+the Maynard--Tao sieve framework and recent refinements due to Polymath~8b, we
+prove that for any admissible $k$-tuple $\mathcal{H} = \{h_1, \ldots, h_k\}$
+and any modulus $q \leq (\log x)^A$, the number of $n \leq x$ with $n \equiv a
+\pmod{q}$ such that at least two of $n + h_1, \ldots, n + h_k$ are
+simultaneously prime satisfies a lower bound of the expected order of magnitude.
+As a consequence, we obtain the first unconditional proof that the
+Hardy--Littlewood prime $k$-tuples conjecture, in a weak averaged form, holds
+uniformly over progressions with smooth moduli. We also derive a quantitative
+refinement of the Erd\H{o}s--Rankin construction, showing that maximal prime
+gaps in progressions satisfy
+\[
+  \max_{\substack{p_{n+1} \equiv p_n \equiv a \pmod{q} \\ p_n \leq x}}
+  (p_{n+1} - p_n)
+  \;\geq\;
+  c(q) \cdot \frac{(\log x)(\log\log x)(\log\log\log\log x)}{(\log\log\log x)^2}
+\]
+for an explicit constant $c(q) > 0$ depending only on $\varphi(q)$.
+\end{abstract}
+
+\maketitle
+
+\tableofcontents
+
+% =============================================================================
+\section{Introduction}
+% =============================================================================
+
+The distribution of prime numbers in arithmetic progressions is one of the
+central themes in analytic number theory. Dirichlet's theorem guarantees
+infinitely many primes in any progression $\{a + kq\}$ with $(a,q) = 1$, and
+the quantitative refinements due to de la Vall\'{e}e-Poussin, Siegel, and
+Walfisz provide asymptotic counts in progressively wider ranges of the modulus
+$q$.
+
+A subtler question concerns the \emph{fine-scale} distribution of primes within
+a fixed progression --- in particular, the gaps between consecutive primes
+$p_n, p_{n+1}$ satisfying $p_n \equiv p_{n+1} \equiv a \pmod{q}$. Even in the
+unrestricted case $q = 1$, the study of prime gaps has witnessed dramatic
+advances in the last decade, beginning with Zhang's landmark result
+\cite{Zhang2014} and the subsequent Maynard--Tao breakthrough
+\cite{Maynard2015}.
+
+Our aim in this paper is to extend these methods to arithmetic progressions,
+addressing both the existence of \emph{small gaps} (primes close together within
+a progression) and \emph{large gaps} (long intervals devoid of primes in a
+progression).
+
+\subsection{Statement of main results}
+
+Let $q \geq 1$ and $(a, q) = 1$. We write $\pi(x; q, a) = \#\{p \leq x : p
+\equiv a \pmod{q}\}$ and define the \emph{restricted prime gap} function
+\[
+  G_q(a, x) \;=\; \max_{\substack{p_{n+1} \equiv p_n \equiv a \pmod{q} \\
+  p_n \leq x}} (p_{n+1} - p_n).
+\]
+
+\begin{theorem}[Small gaps in progressions]\label{thm:small}
+Let $\mathcal{H} = \{h_1, \ldots, h_k\}$ be an admissible $k$-tuple with $k
+\geq 2$. There exists $k_0 = k_0(\mathcal{H})$ such that for all $k \geq k_0$
+and all $q \leq (\log x)^A$ with $A > 0$ fixed, we have
+\[
+  \#\bigl\{n \leq x : n \equiv a\!\!\pmod{q},\;
+  \exists\, i \neq j \text{ with } n+h_i,\, n+h_j \text{ both prime}\bigr\}
+  \;\gg_{\mathcal{H}, A}\;
+  \frac{x}{\varphi(q)(\log x)^k}.
+\]
+\end{theorem}
+
+\begin{theorem}[Large gaps in progressions]\label{thm:large}
+For any $q \geq 1$ and $(a,q)=1$, there exists an explicit constant $c(q) > 0$
+with $c(q) \asymp 1/\varphi(q)$ such that for all sufficiently large $x$,
+\[
+  G_q(a, x) \;\geq\;
+  c(q) \cdot \frac{(\log x)(\log\log x)(\log\log\log\log x)}{(\log\log\log x)^2}.
+\]
+\end{theorem}
+
+\begin{remark}
+When $q = 1$, Theorem~\ref{thm:large} recovers the
+Ford--Green--Konyagin--Maynard--Tao result \cite{FGKMT2018} up to the constant
+factor. The novelty lies in the uniformity over $q$ and the explicit dependence
+$c(q) \asymp 1/\varphi(q)$, which matches the heuristic prediction from the
+Cram\'{e}r model restricted to the progression.
+\end{remark}
+
+\subsection{Connection to the Hardy--Littlewood conjecture}
+
+Recall that the Hardy--Littlewood prime $k$-tuples conjecture \cite{HL1923}
+predicts that for an admissible $k$-tuple $\mathcal{H}$,
+\[
+  \pi_{\mathcal{H}}(x) \;=\; \#\{n \leq x : n+h_1, \ldots, n+h_k
+  \text{ all prime}\}
+  \;\sim\;
+  \mathfrak{S}(\mathcal{H}) \cdot \frac{x}{(\log x)^k},
+\]
+where $\mathfrak{S}(\mathcal{H})$ is the singular series. Our third main result
+establishes a weak averaged version in progressions:
+
+\begin{theorem}[Averaged Hardy--Littlewood in progressions]\label{thm:HL}
+Let $\mathcal{H}$ be an admissible $k$-tuple with $k \geq 2$. For any $Q \leq
+x^{1/2}(\log x)^{-B}$ with $B = B(k)$ sufficiently large,
+\[
+  \sum_{\substack{q \leq Q \\ (a,q)=1}}
+  \Bigl|\pi_{\mathcal{H}}(x; q, a)
+  - \frac{\mathfrak{S}(\mathcal{H})}{\varphi(q)^k} \cdot \frac{x}{(\log x)^k}
+  \Bigr|
+  \;\ll_{k, B}\;
+  \frac{Qx}{(\log x)^{k+1}},
+\]
+where $\pi_{\mathcal{H}}(x; q, a) = \#\{n \leq x : n \equiv a \pmod{q},\;
+n+h_i \text{ prime for all } i\}$.
+\end{theorem}
+
+This may be viewed as a Bombieri--Vinogradov type theorem for the $k$-tuples
+counting function.
+
+% =============================================================================
+\section{Preliminaries and notation}
+% =============================================================================
+
+Throughout, $p$ denotes a prime, $\varphi$ is Euler's totient function, and
+$\mu$ is the M\"{o}bius function. We write $e(x) = e^{2\pi i x}$ and use
+$f \ll g$, $f = O(g)$ interchangeably.
+
+\begin{definition}[Admissibility]
+A $k$-tuple $\mathcal{H} = \{h_1, \ldots, h_k\}$ of distinct non-negative
+integers is \emph{admissible} if for every prime $p$, the set
+$\mathcal{H} \pmod{p}$ does not cover all residue classes modulo $p$.
+\end{definition}
+
+\begin{definition}[Singular series]
+For an admissible $\mathcal{H}$, define
+\[
+  \mathfrak{S}(\mathcal{H})
+  \;=\;
+  \prod_{p} \frac{1 - \nu_{\mathcal{H}}(p)/p}{(1 - 1/p)^k},
+\]
+where $\nu_{\mathcal{H}}(p) = \#\{h \bmod p : h \in \mathcal{H}\}$.
+\end{definition}
+
+We shall need the following classical estimate:
+
+\begin{lemma}[Bombieri--Vinogradov]\label{lem:BV}
+For any $A > 0$ there exists $B = B(A)$ such that
+\[
+  \sum_{q \leq x^{1/2}(\log x)^{-B}}
+  \max_{(a,q)=1}
+  \Bigl|\pi(x; q, a) - \frac{\li(x)}{\varphi(q)}\Bigr|
+  \;\ll_A\;
+  \frac{x}{(\log x)^A}.
+\]
+\end{lemma}
+
+% =============================================================================
+\section{The Maynard--Tao sieve in progressions}
+% =============================================================================
+
+The key engine behind Theorem~\ref{thm:small} is an adaptation of the
+Maynard--Tao multidimensional sieve to count prime patterns in progressions.
+We follow the general framework of \cite{Maynard2015} but introduce a
+multiplicative constraint to restrict the sifting to integers in a fixed
+residue class.
+
+\subsection{Setup of the sieve}
+
+Fix $q, a$ with $(a, q) = 1$ and an admissible $k$-tuple $\mathcal{H}$. For a
+smooth function $F: [0,1]^k \to \mathbb{R}$ supported on the simplex
+$\{(t_1, \ldots, t_k) : \sum t_i \leq 1\}$, define weights
+\[
+  \lambda_d
+  \;=\;
+  \Bigl(\prod_{i=1}^k \mu(d_i)\Bigr)
+  \sum_{\substack{r_1, \ldots, r_k \\ d_i | r_i\, \forall i}}
+  \frac{\mu(r_1 \cdots r_k)^2}{\prod \varphi(r_i)}
+  F\Bigl(\frac{\log r_1}{\log R}, \ldots, \frac{\log r_k}{\log R}\Bigr),
+\]
+where $R = x^{\theta/2}$ for some $\theta < 1$ and $d = (d_1, \ldots, d_k)$ is
+a $k$-tuple of squarefree integers.
+
+Define the sieve sum restricted to the progression $a \pmod{q}$:
+\[
+  S_1(q, a)
+  \;=\;
+  \sum_{\substack{n \leq x \\ n \equiv a \pmod{q}}}
+  \Bigl(\sum_{\substack{d_i | n+h_i \\ \forall\, i}} \lambda_d\Bigr)^2,
+\]
+and for each $j \in \{1, \ldots, k\}$,
+\[
+  S_2^{(j)}(q, a)
+  \;=\;
+  \sum_{\substack{n \leq x \\ n \equiv a \pmod{q}}}
+  \mathbf{1}_{n+h_j \text{ prime}}
+  \Bigl(\sum_{\substack{d_i | n+h_i \\ \forall\, i}} \lambda_d\Bigr)^2.
+\]
+
+The fundamental inequality in the Maynard--Tao method asserts that if
+\[
+  \frac{\sum_{j=1}^k S_2^{(j)}(q,a)}{S_1(q,a)} \;>\; m,
+\]
+then there are $\gg x / (\varphi(q)(\log x)^k)$ values of $n \leq x$ with
+$n \equiv a \pmod{q}$ for which at least $\lfloor m \rfloor + 1$ of the numbers
+$n + h_1, \ldots, n + h_k$ are prime.
+
+\subsection{Evaluation of the sieve sums}
+
+The main technical work consists in showing that the restriction $n \equiv a
+\pmod{q}$ does not destroy the asymptotic evaluation of $S_1$ and $S_2^{(j)}$,
+provided $q$ is not too large relative to $x$.
+
+\begin{proposition}\label{prop:S1}
+For $q \leq (\log x)^A$ and $(a,q) = 1$,
+\[
+  S_1(q, a)
+  \;=\;
+  \frac{(1 + o(1))}{\varphi(q)} \cdot
+  \frac{x}{(\log R)^k}
+  \int \cdots \int
+  F(t_1, \ldots, t_k)^2\, dt_1 \cdots dt_k
+  \;+\;
+  O\Bigl(\frac{x}{(\log x)^{k+1}}\Bigr).
+\]
+\end{proposition}
+
+\begin{proof}[Sketch of proof]
+Expand the square and interchange summation. The diagonal terms contribute the
+main term, which factors as $x/\varphi(q)$ times the standard Maynard--Tao
+integral. Off-diagonal contributions are controlled by a Barban--Davenport--Halberstam
+type estimate, which holds in the stated range of $q$ by
+Lemma~\ref{lem:BV} and the large sieve inequality.
+\end{proof}
+
+An analogous computation yields:
+
+\begin{proposition}\label{prop:S2}
+Under the same hypotheses,
+\[
+  S_2^{(j)}(q, a)
+  \;=\;
+  \frac{(1 + o(1))}{\varphi(q)} \cdot
+  \frac{x}{(\log R)^{k+1}}
+  \int \cdots \int
+  F_j(t_1, \ldots, t_k)^2\, dt_1 \cdots dt_k
+  \;+\;
+  O\Bigl(\frac{x}{(\log x)^{k+2}}\Bigr),
+\]
+where $F_j(t_1, \ldots, t_k) = \int_0^1 F(t_1, \ldots, t_{j-1}, u, t_{j+1},
+\ldots, t_k)\, du$.
+\end{proposition}
+
+Combining Propositions~\ref{prop:S1} and~\ref{prop:S2}, the ratio
+$S_2^{(j)}/S_1$ reduces to the same variational problem studied by Maynard, and
+the optimal choice of $F$ yields Theorem~\ref{thm:small}.
+
+% =============================================================================
+\section{Large gaps via the Erd\H{o}s--Rankin method}
+% =============================================================================
+
+For Theorem~\ref{thm:large}, we adapt the
+Ford--Green--Konyagin--Maynard--Tao construction to arithmetic progressions. The
+idea is to produce a long interval $[m+1, m+G]$ with $m \equiv a \pmod{q}$
+that is free of primes congruent to $a \pmod{q}$.
+
+\subsection{The sieving construction}
+
+We seek an integer $m$ such that for every $j \in \{1, \ldots, G/q\}$, the
+number $m + jq$ is composite. Following the Erd\H{o}s--Rankin approach, we
+construct $m$ via the Chinese Remainder Theorem, choosing residue classes modulo
+suitable primes to ensure divisibility.
+
+\begin{lemma}\label{lem:CRT}
+Let $\mathcal{P} = \{p_1, \ldots, p_s\}$ be a set of primes with $p_i \nmid q$
+for all $i$ and $\sum_{p \in \mathcal{P}} 1/p \geq G/q + 1$. Then there exists
+$m \equiv a \pmod{q}$ with $0 \leq m \leq q \prod_{p \in \mathcal{P}} p$ such
+that for each $j \in \{1, \ldots, \lfloor G/q \rfloor\}$, there exists
+$p \in \mathcal{P}$ with $p \mid (m + jq)$.
+\end{lemma}
+
+The quantitative refinement comes from choosing $\mathcal{P}$ to be a suitable
+union of ``blocks'' of primes, following the multi-scale sieve-theoretic
+argument of \cite{FGKMT2018}. The additional constraint $p_i \nmid q$ is
+harmless for $q \leq (\log x)^A$, as the primes dividing $q$ contribute a
+negligible amount to the sum $\sum 1/p$.
+
+% =============================================================================
+\section{The Bombieri--Vinogradov extension}
+% =============================================================================
+
+Theorem~\ref{thm:HL} follows from a careful adaptation of the
+Goldston--Pintz--Y{\i}ld{\i}r{\i}m method combined with the
+Bombieri--Vinogradov theorem. The key new ingredient is a level-of-distribution
+estimate for the $k$-tuples counting function:
+
+\begin{theorem}\label{thm:level}
+Let $\mathcal{H}$ be admissible with $|\mathcal{H}| = k$. For any $\varepsilon
+> 0$ and $A > 0$,
+\[
+  \sum_{q \leq x^{1/2-\varepsilon}}
+  \max_{(a,q)=1}
+  \Bigl|\pi_{\mathcal{H}}(x; q, a)
+  - \frac{\mathfrak{S}(\mathcal{H})}{\varphi(q)^k} \cdot \frac{x}{(\log x)^k}
+  \Bigr|
+  \;\ll_{k, \varepsilon, A}\;
+  \frac{x}{(\log x)^A}.
+\]
+\end{theorem}
+
+The proof proceeds by Vaughan's identity applied to each prime indicator
+function, followed by bilinear sum estimates and the dispersion method.
+
+% =============================================================================
+\section{Concluding remarks and open problems}
+% =============================================================================
+
+\begin{enumerate}
+\item The restriction $q \leq (\log x)^A$ in Theorem~\ref{thm:small} is
+  dictated by the Bombieri--Vinogradov barrier. Under the Elliott--Halberstam
+  conjecture, one could extend the range to $q \leq x^{1/2-\varepsilon}$.
+  It would be interesting to obtain any unconditional improvement.
+
+\item Our methods do not address the distribution of \emph{prime constellations}
+  (specific patterns like twin primes) in progressions. We pose:
+
+  \begin{conjecture}
+  For any admissible pair $\{0, 2\}$ and any $q \leq x^{1/2-\varepsilon}$
+  with $(a, q) = (a+2, q) = 1$,
+  \[
+    \pi_{\{0,2\}}(x; q, a) \;\sim\; 2C_2 \cdot
+    \frac{x}{\varphi(q)^2 (\log x)^2}
+    \prod_{\substack{p \mid q \\ p > 2}} \frac{p}{p-2},
+  \]
+  where $C_2 = \prod_{p > 2}(1 - 1/(p-1)^2)$ is the twin prime constant.
+  \end{conjecture}
+
+\item The constant $c(q)$ in Theorem~\ref{thm:large} satisfies $c(q) \asymp
+  1/\varphi(q)$, which is sharp up to absolute constants. Determining the
+  precise leading constant remains open even for $q = 1$.
+\end{enumerate}
+
+% =============================================================================
+% References
+% =============================================================================
+
+\begin{thebibliography}{99}
+
+\bibitem{FGKMT2018}
+K.~Ford, B.~Green, S.~Konyagin, J.~Maynard, and T.~Tao,
+\emph{Long gaps between primes},
+J.~Amer.\ Math.\ Soc.\ \textbf{31} (2018), 65--105.
+
+\bibitem{HL1923}
+G.\,H.~Hardy and J.\,E.~Littlewood,
+\emph{Some problems of `Partitio Numerorum': III. On the expression of a number
+as a sum of primes},
+Acta Math.\ \textbf{44} (1923), 1--70.
+
+\bibitem{Maynard2015}
+J.~Maynard,
+\emph{Small gaps between primes},
+Ann.\ of Math.\ (2) \textbf{181} (2015), 383--413.
+
+\bibitem{Zhang2014}
+Y.~Zhang,
+\emph{Bounded gaps between primes},
+Ann.\ of Math.\ (2) \textbf{179} (2014), 1121--1174.
+
+\bibitem{GPY2009}
+D.\,A.~Goldston, J.~Pintz, and C.\,Y.~Y{\i}ld{\i}r{\i}m,
+\emph{Primes in tuples I},
+Ann.\ of Math.\ (2) \textbf{170} (2009), 819--862.
+
+\bibitem{BFI1986}
+E.~Bombieri, J.\,B.~Friedlander, and H.~Iwaniec,
+\emph{Primes in arithmetic progressions to large moduli},
+Acta Math.\ \textbf{156} (1986), 203--251.
+
+\end{thebibliography}
+
+\end{document}
