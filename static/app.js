@@ -902,114 +902,497 @@
     }
 
     // Thinking blocks
+    function updateThinkingHeader(block, done = false) {
+        if (!block) return;
+        const started = Number(block.dataset.startedAt || Date.now());
+        const elapsed = Math.max(0, Math.round((Date.now() - started) / 1000));
+        const titleEl = block.querySelector(".thinking-title");
+        const statusEl = block.querySelector(".thinking-status-text");
+        if (titleEl) {
+            titleEl.textContent = done ? `Thought for ${elapsed}s` : (elapsed > 0 ? `Thinking for ${elapsed}s` : "Thinking...");
+        }
+        if (statusEl) {
+            statusEl.textContent = done ? "Completed" : "In progress";
+        }
+    }
+
     function createThinkingBlock() {
         const bubble = getOrCreateBubble();
         const block = document.createElement("div"); block.className = "thinking-block";
-        block.innerHTML = `<div class="thinking-header"><span class="thinking-chevron">\u25BC</span><span class="spinner" style="width:10px;height:10px;border:2px solid var(--border);border-top:2px solid var(--accent);border-radius:50%;animation:spin .8s linear infinite;"></span><span>Thinking\u2026</span></div><div class="thinking-content"></div>`;
+        block.dataset.startedAt = String(Date.now());
+        block.innerHTML = `
+            <div class="thinking-header">
+                <div class="thinking-left">
+                    <span class="thinking-icon-wrap">
+                        <svg class="thinking-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 3a6 6 0 0 0-6 6c0 2.5 1.3 4 2.5 5.1.8.8 1.5 1.4 1.5 2.4h4c0-1 .7-1.6 1.5-2.4C16.7 13 18 11.5 18 9a6 6 0 0 0-6-6z"/>
+                            <path d="M9 19h6"/><path d="M10 22h4"/>
+                        </svg>
+                    </span>
+                    <div class="thinking-meta">
+                        <span class="thinking-title">Thinking...</span>
+                        <span class="thinking-status-text">In progress</span>
+                    </div>
+                </div>
+                <div class="thinking-right">
+                    <span class="thinking-spinner spinner"></span>
+                    <span class="thinking-chevron">\u25BC</span>
+                </div>
+            </div>
+            <div class="thinking-content"></div>`;
         block.querySelector(".thinking-header").addEventListener("click", () => block.classList.toggle("collapsed"));
         bubble.appendChild(block);
+        updateThinkingHeader(block, false);
         scrollChat();
         return block.querySelector(".thinking-content");
     }
     function finishThinking(el) {
         if (!el) return;
         const block = el.closest(".thinking-block"); if (!block) return;
-        const header = block.querySelector(".thinking-header");
-        const spinner = header.querySelector(".spinner"); if (spinner) spinner.remove();
-        header.querySelector("span:last-child").textContent = "Thought process";
+        updateThinkingHeader(block, true);
+        const spinner = block.querySelector(".thinking-spinner"); if (spinner) spinner.remove();
         block.classList.add("collapsed");
         block.appendChild(makeCopyBtn(() => el.textContent));
     }
 
     // Tool blocks
+    let lastToolGroup = null;
+    const toolRunState = new WeakMap(); // runEl -> { name, input, output }
+
+    function formatClock(ts) {
+        return new Date(ts).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    }
+    function toolGroupKey(name, input) { return `${name}::${toolDesc(name, input)}`; }
+    function toolCanOpenFile(name, input) {
+        return Boolean((name === "read_file" || name === "write_file" || name === "edit_file" || name === "lint_file") && input?.path);
+    }
+    function toolFollowupPrompt(name, input, failedOnly = false) {
+        const title = toolTitle(name);
+        if (name === "run_command" && input?.command) {
+            return failedOnly
+                ? `The command failed. Please rerun this command and fix the issue:\n\n${input.command}`
+                : `Please rerun this exact command and summarize the result:\n\n${input.command}`;
+        }
+        if (failedOnly) return `The ${title} tool call failed. Retry it and fix the issue. Input:\n${JSON.stringify(input || {}, null, 2)}`;
+        return `Please rerun this ${title} tool call with the same input:\n${JSON.stringify(input || {}, null, 2)}`;
+    }
+    function runFollowupPrompt(prompt) {
+        if (!prompt) return;
+        if (isRunning) { showInfo("Agent is running. Cancel first to rerun."); return; }
+        addUserMessage(prompt);
+        setRunning(true);
+        addAssistantMessage();
+        send({ type: "task", content: prompt });
+    }
+    function openFileAt(path, lineNumber) {
+        if (!path) return;
+        openFile(path).then(() => {
+            if (monacoInstance && lineNumber) {
+                const ln = Math.max(1, Number(lineNumber) || 1);
+                monacoInstance.setPosition({ lineNumber: ln, column: 1 });
+                monacoInstance.revealLineInCenter(ln);
+                monacoInstance.focus();
+            }
+        }).catch(() => {});
+    }
+    function parseLocationLine(line) {
+        const m = String(line || "").trim().match(/^(.+?):(\d+):(?:(\d+):)?(.*)$/);
+        if (!m) return null;
+        return { path: m[1], line: Number(m[2]), col: m[3] ? Number(m[3]) : null, text: (m[4] || "").trim() };
+    }
+    function buildEditPreviewDiff(name, input) {
+        const path = input?.path || "(unknown)";
+        if (name === "write_file") {
+            const lines = String(input?.content || "").split("\n");
+            const added = lines.slice(0, 16).map(l => `+${l}`);
+            if (lines.length > 16) added.push(`+... (${lines.length - 16} more lines)`);
+            return `+++ ${path}\n@@ new content preview @@\n${added.join("\n")}`;
+        }
+        if (name === "edit_file") {
+            const oldLines = String(input?.old_string || "").split("\n");
+            const newLines = String(input?.new_string || "").split("\n");
+            const removed = oldLines.slice(0, 8).map(l => `-${l}`);
+            const added = newLines.slice(0, 8).map(l => `+${l}`);
+            if (oldLines.length > 8) removed.push(`-... (${oldLines.length - 8} more lines)`);
+            if (newLines.length > 8) added.push(`+... (${newLines.length - 8} more lines)`);
+            return `--- ${path}\n+++ ${path}\n@@ edit preview @@\n${removed.join("\n")}\n${added.join("\n")}`;
+        }
+        return "";
+    }
+    function failureSummary(name, outputText) {
+        const txt = String(outputText || "");
+        let issue = "", next = "";
+        const mMissing = txt.match(/File not found:\s*([^\n]+)/i);
+        const mOldMiss = txt.match(/old_string not found/i);
+        const mMultiple = txt.match(/Found\s+(\d+)\s+occurrences\s+of\s+old_string/i);
+        const mTimeout = txt.match(/timed out/i);
+        const mExit = txt.match(/\[exit code:\s*(-?\d+)\]/i) || txt.match(/exited with code\s+(-?\d+)/i);
+        const mPerm = txt.match(/permission denied/i);
+        if (mMissing) {
+            issue = `Target file does not exist: ${mMissing[1].trim()}.`;
+            next = "Verify the path and create the file or correct the path before retrying.";
+        } else if (mOldMiss) {
+            issue = "Edit anchor was not found in the file.";
+            next = "Use more surrounding context or re-read the file to update the exact snippet.";
+        } else if (mMultiple) {
+            issue = `Edit anchor matched multiple locations (${mMultiple[1]} occurrences).`;
+            next = "Narrow the edit target with unique context lines.";
+        } else if (mTimeout) {
+            issue = "Tool operation timed out.";
+            next = "Retry with a narrower scope or increase timeout.";
+        } else if (mPerm) {
+            issue = "Permission denied while running the tool.";
+            next = "Check file/command permissions and retry.";
+        } else if (mExit) {
+            issue = `${toolTitle(name)} failed with exit code ${mExit[1]}.`;
+            next = "Inspect the output details and rerun after fixing the reported error.";
+        }
+        if (!issue) return null;
+        return { issue, next };
+    }
+    function makeProgressiveBody(text, className = "", maxChars = 2400) {
+        const wrap = document.createElement("div");
+        const pre = document.createElement("pre");
+        pre.className = `tool-result-body ${className}`.trim();
+        const full = String(text || "(no output)");
+        const short = full.slice(0, maxChars);
+        pre.textContent = full.length > maxChars ? `${short}\n…` : full;
+        wrap.appendChild(pre);
+        if (full.length > maxChars) {
+            const btn = document.createElement("button");
+            btn.className = "tool-show-more-btn";
+            btn.textContent = "Show more";
+            let expanded = false;
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                expanded = !expanded;
+                pre.textContent = expanded ? full : `${short}\n…`;
+                btn.textContent = expanded ? "Show less" : "Show more";
+            });
+            wrap.appendChild(btn);
+        }
+        return wrap;
+    }
+    function makeLocationList(rawText) {
+        const lines = String(rawText || "").split("\n");
+        const groups = [];
+        let currentGroup = "Matches";
+        for (const ln of lines) {
+            if (/^\s*definitions:\s*$/i.test(ln)) { currentGroup = "Definitions"; continue; }
+            if (/^\s*references:\s*$/i.test(ln)) { currentGroup = "References"; continue; }
+            const hit = parseLocationLine(ln);
+            if (hit) groups.push({ group: currentGroup, ...hit });
+        }
+        if (!groups.length) return null;
+        const wrap = document.createElement("div");
+        wrap.className = "tool-match-list";
+        const initial = 40;
+        const render = (maxItems) => {
+            wrap.innerHTML = "";
+            groups.slice(0, maxItems).forEach((hit) => {
+                const row = document.createElement("button");
+                row.type = "button";
+                row.className = "tool-match-item";
+                row.innerHTML = `<span class="tool-match-group">${escapeHtml(hit.group)}</span><span class="tool-match-loc">${escapeHtml(hit.path)}:${hit.line}</span><span class="tool-match-text">${escapeHtml(hit.text || "")}</span>`;
+                row.addEventListener("click", (e) => { e.stopPropagation(); openFileAt(hit.path, hit.line); });
+                wrap.appendChild(row);
+            });
+        };
+        render(initial);
+        if (groups.length > initial) {
+            const btn = document.createElement("button");
+            btn.className = "tool-show-more-btn";
+            btn.textContent = `Show ${groups.length - initial} more matches`;
+            let expanded = false;
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                expanded = !expanded;
+                render(expanded ? groups.length : initial);
+                btn.textContent = expanded ? "Show fewer matches" : `Show ${groups.length - initial} more matches`;
+                wrap.appendChild(btn);
+            });
+            wrap.appendChild(btn);
+        }
+        return wrap;
+    }
+    function makeReadFilePreview(rawText, input) {
+        const lines = String(rawText || "").split("\n");
+        const codeLines = [];
+        let header = "";
+        lines.forEach((ln) => {
+            if (!header && ln.startsWith("[")) header = ln;
+            const m = ln.match(/^\s*\d+\|(.*)$/);
+            if (m) codeLines.push(m[1]);
+        });
+        if (!codeLines.length) return null;
+        const wrap = document.createElement("div");
+        if (header) {
+            const meta = document.createElement("div");
+            meta.className = "tool-read-meta";
+            meta.textContent = header;
+            wrap.appendChild(meta);
+        }
+        const preWrap = makeProgressiveBody(codeLines.join("\n"), "tool-code-preview", 3000);
+        const pre = preWrap.querySelector("pre");
+        if (pre && typeof hljs !== "undefined") {
+            const ext = (input?.path || "").split(".").pop() || "";
+            const lang = langFromExt(ext);
+            if (hljs.getLanguage(lang)) {
+                const code = document.createElement("code");
+                code.className = `language-${lang}`;
+                code.textContent = pre.textContent;
+                pre.innerHTML = "";
+                pre.appendChild(code);
+                try { hljs.highlightElement(code); } catch {}
+            }
+        }
+        wrap.appendChild(preWrap);
+        return wrap;
+    }
+    function renderToolOutput(runEl, name, input, content, success, extraData) {
+        const out = document.createElement("div");
+        out.className = `tool-result ${success ? "tool-result-success" : "tool-result-error"} ${name === "run_command" ? "tool-result-terminal" : ""}`;
+        out.innerHTML = `<div class="tool-section-label">${name === "run_command" ? "Output" : "Result"}</div>`;
+
+        if (!success) {
+            const summary = failureSummary(name, content || extraData?.error || "");
+            if (summary) {
+                const box = document.createElement("div");
+                box.className = "tool-failure-summary";
+                box.innerHTML = `<div class="tool-failure-title">What failed: ${escapeHtml(summary.issue)}</div><div class="tool-failure-next">Next step: ${escapeHtml(summary.next)}</div>`;
+                out.appendChild(box);
+            }
+        }
+
+        if (name === "search" || name === "find_symbol") {
+            const list = makeLocationList(content);
+            if (list) out.appendChild(list);
+        }
+        if (name === "read_file") {
+            const preview = makeReadFilePreview(content, input);
+            if (preview) out.appendChild(preview);
+        }
+        if (name === "write_file" || name === "edit_file") {
+            const diff = buildEditPreviewDiff(name, input);
+            if (diff) {
+                const mini = document.createElement("div");
+                mini.className = "tool-mini-diff";
+                mini.innerHTML = renderDiff(diff);
+                out.appendChild(mini);
+            }
+        }
+
+        out.appendChild(makeProgressiveBody(content || "(no output)", name === "run_command" ? "tool-terminal-body" : "", name === "run_command" ? 6000 : 2400));
+        runEl.appendChild(out);
+        return out;
+    }
+    function updateToolGroupHeader(groupEl) {
+        const count = Number(groupEl.dataset.count || "1");
+        const firstAt = Number(groupEl.dataset.firstAt || Date.now());
+        const lastAt = Number(groupEl.dataset.lastAt || firstAt);
+        const countEl = groupEl.querySelector(".tool-count-badge");
+        if (countEl) countEl.textContent = count === 1 ? "1 call" : `${count} calls`;
+        const timeEl = groupEl.querySelector(".tool-time-range");
+        if (timeEl) timeEl.textContent = count === 1 ? formatClock(firstAt) : `${formatClock(firstAt)} - ${formatClock(lastAt)}`;
+    }
+    function maybeAutoFollow(groupEl, runEl) {
+        if (!groupEl || groupEl.dataset.toolName !== "run_command") return;
+        if (groupEl.dataset.follow !== "1") return;
+        const contentEl = groupEl.querySelector(".tool-content");
+        if (contentEl) contentEl.scrollTop = contentEl.scrollHeight;
+        const body = runEl.querySelector(".tool-terminal-body");
+        if (body) body.scrollTop = body.scrollHeight;
+        scrollChat();
+    }
     function addToolCall(name, input) {
         const bubble = getOrCreateBubble();
         const isCmd = name === "run_command";
-        // Commands auto-expand; everything else starts collapsed
-        const block = document.createElement("div");
-        block.className = isCmd ? "tool-block tool-block-command" : "tool-block collapsed";
-        block.dataset.toolName = name;
-        const desc = toolDesc(name, input), icon = toolIcon(name, input);
-        let statusHtml = "";
-        if (isCmd) {
-            statusHtml = `<span class="tool-status tool-status-running"><span class="tool-spinner"></span> Running</span>`
-                + `<button class="tool-stop-btn" title="Stop command">Stop</button>`;
-        }
-        const label = toolLabel(name);
-        if (isCmd) {
-            // Terminal-style layout for commands
-            block.innerHTML = `<div class="tool-header tool-header-cmd"><span class="tool-icon">${icon}</span><span class="tool-name">${escapeHtml(label)}</span><span class="tool-desc tool-desc-cmd">${escapeHtml(desc)}</span>${statusHtml}<span class="tool-chevron">\u25BC</span></div><div class="tool-content tool-content-cmd"><div class="tool-input tool-input-cmd">${escapeHtml(input?.command || JSON.stringify(input, null, 2))}</div></div>`;
+        const now = Date.now();
+        const key = toolGroupKey(name, input);
+
+        let group = null;
+        const canReuse =
+            lastToolGroup &&
+            lastToolGroup.isConnected &&
+            lastToolGroup.dataset.groupKey === key &&
+            (now - Number(lastToolGroup.dataset.lastAt || 0) < 60000);
+
+        if (canReuse) {
+            group = lastToolGroup;
+            group.classList.remove("collapsed");
+            group.dataset.lastAt = String(now);
+            group.dataset.count = String(Number(group.dataset.count || "1") + 1);
+            updateToolGroupHeader(group);
+            const statusEl = group.querySelector(".tool-status");
+            if (statusEl) {
+                statusEl.outerHTML = isCmd
+                    ? `<span class="tool-status tool-status-running"><span class="tool-spinner"></span> Running</span>`
+                    : `<span class="tool-status tool-status-pending">pending</span>`;
+            }
+            if (isCmd && !group.querySelector(".tool-stop-btn")) {
+                const actions = group.querySelector(".tool-actions");
+                if (actions) {
+                    const stopBtn = document.createElement("button");
+                    stopBtn.className = "tool-stop-btn";
+                    stopBtn.title = "Stop command";
+                    stopBtn.textContent = "Stop";
+                    stopBtn.addEventListener("click", (e) => {
+                        e.stopPropagation();
+                        send({ type: "cancel" });
+                        stopBtn.disabled = true;
+                        stopBtn.textContent = "Stopping\u2026";
+                        stopBtn.title = "Stopping\u2026";
+                    });
+                    actions.appendChild(stopBtn);
+                }
+            }
         } else {
-            block.innerHTML = `<div class="tool-header"><span class="tool-icon">${icon}</span><span class="tool-name">${escapeHtml(label)}</span><span class="tool-desc">${escapeHtml(desc)}</span>${statusHtml}<span class="tool-chevron">\u25BC</span></div><div class="tool-content"><div class="tool-input">${escapeHtml(JSON.stringify(input, null, 2))}</div></div>`;
-        }
-        block.querySelector(".tool-header").addEventListener("click", () => block.classList.toggle("collapsed"));
+            const desc = toolDesc(name, input);
+            const icon = toolIcon(name, input);
+            group = document.createElement("div");
+            group.className = isCmd ? "tool-block tool-block-command" : "tool-block collapsed";
+            group.dataset.toolName = name;
+            group.dataset.groupKey = key;
+            group.dataset.count = "1";
+            group.dataset.firstAt = String(now);
+            group.dataset.lastAt = String(now);
+            group.dataset.follow = "1";
+            if (input?.path) group.dataset.path = input.path;
+            const statusHtml = isCmd
+                ? `<span class="tool-status tool-status-running"><span class="tool-spinner"></span> Running</span>`
+                : `<span class="tool-status tool-status-pending">pending</span>`;
 
-        // Stop button for commands — sends cancel
-        const stopBtn = block.querySelector(".tool-stop-btn");
-        if (stopBtn) {
-            stopBtn.addEventListener("click", (e) => {
-                e.stopPropagation();
-                send({type: "cancel"});
-                stopBtn.disabled = true;
-                stopBtn.textContent = "Stopping\u2026";
-                stopBtn.title = "Stopping\u2026";
-            });
+            group.innerHTML = `
+                <div class="tool-header ${isCmd ? "tool-header-cmd" : ""}">
+                    <div class="tool-left">
+                        <span class="tool-icon-wrap"><span class="tool-icon">${icon}</span></span>
+                        <div class="tool-meta">
+                            <div class="tool-title-row"><span class="tool-title">${escapeHtml(toolTitle(name))}</span></div>
+                            <span class="tool-desc ${isCmd ? "tool-desc-cmd" : ""}">${escapeHtml(desc)}</span>
+                        </div>
+                    </div>
+                    <div class="tool-right">
+                        <span class="tool-count-badge">1 call</span>
+                        <span class="tool-time-range">${formatClock(now)}</span>
+                        ${statusHtml}
+                        <div class="tool-actions">
+                            <button type="button" class="tool-action-btn tool-action-open ${toolCanOpenFile(name, input) ? "" : "hidden"}">Open</button>
+                            <button type="button" class="tool-action-btn tool-action-rerun">Rerun</button>
+                            <button type="button" class="tool-action-btn tool-action-retry hidden">Retry</button>
+                            <button type="button" class="tool-action-btn tool-action-copy hidden">Copy output</button>
+                            ${isCmd ? `<button type="button" class="tool-action-btn tool-follow-btn">Pause follow</button>` : ""}
+                            ${isCmd ? `<button class="tool-stop-btn" title="Stop command">Stop</button>` : ""}
+                        </div>
+                        <span class="tool-chevron">\u25BC</span>
+                    </div>
+                </div>
+                <div class="tool-content ${isCmd ? "tool-content-cmd" : ""}">
+                    <div class="tool-run-list"></div>
+                </div>`;
+            group.querySelector(".tool-header").addEventListener("click", () => group.classList.toggle("collapsed"));
+
+            const path = input?.path;
+            const openBtn = group.querySelector(".tool-action-open");
+            if (openBtn && path) openBtn.addEventListener("click", (e) => { e.stopPropagation(); openFile(path); });
+            const rerunBtn = group.querySelector(".tool-action-rerun");
+            if (rerunBtn) rerunBtn.addEventListener("click", (e) => { e.stopPropagation(); runFollowupPrompt(toolFollowupPrompt(name, input, false)); });
+            const retryBtn = group.querySelector(".tool-action-retry");
+            if (retryBtn) retryBtn.addEventListener("click", (e) => { e.stopPropagation(); runFollowupPrompt(toolFollowupPrompt(name, input, true)); });
+            const copyBtn = group.querySelector(".tool-action-copy");
+            if (copyBtn) copyBtn.addEventListener("click", (e) => { e.stopPropagation(); copyText(group.dataset.latestOutput || ""); });
+            const followBtn = group.querySelector(".tool-follow-btn");
+            if (followBtn) {
+                followBtn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    const enabled = group.dataset.follow === "1";
+                    group.dataset.follow = enabled ? "0" : "1";
+                    followBtn.textContent = enabled ? "Resume follow" : "Pause follow";
+                    followBtn.classList.toggle("paused", enabled);
+                    if (!enabled) {
+                        const contentEl = group.querySelector(".tool-content");
+                        if (contentEl) contentEl.scrollTop = contentEl.scrollHeight;
+                    }
+                });
+            }
+            const stopBtn = group.querySelector(".tool-stop-btn");
+            if (stopBtn) {
+                stopBtn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    send({ type: "cancel" });
+                    stopBtn.disabled = true;
+                    stopBtn.textContent = "Stopping\u2026";
+                    stopBtn.title = "Stopping\u2026";
+                });
+            }
+            group.querySelectorAll(".tool-action-btn").forEach(btn => btn.addEventListener("click", e => e.stopPropagation()));
+
+            bubble.appendChild(group);
+            lastToolGroup = group;
         }
 
-        // Click file path to open in editor
-        if ((name === "read_file" || name === "write_file" || name === "edit_file" || name === "lint_file") && input?.path) {
-            const nameEl = block.querySelector(".tool-desc");
-            nameEl.style.cursor = "pointer";
-            nameEl.style.textDecoration = "underline";
-            nameEl.addEventListener("click", (e) => { e.stopPropagation(); openFile(input.path); });
-        }
-
-        bubble.appendChild(block);
+        const runList = group.querySelector(".tool-run-list");
+        const runIndex = Number(group.dataset.count || "1");
+        const run = document.createElement("div");
+        run.className = "tool-run";
+        run.dataset.runIndex = String(runIndex);
+        run.dataset.toolName = name;
+        if (input?.path) run.dataset.path = input.path;
+        run.innerHTML = `
+            <div class="tool-run-header">
+                <span class="tool-run-index">Run ${runIndex}</span>
+                <span class="tool-run-time">${formatClock(now)}</span>
+            </div>
+            <div class="tool-section-label">${isCmd ? "Command" : "Input"}</div>`;
+        const inputText = isCmd ? (input?.command || JSON.stringify(input, null, 2)) : JSON.stringify(input, null, 2);
+        run.appendChild(makeProgressiveBody(inputText || "{}", isCmd ? "tool-input tool-input-cmd" : "tool-input", isCmd ? 2800 : 1800));
+        runList.appendChild(run);
+        toolRunState.set(run, { name, input: input || {}, output: "" });
         scrollChat();
-        return block;
+        return run;
     }
-    function addToolResult(content, success, block, extraData) {
-        if (!block) return;
-        const div = block.querySelector(".tool-content");
-        const isCmd = block.dataset.toolName === "run_command";
-        const r = document.createElement("div");
-        if (isCmd) {
-            // Terminal-style output
-            r.className = `tool-result tool-result-terminal ${success ? "tool-result-success" : "tool-result-error"}`;
-            r.textContent = content || "(no output)";
-        } else {
-            r.className = `tool-result ${success ? "tool-result-success" : "tool-result-error"}`;
-            r.style.marginTop = "6px"; r.style.borderTop = "1px solid var(--border-light)"; r.style.paddingTop = "6px";
-            r.textContent = truncate(content, 1500);
-        }
-        div.appendChild(r);
-        block.appendChild(makeCopyBtn(content));
+    function addToolResult(content, success, runEl, extraData) {
+        if (!runEl) return;
+        const state = toolRunState.get(runEl);
+        if (!state) return;
+        const group = runEl.closest(".tool-block");
+        if (!group) return;
+        const isCmd = state.name === "run_command";
 
-        // Remove stop button once done
-        const stopBtn = block.querySelector(".tool-stop-btn");
-        if (stopBtn) stopBtn.remove();
+        const baseOutput = String(content || extraData?.error || "");
+        const rawOutput = baseOutput || "(no output)";
+        const prior = state.output || "";
+        const merged = isCmd
+            ? (baseOutput ? ((prior && !prior.includes(baseOutput)) ? `${prior}\n${baseOutput}` : (prior || baseOutput)) : (prior || rawOutput))
+            : (rawOutput || prior || "(no output)");
+        state.output = merged;
+        toolRunState.set(runEl, state);
 
-        // Update status badge for commands
-        const statusEl = block.querySelector(".tool-status");
+        runEl.querySelector(".tool-result")?.remove();
+        renderToolOutput(runEl, state.name, state.input, merged, success, extraData);
+
+        group.dataset.latestOutput = merged;
+        const copyBtn = group.querySelector(".tool-action-copy");
+        if (copyBtn) copyBtn.classList.remove("hidden");
+        const retryBtn = group.querySelector(".tool-action-retry");
+        if (retryBtn) retryBtn.classList.toggle("hidden", success !== false);
+
+        const statusEl = group.querySelector(".tool-status");
         if (statusEl) {
             if (isCmd) {
                 const exitCode = extraData?.exit_code;
                 const duration = extraData?.duration;
-                let badge = "";
-                if (success) {
-                    badge = `<span class="tool-status tool-status-success">exit 0</span>`;
-                } else {
-                    const code = exitCode !== undefined && exitCode !== null ? exitCode : "?";
-                    badge = `<span class="tool-status tool-status-error">exit ${code}</span>`;
-                }
-                if (duration !== undefined && duration !== null) {
-                    badge += `<span class="tool-status tool-status-duration">${duration}s</span>`;
-                }
+                let badge = success ? `<span class="tool-status tool-status-success">exit 0</span>` : `<span class="tool-status tool-status-error">exit ${exitCode ?? "?"}</span>`;
+                if (duration !== undefined && duration !== null) badge += `<span class="tool-status tool-status-duration">${duration}s</span>`;
                 statusEl.outerHTML = badge;
             } else {
-                statusEl.remove();
+                statusEl.outerHTML = success ? `<span class="tool-status tool-status-success">done</span>` : `<span class="tool-status tool-status-error">failed</span>`;
             }
         }
+
+        const stopBtn = group.querySelector(".tool-stop-btn");
+        if (stopBtn && success !== undefined) stopBtn.remove();
+        maybeAutoFollow(group, runEl);
+        scrollChat();
     }
     function toolLabel(n) {
         const labels = {
@@ -1021,9 +1404,25 @@
             search: "Search",
             list_directory: "List Files",
             glob_find: "Find Files",
+            find_symbol: "Find Symbol",
             scout: "Scout",
         };
         return labels[n] || n;
+    }
+    function toolTitle(n) {
+        const titles = {
+            read_file: "Read File",
+            write_file: "Write File",
+            edit_file: "Edit File",
+            lint_file: "Lint File",
+            run_command: "Run Command",
+            search: "Search",
+            list_directory: "List Directory",
+            glob_find: "Find Files",
+            find_symbol: "Find Symbol",
+            scout: "Scout",
+        };
+        return titles[n] || toolLabel(n);
     }
     function toolDesc(n, i) {
         switch(n) {
@@ -1035,6 +1434,7 @@
             case "search": return `"${i?.pattern || ""}" in ${i?.path || "."}`;
             case "list_directory": return i?.path || ".";
             case "glob_find": return i?.pattern || "";
+            case "find_symbol": return `${i?.symbol || ""} (${i?.kind || "all"}) in ${i?.path || "."}`;
             case "scout": return i?.task || "";
             default: return "";
         }
@@ -1047,6 +1447,7 @@
         const svgs = {
             run_command: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`,
             search: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`,
+            find_symbol: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16"/><path d="M7 4v3a5 5 0 0 0 10 0V4"/><line x1="12" y1="17" x2="12" y2="21"/><line x1="8" y1="21" x2="16" y2="21"/></svg>`,
             list_directory: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`,
             glob_find: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><path d="M11 8v6"/><path d="M8 11h6"/></svg>`,
             scout: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`,
@@ -1483,7 +1884,12 @@
                 break;
             case "thinking_start": currentThinkingEl = createThinkingBlock(); break;
             case "thinking":
-                if (currentThinkingEl) { currentThinkingEl.textContent += evt.content || ""; scrollChat(); }
+                if (currentThinkingEl) {
+                    currentThinkingEl.textContent += evt.content || "";
+                    const thinkingBlock = currentThinkingEl.closest(".thinking-block");
+                    updateThinkingHeader(thinkingBlock, false);
+                    scrollChat();
+                }
                 break;
             case "thinking_end": finishThinking(currentThinkingEl); currentThinkingEl = null; break;
             case "text_start": currentTextEl = null; currentTextBuffer = ""; break;
@@ -1517,8 +1923,8 @@
                 if (lastToolBlock) {
                     const tn = lastToolBlock.dataset.toolName;
                     if (tn === "write_file" || tn === "edit_file") {
-                        const desc = lastToolBlock.querySelector(".tool-desc")?.textContent;
-                        if (desc) reloadFileInEditor(desc);
+                        const path = lastToolBlock.dataset.path;
+                        if (path) reloadFileInEditor(path);
                     }
                 }
                 lastToolBlock = null;
@@ -1584,7 +1990,8 @@
                     if (span) span.textContent = span.textContent.replace(/…$/, "") + " — cancelled";
                 });
                 // 4. Thinking spinner
-                document.querySelectorAll(".thinking-block .spinner").forEach(el => el.remove());
+                document.querySelectorAll(".thinking-block .thinking-spinner").forEach(el => el.remove());
+                document.querySelectorAll(".thinking-block").forEach(el => updateThinkingHeader(el, true));
                 lastToolBlock = null;
                 break;
             case "reset_done":
@@ -1625,7 +2032,7 @@
                 lastToolBlock = addToolCall(evt.data?.name || "tool", evt.data?.input || {});
                 break;
             case "replay_tool_result":
-                addToolResult(evt.content || "", evt.data?.success !== false, lastToolBlock);
+                addToolResult(evt.content || "", evt.data?.success !== false, lastToolBlock, evt.data);
                 lastToolBlock = null;
                 break;
             case "replay_done":
