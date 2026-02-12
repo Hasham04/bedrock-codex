@@ -118,6 +118,7 @@
             <div class="welcome-modal-overlay"></div>
             <div class="welcome-modal-body ssh-browse-body">
                 <h3>Choose remote folder</h3>
+                <p class="ssh-browse-hint">Click a folder to open it. Use the path above to go back.</p>
                 <div class="ssh-browse-breadcrumb" id="ssh-browse-breadcrumb"></div>
                 <div class="ssh-browse-list" id="ssh-browse-list">
                     <div class="ssh-browse-loading">Connecting…</div>
@@ -211,7 +212,16 @@
 
             <!-- Center: Code Editor -->
             <main id="editor-panel">
-                <div id="tab-bar"></div>
+                <div class="editor-tab-row">
+                    <div id="tab-bar"></div>
+                    <div class="editor-tab-actions">
+                        <button id="terminal-toggle-btn" class="icon-btn-sm" title="Toggle Terminal" aria-label="Toggle Terminal">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
                 <div id="editor-container">
                     <div id="editor-welcome">
                         <div class="editor-welcome-inner">
@@ -220,6 +230,21 @@
                         </div>
                     </div>
                     <div id="monaco-container"></div>
+                </div>
+                <div class="resize-handle terminal-resize-handle hidden" id="resize-terminal" title="Drag to resize terminal"></div>
+                <div id="terminal-panel" class="terminal-panel hidden">
+                    <div class="terminal-panel-header">
+                        <span class="terminal-panel-title">Terminal</span>
+                        <div class="terminal-panel-actions">
+                            <button id="terminal-clear-btn" class="icon-btn-sm" title="Clear">Clear</button>
+                            <button id="terminal-close-btn" class="icon-btn-sm" title="Close panel" aria-label="Close terminal">&#x00D7;</button>
+                        </div>
+                    </div>
+                    <div id="terminal-output" class="terminal-output"></div>
+                    <div class="terminal-input-row">
+                        <span id="terminal-prompt" class="terminal-prompt"></span>
+                        <input type="text" id="terminal-input" class="terminal-input" placeholder="Type a command..." spellcheck="false" autocomplete="off" />
+                    </div>
                 </div>
             </main>
 

@@ -18,7 +18,7 @@ import posixpath
 import shlex
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 from dotenv import load_dotenv
 
@@ -343,6 +343,73 @@ async def set_directory(body: dict):
     _backend = LocalBackend(resolved)
     _ssh_info = None  # Clear SSH info when switching to local
     return {"ok": True, "path": resolved}
+
+
+@app.get("/api/terminal-cwd")
+async def terminal_cwd():
+    """Return current working directory for the integrated terminal (project root)."""
+    if _backend is None:
+        return {"ok": False, "cwd": None}
+    return {"ok": True, "cwd": _backend.working_directory}
+
+
+def _terminal_cwd_ok(backend, requested_cwd: str) -> Tuple[bool, str]:
+    """Validate requested cwd is under project root. Returns (ok, resolved_cwd)."""
+    root = backend.working_directory
+    if not requested_cwd or requested_cwd == ".":
+        return True, root
+    # SSH backend: root is remote path; allow root or subdirs (string prefix)
+    if getattr(backend, "_host", None) is not None:
+        root_norm = root.rstrip("/")
+        req_norm = requested_cwd.rstrip("/")
+        if req_norm == root_norm or req_norm.startswith(root_norm + "/"):
+            return True, requested_cwd
+        return False, root
+    # Local: resolve and ensure under project root
+    try:
+        req_abs = os.path.abspath(os.path.join(root, requested_cwd)) if not os.path.isabs(requested_cwd) else requested_cwd
+        req_real = os.path.realpath(req_abs)
+        root_real = os.path.realpath(root)
+        if req_real == root_real or req_real.startswith(root_real.rstrip(os.sep) + os.sep):
+            return True, req_real
+    except Exception:
+        pass
+    return False, root
+
+
+@app.post("/api/terminal-run")
+async def terminal_run(request: Request):
+    """Run a shell command in the given cwd (default project root). Returns stdout, stderr, returncode, cwd."""
+    global _backend
+    if _backend is None:
+        return JSONResponse({"ok": False, "error": "No project open. Open a local folder or connect via SSH first."}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"Invalid request: {e!s}"}, status_code=400)
+    command = (body.get("command") or "").strip()
+    if not command:
+        return JSONResponse({"ok": False, "error": "No command"}, status_code=400)
+    requested_cwd = (body.get("cwd") or "").strip() or "."
+    ok, cwd = _terminal_cwd_ok(_backend, requested_cwd)
+    if not ok:
+        return JSONResponse({"ok": False, "error": "Directory not under project root"}, status_code=400)
+    timeout = min(int(body.get("timeout", 60)), 300)
+    try:
+        stdout, stderr, returncode = await asyncio.to_thread(
+            _backend.run_command, command, cwd, timeout
+        )
+        return {
+            "ok": True,
+            "stdout": stdout or "",
+            "stderr": stderr or "",
+            "returncode": returncode,
+            "cwd": cwd,
+        }
+    except Exception as e:
+        err_msg = str(e).strip() or "Command failed"
+        logger.exception("Terminal run failed")
+        return JSONResponse({"ok": False, "error": err_msg}, status_code=500)
 
 
 # ------------------------------------------------------------------

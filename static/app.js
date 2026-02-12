@@ -72,6 +72,15 @@
     const $replaceInput  = document.getElementById("replace-input");
     const $replaceAllBtn = document.getElementById("replace-all-btn");
     const $replaceToggle = document.getElementById("search-replace-toggle");
+    const $terminalToggleBtn = document.getElementById("terminal-toggle-btn");
+    const $terminalPanel = document.getElementById("terminal-panel");
+    const $terminalOutput = document.getElementById("terminal-output");
+    const $terminalInput = document.getElementById("terminal-input");
+    const $terminalPrompt = document.getElementById("terminal-prompt");
+    const $terminalCloseBtn = document.getElementById("terminal-close-btn");
+    const $terminalClearBtn = document.getElementById("terminal-clear-btn");
+    const $resizeTerminal = document.getElementById("resize-terminal");
+    let terminalCwd = null;  // current working directory for terminal (project root or after cd)
 
     // ── State ─────────────────────────────────────────────────
     let ws = null;
@@ -1007,6 +1016,167 @@
 
     setupResize("resize-left", document.getElementById("file-explorer"), null, "left");
     setupResize("resize-right", null, document.getElementById("chat-panel"), "right");
+
+    // ================================================================
+    // INTEGRATED TERMINAL (bottom of editor panel)
+    // ================================================================
+
+    const TERMINAL_DEFAULT_HEIGHT = 220;
+    const TERMINAL_MIN_HEIGHT = 100;
+
+    async function updateTerminalPrompt() {
+        if (!$terminalPrompt) return;
+        try {
+            const res = await fetch("/api/terminal-cwd");
+            const data = await res.json();
+            const cwd = data.ok && data.cwd ? data.cwd : "~";
+            terminalCwd = cwd !== "~" ? cwd : null;
+            const short = cwd.split("/").filter(Boolean).pop() || cwd.replace(/^.*@/, "").split(":").pop() || "~";
+            $terminalPrompt.textContent = short + " $ ";
+        } catch {
+            terminalCwd = null;
+            $terminalPrompt.textContent = "$ ";
+        }
+    }
+
+    function setTerminalCwdFromResponse(cwd) {
+        if (cwd) terminalCwd = cwd;
+        if ($terminalPrompt && terminalCwd) {
+            const short = terminalCwd.split("/").filter(Boolean).pop() || terminalCwd.replace(/^.*@/, "").split(":").pop() || "~";
+            $terminalPrompt.textContent = short + " $ ";
+        }
+    }
+
+    function appendTerminalLine(htmlOrText, className) {
+        if (!$terminalOutput) return;
+        const line = document.createElement("div");
+        line.className = "terminal-line" + (className ? " " + className : "");
+        if (htmlOrText.startsWith("<")) {
+            line.innerHTML = htmlOrText;
+        } else {
+            line.textContent = htmlOrText;
+        }
+        $terminalOutput.appendChild(line);
+        $terminalOutput.scrollTop = $terminalOutput.scrollHeight;
+    }
+
+    async function runTerminalCommand() {
+        const cmd = $terminalInput && $terminalInput.value.trim();
+        if (!cmd) return;
+        if ($terminalInput) $terminalInput.value = "";
+        const promptText = ($terminalPrompt && $terminalPrompt.textContent) || "$ ";
+        appendTerminalLine(promptText + escapeHtml(cmd), "terminal-command");
+        appendTerminalLine("", "terminal-running");
+        const runningEl = $terminalOutput.lastElementChild;
+        const isCd = cmd === "cd" || (cmd.startsWith("cd ") && cmd.length > 3);
+        const runCmd = isCd ? (cmd === "cd" ? "cd && pwd" : cmd + " && pwd") : cmd;
+        const body = { command: runCmd };
+        if (terminalCwd) body.cwd = terminalCwd;
+        try {
+            const res = await fetch("/api/terminal-run", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+            const data = await res.json();
+            if (runningEl) runningEl.remove();
+            if (data.ok) {
+                if (data.stdout) appendTerminalLine(data.stdout, "terminal-stdout");
+                if (data.stderr) appendTerminalLine(data.stderr, "terminal-stderr");
+                if (data.cwd) {
+                    if (isCd && data.stdout) {
+                        const firstLine = data.stdout.trim().split("\n")[0].trim();
+                        if (firstLine) terminalCwd = firstLine;
+                        else terminalCwd = data.cwd;
+                    } else {
+                        terminalCwd = data.cwd;
+                    }
+                    setTerminalCwdFromResponse(terminalCwd);
+                }
+            } else {
+                appendTerminalLine("Error: " + (data.error && data.error.trim() ? data.error.trim() : "Unknown"), "terminal-stderr");
+            }
+        } catch (e) {
+            if (runningEl) runningEl.remove();
+            appendTerminalLine("Error: " + (e.message || "Request failed"), "terminal-stderr");
+        }
+        if ($terminalOutput) $terminalOutput.scrollTop = $terminalOutput.scrollHeight;
+    }
+
+    function setTerminalPanelVisible(visible) {
+        if (!$terminalPanel || !$resizeTerminal) return;
+        if (visible) {
+            $terminalPanel.classList.remove("hidden");
+            $resizeTerminal.classList.remove("hidden");
+            if (!$terminalPanel.style.height || $terminalPanel.dataset.height) {
+                $terminalPanel.style.height = ($terminalPanel.dataset.height || TERMINAL_DEFAULT_HEIGHT) + "px";
+            }
+            updateTerminalPrompt();
+            if ($terminalToggleBtn) $terminalToggleBtn.classList.add("active");
+        } else {
+            $terminalPanel.classList.add("hidden");
+            $resizeTerminal.classList.add("hidden");
+            if ($terminalToggleBtn) $terminalToggleBtn.classList.remove("active");
+        }
+        requestAnimationFrame(() => {
+            if (monacoInstance) monacoInstance.layout();
+            if (diffEditorInstance) diffEditorInstance.layout();
+        });
+    }
+
+    function toggleTerminalPanel() {
+        const isHidden = $terminalPanel && $terminalPanel.classList.contains("hidden");
+        setTerminalPanelVisible(!!isHidden);
+    }
+
+    if ($terminalToggleBtn) {
+        $terminalToggleBtn.addEventListener("click", toggleTerminalPanel);
+    }
+    if ($terminalCloseBtn) {
+        $terminalCloseBtn.addEventListener("click", () => setTerminalPanelVisible(false));
+    }
+    if ($terminalClearBtn) {
+        $terminalClearBtn.addEventListener("click", () => {
+            if ($terminalOutput) $terminalOutput.innerHTML = "";
+        });
+    }
+    if ($terminalInput) {
+        $terminalInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") {
+                e.preventDefault();
+                runTerminalCommand();
+            }
+        });
+    }
+
+    // Terminal panel vertical resize
+    if ($resizeTerminal && $terminalPanel) {
+        $resizeTerminal.addEventListener("mousedown", (e) => {
+            e.preventDefault();
+            const startY = e.clientY;
+            const startHeight = $terminalPanel.offsetHeight;
+            $resizeTerminal.classList.add("dragging");
+            document.body.style.cursor = "row-resize";
+            document.body.style.userSelect = "none";
+            function onMove(ev) {
+                const dy = ev.clientY - startY;
+                const newHeight = Math.max(TERMINAL_MIN_HEIGHT, startHeight - dy);
+                $terminalPanel.style.height = newHeight + "px";
+                $terminalPanel.dataset.height = newHeight;
+                if (monacoInstance) monacoInstance.layout();
+                if (diffEditorInstance) diffEditorInstance.layout();
+            }
+            function onUp() {
+                $resizeTerminal.classList.remove("dragging");
+                document.body.style.cursor = "";
+                document.body.style.userSelect = "";
+                document.removeEventListener("mousemove", onMove);
+                document.removeEventListener("mouseup", onUp);
+            }
+            document.addEventListener("mousemove", onMove);
+            document.addEventListener("mouseup", onUp);
+        });
+    }
 
     // ================================================================
     // CHAT — Messages
@@ -3115,13 +3285,6 @@
             });
             if (listHtml === "") listHtml = '<div class="ssh-browse-empty">No entries</div>';
             $sshBrowseList.innerHTML = listHtml;
-
-            $sshBrowseList.querySelectorAll(".ssh-browse-entry.dir, .ssh-browse-up, .ssh-browse-seg[data-dir]").forEach(btn => {
-                btn.addEventListener("click", () => {
-                    const dir = btn.dataset.dir;
-                    if (dir) loadSshBrowseDir(dir);
-                });
-            });
         } catch (e) {
             $sshBrowseList.innerHTML = `<div class="ssh-browse-error">${escapeHtml(e.message || "Network error")}</div>`;
         }
@@ -3133,6 +3296,25 @@
             $sshBrowseModal.classList.remove("hidden");
             sshBrowseCurrentPath = $sshDir.value.trim() || "~";
             loadSshBrowseDir(sshBrowseCurrentPath);
+        });
+    }
+    // One delegated listener so clicking any folder (or breadcrumb) navigates
+    if ($sshBrowseList) {
+        $sshBrowseList.addEventListener("click", (e) => {
+            const btn = e.target.closest(".ssh-browse-entry.dir[data-dir]");
+            if (btn && btn.dataset.dir) {
+                e.preventDefault();
+                loadSshBrowseDir(btn.dataset.dir);
+            }
+        });
+    }
+    if ($sshBrowseBreadcrumb) {
+        $sshBrowseBreadcrumb.addEventListener("click", (e) => {
+            const btn = e.target.closest(".ssh-browse-up[data-dir], .ssh-browse-seg[data-dir]");
+            if (btn && btn.dataset.dir) {
+                e.preventDefault();
+                loadSshBrowseDir(btn.dataset.dir);
+            }
         });
     }
     if ($sshBrowseSelect) {
