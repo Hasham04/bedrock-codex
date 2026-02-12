@@ -177,7 +177,7 @@ When the user or plan gives multiple distinct tasks (e.g. "do X. Also do Y. Then
 <execution_principles>
 1. **Follow the plan, think for yourself**: Execute steps in order, but you're not a robot. If you see something the plan missed — a better approach, a missed edge case, a simpler solution — adapt. State what you changed and why.
 2. **Read before write. Always.**: Never modify a file you haven't read in this session. Understand the surrounding code, the imports, the patterns. Your change must fit seamlessly into the existing codebase — same style, same patterns, same level of quality.
-3. **Surgical precision**: Use edit_file with enough context (3-5 surrounding lines) to match exactly one location. Use write_file only for new files or complete rewrites. Every edit should be the minimum change that fully solves the problem.
+3. **Surgical precision**: Use `symbol_edit` for symbol-level refactors (function/class/type blocks). Use `edit_file` with enough context (3-5 surrounding lines) for exact string edits. Use `write_file` only for new files or complete rewrites. Every edit should be the minimum change that fully solves the problem.
 4. **Verify everything**: After every file modification:
    (a) Re-read the changed section. Confirm the edit is correct.
    (b) Run the linter or type checker on the file. Fix any errors before moving on.
@@ -217,6 +217,7 @@ Before every batch of tool calls, output 1-2 sentences stating what you will do 
 <tool_usage>
 - `read_file`: Reads with line numbers. Use `offset` + `limit` to read specific sections of large files instead of the whole file.
 - `edit_file`: old_string must match EXACTLY one location, including all whitespace. Include surrounding lines for uniqueness. If it fails, re-read the file — the content may have changed.
+- `symbol_edit`: Prefer for safer symbol-level refactors. Target symbol name + kind (+ occurrence when needed) instead of brittle regex/string heuristics.
 - `write_file`: Overwrites entirely. Only for new files or when >50% changes. Prefer edit_file.
 - `run_command`: Runs in working directory. Check stdout AND stderr. Non-zero exit = failure.
 - `search`: Regex search across files with ripgrep. Returns matching lines with paths and line numbers. Use `include` to filter by file type.
@@ -551,6 +552,9 @@ class CodingAgent:
         self._file_cache: Dict[str, tuple] = {}
         # Per-step checkpoints: {step_num: {abs_path: content_or_None}}
         self._step_checkpoints: Dict[int, Dict[str, Optional[str]]] = {}
+        # Session checkpoints for rewind across risky batches
+        self._session_checkpoints: List[Dict[str, Any]] = []
+        self._checkpoint_counter: int = 0
         # Deterministic verification gate status for current run/build
         self._deterministic_verification_done: bool = False
         # Task decomposition of current plan (execution batches)
@@ -594,6 +598,8 @@ class CodingAgent:
         self._plan_step_index = 0
         self._file_cache = {}
         self._step_checkpoints = {}
+        self._session_checkpoints = []
+        self._checkpoint_counter = 0
         self._deterministic_verification_done = False
         self._current_plan_decomposition = []
         self._failure_pattern_cache = None
@@ -662,6 +668,92 @@ class CodingAgent:
             if s > step_num:
                 del self._step_checkpoints[s]
         self._plan_step_index = step_num
+        return reverted
+
+    # ------------------------------------------------------------------
+    # Session checkpoints + rewind
+    # ------------------------------------------------------------------
+
+    def _create_session_checkpoint(self, label: str, target_paths: Optional[List[str]] = None) -> Optional[str]:
+        """Capture a checkpoint of current file states before risky operations."""
+        if not app_config.session_checkpoints_enabled:
+            return None
+
+        paths: List[str] = []
+        if target_paths:
+            paths.extend([p for p in target_paths if p])
+        if not paths:
+            paths.extend(list(self._file_snapshots.keys()))
+        if not paths:
+            paths.extend(list(self._file_cache.keys()))
+        if not paths:
+            return None
+
+        files: Dict[str, Optional[str]] = {}
+        for abs_path in sorted(set(paths)):
+            try:
+                if self.backend.file_exists(abs_path):
+                    files[abs_path] = self.backend.read_file(abs_path)
+                else:
+                    files[abs_path] = None
+            except Exception:
+                files[abs_path] = None
+        if not files:
+            return None
+
+        self._checkpoint_counter += 1
+        checkpoint_id = f"cp-{int(time.time())}-{self._checkpoint_counter}"
+        self._session_checkpoints.append({
+            "id": checkpoint_id,
+            "label": label[:120],
+            "created_at": int(time.time()),
+            "files": files,
+        })
+        # Keep only recent checkpoints
+        self._session_checkpoints = self._session_checkpoints[-25:]
+        return checkpoint_id
+
+    def list_session_checkpoints(self) -> List[Dict[str, Any]]:
+        """List checkpoints without embedding full file payloads."""
+        out = []
+        for cp in self._session_checkpoints:
+            out.append({
+                "id": cp.get("id"),
+                "label": cp.get("label", ""),
+                "created_at": cp.get("created_at", 0),
+                "file_count": len(cp.get("files", {}) or {}),
+            })
+        return out
+
+    def rewind_to_checkpoint(self, checkpoint_id: str = "latest") -> List[str]:
+        """Restore files from a session checkpoint id (or latest)."""
+        if not self._session_checkpoints:
+            return []
+        checkpoint = None
+        if checkpoint_id == "latest":
+            checkpoint = self._session_checkpoints[-1]
+        else:
+            for cp in self._session_checkpoints:
+                if cp.get("id") == checkpoint_id:
+                    checkpoint = cp
+                    break
+        if not checkpoint:
+            return []
+
+        reverted: List[str] = []
+        files = checkpoint.get("files", {}) or {}
+        for abs_path, content in files.items():
+            try:
+                if content is None:
+                    if self.backend.file_exists(abs_path):
+                        self.backend.remove_file(abs_path)
+                        reverted.append(abs_path)
+                else:
+                    self.backend.write_file(abs_path, content)
+                    reverted.append(abs_path)
+                self._file_cache.pop(abs_path, None)
+            except Exception as e:
+                logger.warning(f"Failed to rewind {abs_path} from checkpoint {checkpoint.get('id')}: {e}")
         return reverted
 
     # ------------------------------------------------------------------
@@ -871,7 +963,7 @@ class CodingAgent:
             return PolicyDecision()
 
         # File path protections
-        if tool_name in ("write_file", "edit_file"):
+        if tool_name in ("write_file", "edit_file", "symbol_edit"):
             path = (tool_input.get("path", "") or "").lower()
             protected = (".env", "credentials", "secret", "id_rsa", ".pem", "token")
             if any(tok in path for tok in protected):
@@ -946,6 +1038,61 @@ class CodingAgent:
             b["targets"] = sorted(list(dict.fromkeys(b.get("targets", []))))[:20]
         return batches
 
+    async def _run_parallel_manager_workers(self, task: str, decomposition: List[Dict[str, Any]]) -> str:
+        """Run lightweight parallel worker analyses and merge into manager insights."""
+        if not app_config.parallel_subagents_enabled:
+            return ""
+        lanes = [b for b in decomposition if b.get("type") == "file_batch" and b.get("steps")]
+        if len(lanes) < 2:
+            return ""
+
+        max_workers = max(1, min(app_config.parallel_subagents_max_workers, len(lanes), 4))
+        selected = lanes[:max_workers]
+        loop = asyncio.get_event_loop()
+        cfg = GenerationConfig(
+            max_tokens=1800,
+            enable_thinking=False,
+            throughput_mode=model_config.throughput_mode,
+        )
+
+        def _worker_prompt(batch: Dict[str, Any]) -> str:
+            steps = "\n".join(f"- {s.get('step','')}" for s in batch.get("steps", [])[:8])
+            targets = ", ".join(batch.get("targets", [])[:12]) or "n/a"
+            return (
+                "You are a worker agent for one execution lane.\n"
+                "Return concise actionable guidance with this exact format:\n"
+                "Edits:\n- ...\nRisks:\n- ...\nVerification:\n- ...\n\n"
+                f"Task:\n{task[:2000]}\n\n"
+                f"Lane batch #{batch.get('batch')} targets: {targets}\n"
+                f"Lane steps:\n{steps}\n"
+            )
+
+        async def _run_worker(batch: Dict[str, Any]) -> str:
+            prompt = _worker_prompt(batch)
+            def _call():
+                res = self.service.generate_response(
+                    messages=[{"role": "user", "content": prompt}],
+                    system_prompt="You produce terse worker execution guidance for a coding manager.",
+                    model_id=app_config.fast_model or self.service.model_id,
+                    config=cfg,
+                )
+                return (res.content or "").strip()
+            try:
+                out = await loop.run_in_executor(None, _call)
+                return out
+            except Exception as e:
+                return f"Worker failed: {e}"
+
+        worker_outputs = await asyncio.gather(*[_run_worker(b) for b in selected])
+        merged_lines = []
+        for idx, txt in enumerate(worker_outputs, start=1):
+            if not txt:
+                continue
+            merged_lines.append(f"### Worker lane {idx}\n{txt[:2000]}")
+        if not merged_lines:
+            return ""
+        return "\n\n".join(merged_lines)
+
     # ------------------------------------------------------------------
     # File snapshots — capture originals before modifications
     # ------------------------------------------------------------------
@@ -996,10 +1143,53 @@ class CodingAgent:
                         pass
         return test_files
 
+    def _select_impacted_tests(self, modified_paths: List[str]) -> List[str]:
+        """Select likely impacted tests before any full-suite run."""
+        impacted = []
+        seen = set()
+
+        # 1) Structural adjacency heuristics
+        for tf in self._discover_test_files(modified_paths):
+            if tf not in seen:
+                impacted.append(tf)
+                seen.add(tf)
+
+        if not app_config.test_impact_selection_enabled:
+            return impacted
+
+        # 2) Lightweight symbol/name matching in known test dirs
+        candidate_roots = ["tests", "test", "__tests__"]
+        for abs_path in modified_paths[:30]:
+            base = os.path.basename(abs_path)
+            name, _ext = os.path.splitext(base)
+            if not name:
+                continue
+            pattern = re.escape(name)
+            for root in candidate_roots:
+                try:
+                    if not self.backend.file_exists(root) or not self.backend.is_dir(root):
+                        continue
+                    raw = self.backend.search(pattern, root, include="*.py", cwd=".")
+                    if not raw:
+                        continue
+                    for line in raw.split("\n")[:60]:
+                        m = re.match(r"^(.+?):\d+:", line.strip())
+                        if not m:
+                            continue
+                        p = m.group(1).strip()
+                        rel = os.path.relpath(p, self.working_directory) if os.path.isabs(p) else p
+                        if rel not in seen:
+                            impacted.append(rel)
+                            seen.add(rel)
+                except Exception:
+                    continue
+
+        return impacted[:40]
+
     def _snapshot_file(self, tool_name: str, tool_input: Dict[str, Any]) -> None:
         """Capture the original content of a file before it's modified.
         Only snapshots once per file per build run — first write wins."""
-        if tool_name not in ("write_file", "edit_file"):
+        if tool_name not in ("write_file", "edit_file", "symbol_edit"):
             return
 
         rel_path = tool_input.get("path", "")
@@ -1047,7 +1237,7 @@ class CodingAgent:
         if tool_name == "run_command":
             # Match on the exact command string
             return f"cmd:{tool_input.get('command', '')}"
-        elif tool_name in ("write_file", "edit_file"):
+        elif tool_name in ("write_file", "edit_file", "symbol_edit"):
             # Match on (operation, absolute path)
             path = tool_input.get("path", "")
             return f"{tool_name}:{os.path.abspath(os.path.join(self.working_directory, path))}"
@@ -1081,6 +1271,21 @@ class CodingAgent:
                 except (UnicodeDecodeError, UnicodeEncodeError):
                     pass  # skip binary files
 
+        checkpoints: List[Dict[str, Any]] = []
+        for cp in self._session_checkpoints[-10:]:
+            files = {}
+            for p, c in (cp.get("files", {}) or {}).items():
+                if c is None:
+                    files[p] = None
+                elif isinstance(c, str) and len(c) < 1_000_000:
+                    files[p] = c
+            checkpoints.append({
+                "id": cp.get("id"),
+                "label": cp.get("label", ""),
+                "created_at": cp.get("created_at", 0),
+                "files": files,
+            })
+
         return {
             "history": self.history,
             "token_usage": {
@@ -1095,6 +1300,8 @@ class CodingAgent:
             "current_plan_decomposition": self._current_plan_decomposition,
             "scout_context": self._scout_context,
             "file_snapshots": snapshots,
+            "session_checkpoints": checkpoints,
+            "checkpoint_counter": self._checkpoint_counter,
             "plan_step_index": self._plan_step_index,
             "deterministic_verification_done": self._deterministic_verification_done,
         }
@@ -1121,6 +1328,25 @@ class CodingAgent:
             self._file_snapshots = raw_snapshots
         else:
             self._file_snapshots = {}
+        cps = data.get("session_checkpoints", [])
+        if isinstance(cps, list):
+            normalized = []
+            for cp in cps:
+                if not isinstance(cp, dict):
+                    continue
+                files = cp.get("files", {})
+                if not isinstance(files, dict):
+                    files = {}
+                normalized.append({
+                    "id": cp.get("id"),
+                    "label": cp.get("label", ""),
+                    "created_at": cp.get("created_at", 0),
+                    "files": files,
+                })
+            self._session_checkpoints = normalized
+        else:
+            self._session_checkpoints = []
+        self._checkpoint_counter = int(data.get("checkpoint_counter", 0) or 0)
 
     def _default_config(self) -> GenerationConfig:
         """Create default generation config from environment settings"""
@@ -1338,7 +1564,7 @@ class CodingAgent:
                     inp = block.get("input", {})
                     if name == "read_file":
                         files_read.append(inp.get("path", "?"))
-                    elif name in ("write_file", "edit_file"):
+                    elif name in ("write_file", "edit_file", "symbol_edit"):
                         files_edited.append(inp.get("path", "?"))
                     elif name == "run_command":
                         commands_run.append(inp.get("command", "?")[:80])
@@ -1906,6 +2132,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         task: str,
         on_event: Callable[[AgentEvent], Awaitable[None]],
         request_question_answer: Optional[Callable[[str, Optional[str], str], Awaitable[str]]] = None,
+        user_images: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[List[str]]:
         """
         Generate a plan for the task using an agentic loop with read-only tools.
@@ -1958,7 +2185,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         )
 
         plan_messages: List[Dict[str, Any]] = [
-            {"role": "user", "content": plan_user}
+            {"role": "user", "content": self._compose_user_content(plan_user, user_images)}
         ]
         max_plan_iters = 50  # generous — let it read as much as it needs
         plan_text = ""
@@ -2396,6 +2623,34 @@ Keep the whole response under 300 words. If the request is already very clear an
     # Build phase — execute an approved plan
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _compose_user_content(text: str, user_images: Optional[List[Dict[str, Any]]] = None) -> Any:
+        """Return either plain text or multimodal blocks with image attachments."""
+        if not user_images:
+            return text
+        blocks: List[Dict[str, Any]] = [{"type": "text", "text": text}]
+        for img in user_images:
+            if not isinstance(img, dict) or img.get("type") != "image":
+                continue
+            src = img.get("source", {})
+            if not isinstance(src, dict):
+                continue
+            if src.get("type") != "base64":
+                continue
+            media_type = src.get("media_type")
+            data = src.get("data")
+            if not media_type or not data:
+                continue
+            blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data,
+                },
+            })
+        return blocks if len(blocks) > 1 else text
+
     async def run_build(
         self,
         task: str,
@@ -2403,6 +2658,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         on_event: Callable[[AgentEvent], Awaitable[None]],
         request_approval: Callable[[str, str, Dict], Awaitable[bool]],
         config: Optional[GenerationConfig] = None,
+        user_images: Optional[List[Dict[str, Any]]] = None,
     ):
         """
         Execute a previously approved plan. This is the build phase.
@@ -2422,6 +2678,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         plan_block = "\n".join(plan_steps)
         decomposition = self._decompose_plan_steps(plan_steps)
         self._current_plan_decomposition = decomposition
+        worker_insights = await self._run_parallel_manager_workers(task, decomposition)
         decomp_lines = []
         for batch in decomposition:
             step_ids = [str(s.get("index")) for s in batch.get("steps", [])]
@@ -2435,6 +2692,8 @@ Keep the whole response under 300 words. If the request is already very clear an
             parts.append(f"<codebase_context>\n{self._scout_context}\n</codebase_context>")
         parts.append(f"<approved_plan>\n{plan_block}\n</approved_plan>")
         parts.append(f"<plan_decomposition>\n{decomp_text}\n</plan_decomposition>")
+        if worker_insights:
+            parts.append(f"<manager_worker_insights>\n{worker_insights}\n</manager_worker_insights>")
         parts.append(task)
         parts.append(
             "Execute this plan step by step.\n\n"
@@ -2450,6 +2709,7 @@ Keep the whole response under 300 words. If the request is already very clear an
             "a better approach — adapt. State what you changed and why."
         )
         user_content = "\n\n".join(parts)
+        user_content = self._compose_user_content(user_content, user_images)
 
         # Human-in-the-loop review gate (optional, policy mode)
         if app_config.human_review_mode:
@@ -2508,14 +2768,14 @@ Keep the whole response under 300 words. If the request is already very clear an
         if len(modified) > 10:
             files_str += f" (+{len(modified) - 10} more)"
 
-        # ── Auto-discover test files for modified files ──
-        test_files_found = self._discover_test_files(modified)
+        # ── Test impact selection for modified files ──
+        test_files_found = self._select_impacted_tests(modified)
         test_section = ""
         if test_files_found:
             test_section = (
-                f"\n\nRelevant test files found:\n"
+                f"\n\nImpacted tests selected:\n"
                 + "\n".join(f"  - {tf}" for tf in test_files_found[:10])
-                + "\nRun these tests and fix any failures."
+                + "\nRun these impacted tests first, then run broader suite if needed."
             )
 
         verify_msg = (
@@ -2548,6 +2808,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         request_approval: Callable[[str, str, Dict], Awaitable[bool]],
         config: Optional[GenerationConfig] = None,
         enable_scout: bool = True,
+        user_images: Optional[List[Dict[str, Any]]] = None,
     ):
         """
         Run the agent on a task. If plan phase is enabled, this is called
@@ -2578,7 +2839,7 @@ Keep the whole response under 300 words. If the request is already very clear an
             user_content = f"<project_context>\n{project_docs}\n</project_context>\n\n" + user_content
 
         # Add user message
-        self.history.append({"role": "user", "content": user_content})
+        self.history.append({"role": "user", "content": self._compose_user_content(user_content, user_images)})
 
         await self._agent_loop(on_event, request_approval, config)
 
@@ -2725,11 +2986,11 @@ Keep the whole response under 300 words. If the request is already very clear an
             if not lint_result.success:
                 failures.append(f"lint_file {rel_path}: {lint_text[:1000]}")
 
-        # 2) Targeted Python tests if discovered
+        # 2) Impacted tests first, then optional broader suite
         if app_config.deterministic_verification_run_tests:
-            test_files = [p for p in self._discover_test_files(modified_abs) if p.endswith(".py")]
-            if test_files:
-                cmd = "pytest -q " + " ".join(shlex.quote(p) for p in test_files[:20])
+            impacted_tests = [p for p in self._select_impacted_tests(modified_abs) if p.endswith(".py")]
+            if impacted_tests:
+                cmd = "pytest -q " + " ".join(shlex.quote(p) for p in impacted_tests[:20])
                 test_result = await loop.run_in_executor(
                     None,
                     lambda: execute_tool(
@@ -2753,6 +3014,32 @@ Keep the whole response under 300 words. If the request is already very clear an
                 ))
                 if not test_result.success:
                     failures.append(f"{cmd}: {test_text[:1600]}")
+            has_py_changes = any(str(p).lower().endswith(".py") for p in modified_abs)
+            if app_config.test_run_full_after_impact and has_py_changes and not failures:
+                full_cmd = "pytest -q"
+                full_result = await loop.run_in_executor(
+                    None,
+                    lambda: execute_tool(
+                        "run_command",
+                        {"command": full_cmd, "timeout": 300},
+                        self.working_directory,
+                        backend=self.backend,
+                    ),
+                )
+                full_text = full_result.output if full_result.success else (full_result.error or full_result.output or "Unknown test failure")
+                checks_run.append(full_cmd)
+                await on_event(AgentEvent(
+                    type="tool_result",
+                    content=full_text,
+                    data={
+                        "tool_name": "run_command",
+                        "tool_use_id": "deterministic-tests-full",
+                        "success": full_result.success,
+                        "deterministic_gate": True,
+                    },
+                ))
+                if not full_result.success:
+                    failures.append(f"{full_cmd}: {full_text[:1600]}")
 
         # 3) Verification orchestrator (language/framework aware)
         if app_config.verification_orchestrator_enabled:
@@ -3189,13 +3476,13 @@ Keep the whole response under 300 words. If the request is already very clear an
             # append a system hint reminding the model to verify its changes.
             write_tools_used = {
                 tu.get("name") for tu in tool_uses
-                if tu.get("name") in ("edit_file", "write_file")
+                if tu.get("name") in ("edit_file", "write_file", "symbol_edit")
             }
             if write_tools_used:
                 modified_files = [
                     tu.get("input", {}).get("path", "?")
                     for tu in tool_uses
-                    if tu.get("name") in ("edit_file", "write_file")
+                    if tu.get("name") in ("edit_file", "write_file", "symbol_edit")
                 ]
                 files_str = ", ".join(modified_files)
                 verify_hint = {
@@ -3230,6 +3517,82 @@ Keep the whole response under 300 words. If the request is already very clear an
         Returns a list of tool_result dicts ready for the conversation history.
         """
         loop = asyncio.get_event_loop()
+
+        async def _run_command_with_streaming(tool_id: str, tool_input: Dict[str, Any]) -> ToolResult:
+            """Run command with live output events when enabled."""
+            command = tool_input.get("command", "")
+            timeout = int(tool_input.get("timeout", 30) or 30)
+
+            if not app_config.live_command_streaming:
+                return await loop.run_in_executor(
+                    None, lambda: execute_tool("run_command", tool_input, self.working_directory, backend=self.backend)
+                )
+
+            partial_sent = {"value": False}
+
+            def _on_output(chunk: str, is_stderr: bool) -> None:
+                if not chunk:
+                    return
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        on_event(AgentEvent(
+                            type="command_output",
+                            content=chunk,
+                            data={
+                                "tool_use_id": tool_id,
+                                "is_stderr": bool(is_stderr),
+                            },
+                        )),
+                        loop,
+                    )
+                except Exception:
+                    pass
+
+                # Partial failure signal for quicker UX feedback
+                if not partial_sent["value"] and re.search(r"(error|failed|traceback|exception)", chunk, flags=re.IGNORECASE):
+                    partial_sent["value"] = True
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            on_event(AgentEvent(
+                                type="command_partial_failure",
+                                content="Potential failure detected in command output.",
+                                data={"tool_use_id": tool_id},
+                            )),
+                            loop,
+                        )
+                    except Exception:
+                        pass
+
+            def _exec_stream() -> ToolResult:
+                stdout, stderr, rc = self.backend.run_command_stream(
+                    command,
+                    cwd=".",
+                    timeout=timeout,
+                    on_output=_on_output,
+                )
+                parts = []
+                if stdout:
+                    parts.append(stdout)
+                if stderr:
+                    parts.append(f"[stderr]\n{stderr}")
+                output = "\n".join(parts) if parts else "(no output)"
+                if rc != 0:
+                    output = f"[exit code: {rc}]\n{output}"
+
+                if len(output) > 20000:
+                    lines_out = output.split("\n")
+                    if len(lines_out) > 200:
+                        output = "\n".join(lines_out[:100]) + f"\n\n... [{len(lines_out) - 150} lines truncated] ...\n\n" + "\n".join(lines_out[-50:])
+                    else:
+                        output = output[:10000] + "\n\n... [truncated] ...\n\n" + output[-5000:]
+
+                return ToolResult(
+                    success=rc == 0,
+                    output=output,
+                    error=None if rc == 0 else f"Command exited with code {rc}",
+                )
+
+            return await loop.run_in_executor(None, _exec_stream)
 
         # Partition into safe and dangerous
         safe_calls = []
@@ -3316,11 +3679,11 @@ Keep the whole response under 300 words. If the request is already very clear an
         if dangerous_calls:
             file_write_calls = [
                 tu for tu in dangerous_calls
-                if tu["name"] in ("write_file", "edit_file")
+                if tu["name"] in ("write_file", "edit_file", "symbol_edit")
             ]
             command_calls = [
                 tu for tu in dangerous_calls
-                if tu["name"] not in ("write_file", "edit_file")
+                if tu["name"] not in ("write_file", "edit_file", "symbol_edit")
             ]
 
             # Policy engine + explicit approvals for risky file writes
@@ -3387,6 +3750,18 @@ Keep the whole response under 300 words. If the request is already very clear an
                     )
                     file_groups[abs_path].append(tu)
 
+                # Session checkpoint before risky file batch
+                cp_id = self._create_session_checkpoint(
+                    label=f"before_file_batch:{len(file_write_calls)}",
+                    target_paths=list(file_groups.keys()),
+                )
+                if cp_id:
+                    await on_event(AgentEvent(
+                        type="checkpoint_created",
+                        content=f"Checkpoint created: {cp_id}",
+                        data={"checkpoint_id": cp_id, "label": "before_file_batch"},
+                    ))
+
                 async def _run_file_group(
                     calls: List[Dict[str, Any]],
                 ) -> List[tuple]:
@@ -3431,7 +3806,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                                     pass  # fall through with original error
 
                         # ── Auto-lint after successful edit ──
-                        if result.success and tu["name"] in ("edit_file", "write_file"):
+                        if result.success and tu["name"] in ("edit_file", "write_file", "symbol_edit"):
                             path = tu["input"].get("path", "")
                             try:
                                 lint_result = await loop.run_in_executor(
@@ -3600,15 +3975,33 @@ Keep the whole response under 300 words. If the request is already very clear an
                         data={"tool_use_id": tool_id},
                     ))
 
-                cmd_start = time.time()
-                result = await loop.run_in_executor(
-                    None, lambda: execute_tool(tool_name, tool_input, self.working_directory, backend=self.backend)
+                # Session checkpoint before risky command batches
+                cp_id = self._create_session_checkpoint(
+                    label=f"before_command:{tool_name}",
+                    target_paths=list(self._file_snapshots.keys()),
                 )
+                if cp_id:
+                    await on_event(AgentEvent(
+                        type="checkpoint_created",
+                        content=f"Checkpoint created: {cp_id}",
+                        data={"checkpoint_id": cp_id, "label": f"before_command:{tool_name}"},
+                    ))
+
+                cmd_start = time.time()
+                if tool_name == "run_command":
+                    result = await _run_command_with_streaming(tool_id, tool_input)
+                else:
+                    result = await loop.run_in_executor(
+                        None, lambda: execute_tool(tool_name, tool_input, self.working_directory, backend=self.backend)
+                    )
                 cmd_duration = round(time.time() - cmd_start, 1)
 
                 result_text = result.output if result.success else (
                     result.error or "Unknown error"
                 )
+                if not result.success and self._session_checkpoints:
+                    last_cp = self._session_checkpoints[-1].get("id", "latest")
+                    result_text += f"\n\n[checkpoint] You can rewind with checkpoint id: {last_cp}"
 
                 # Extract exit code from run_command output
                 exit_code = None
@@ -3657,6 +4050,11 @@ Keep the whole response under 300 words. If the request is already very clear an
             return f"Write {line_count} lines to {inputs.get('path', '?')}"
         elif name == "edit_file":
             return f"Edit {inputs.get('path', '?')}: replace string"
+        elif name == "symbol_edit":
+            return (
+                f"Symbol edit {inputs.get('path', '?')}: "
+                f"{inputs.get('symbol', '?')} ({inputs.get('kind', 'all')})"
+            )
         elif name == "run_command":
             return f"Run: {inputs.get('command', '?')}"
         elif name == "plan_review":

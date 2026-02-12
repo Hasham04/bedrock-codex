@@ -88,6 +88,16 @@ class AppConfig:
     block_destructive_commands: bool = os.getenv("BLOCK_DESTRUCTIVE_COMMANDS", "true").lower() == "true"
     # Learning loop from failures
     learning_loop_enabled: bool = os.getenv("LEARNING_LOOP_ENABLED", "true").lower() == "true"
+    # Manager-worker planning assistance (parallel worker insights)
+    parallel_subagents_enabled: bool = os.getenv("PARALLEL_SUBAGENTS_ENABLED", "true").lower() == "true"
+    parallel_subagents_max_workers: int = int(os.getenv("PARALLEL_SUBAGENTS_MAX_WORKERS", "3"))
+    # Stream command output incrementally while command runs
+    live_command_streaming: bool = os.getenv("LIVE_COMMAND_STREAMING", "true").lower() == "true"
+    # Session checkpoints and rewind support for risky batches
+    session_checkpoints_enabled: bool = os.getenv("SESSION_CHECKPOINTS_ENABLED", "true").lower() == "true"
+    # Test impact selection: run likely impacted tests before full suite
+    test_impact_selection_enabled: bool = os.getenv("TEST_IMPACT_SELECTION_ENABLED", "true").lower() == "true"
+    test_run_full_after_impact: bool = os.getenv("TEST_RUN_FULL_AFTER_IMPACT", "true").lower() == "true"
 
 
 # ============================================================

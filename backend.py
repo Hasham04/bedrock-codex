@@ -8,6 +8,7 @@ import os
 import pathlib
 import subprocess
 import threading
+import time
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -57,6 +58,26 @@ class Backend(ABC):
     @abstractmethod
     def run_command(self, command: str, cwd: str, timeout: int = 30) -> Tuple[str, str, int]:
         """Run a shell command. Returns (stdout, stderr, returncode)."""
+
+    def run_command_stream(
+        self,
+        command: str,
+        cwd: str,
+        timeout: int = 30,
+        on_output: Optional[Any] = None,
+    ) -> Tuple[str, str, int]:
+        """Run a command with optional incremental output callback.
+
+        Default implementation falls back to run_command and emits one chunk.
+        on_output(chunk: str, is_stderr: bool) -> None
+        """
+        stdout, stderr, rc = self.run_command(command, cwd=cwd, timeout=timeout)
+        if on_output:
+            if stdout:
+                on_output(stdout, False)
+            if stderr:
+                on_output(stderr, True)
+        return stdout, stderr, rc
 
     def cancel_running_command(self) -> bool:
         """Kill the currently running command, if any. Returns True if killed."""
@@ -167,6 +188,85 @@ class LocalBackend(Backend):
         finally:
             self._active_process = None
         return stdout or "", stderr or "", proc.returncode
+
+    def run_command_stream(
+        self,
+        command: str,
+        cwd: str,
+        timeout: int = 30,
+        on_output: Optional[Any] = None,
+    ) -> Tuple[str, str, int]:
+        full_cwd = self.resolve_path(cwd) if cwd != "." else self._working_directory
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=full_cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            preexec_fn=os.setsid,
+        )
+        self._active_process = proc
+
+        stdout_lines: List[str] = []
+        stderr_lines: List[str] = []
+        start = threading.Event()
+
+        def _reader(pipe, is_stderr: bool):
+            try:
+                start.wait()
+                while True:
+                    line = pipe.readline()
+                    if not line:
+                        break
+                    if is_stderr:
+                        stderr_lines.append(line)
+                    else:
+                        stdout_lines.append(line)
+                    if on_output:
+                        try:
+                            on_output(line, is_stderr)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        t_out = threading.Thread(target=_reader, args=(proc.stdout, False), daemon=True)
+        t_err = threading.Thread(target=_reader, args=(proc.stderr, True), daemon=True)
+        t_out.start()
+        t_err.start()
+        start.set()
+
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._kill_process(proc)
+            rc = -1
+            timeout_msg = f"Command timed out after {timeout}s\n"
+            stderr_lines.append(timeout_msg)
+            if on_output:
+                try:
+                    on_output(timeout_msg, True)
+                except Exception:
+                    pass
+        finally:
+            self._active_process = None
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+            except Exception:
+                pass
+            try:
+                if proc.stderr:
+                    proc.stderr.close()
+            except Exception:
+                pass
+            t_out.join(timeout=1.0)
+            t_err.join(timeout=1.0)
+
+        return "".join(stdout_lines), "".join(stderr_lines), rc
 
     def cancel_running_command(self) -> bool:
         """Kill the currently running subprocess, if any. Returns True if killed."""
@@ -459,6 +559,76 @@ class SSHBackend(Backend):
         full_cwd = self._remote_path(cwd) if cwd != "." else self._working_directory
         cmd = f"cd {full_cwd!r} && {command}"
         return self._exec(cmd, timeout=timeout)
+
+    def run_command_stream(
+        self,
+        command: str,
+        cwd: str,
+        timeout: int = 30,
+        on_output: Optional[Any] = None,
+    ) -> Tuple[str, str, int]:
+        full_cwd = self._remote_path(cwd) if cwd != "." else self._working_directory
+        cmd = f"cd {full_cwd!r} && {command}"
+
+        with self._lock:
+            self._reconnect_if_needed()
+            _, stdout_ch, stderr_ch = self._client.exec_command(cmd, timeout=timeout)
+        channel = stdout_ch.channel
+        self._active_channel = channel
+
+        stdout_buf = ""
+        stderr_buf = ""
+        start_ts = time.time()
+        try:
+            while True:
+                if channel.recv_ready():
+                    data = channel.recv(4096).decode("utf-8", errors="replace")
+                    if data:
+                        stdout_buf += data
+                        if on_output:
+                            try:
+                                on_output(data, False)
+                            except Exception:
+                                pass
+                if channel.recv_stderr_ready():
+                    data = channel.recv_stderr(4096).decode("utf-8", errors="replace")
+                    if data:
+                        stderr_buf += data
+                        if on_output:
+                            try:
+                                on_output(data, True)
+                            except Exception:
+                                pass
+                if channel.exit_status_ready():
+                    # Drain remaining buffers
+                    while channel.recv_ready():
+                        data = channel.recv(4096).decode("utf-8", errors="replace")
+                        if data:
+                            stdout_buf += data
+                            if on_output:
+                                on_output(data, False)
+                    while channel.recv_stderr_ready():
+                        data = channel.recv_stderr(4096).decode("utf-8", errors="replace")
+                        if data:
+                            stderr_buf += data
+                            if on_output:
+                                on_output(data, True)
+                    break
+                if time.time() - start_ts > timeout:
+                    try:
+                        channel.close()
+                    except Exception:
+                        pass
+                    timeout_msg = f"Command timed out after {timeout}s\n"
+                    stderr_buf += timeout_msg
+                    if on_output:
+                        on_output(timeout_msg, True)
+                    return stdout_buf, stderr_buf, -1
+                time.sleep(0.05)
+            rc = channel.recv_exit_status()
+            return stdout_buf, stderr_buf, rc
+        finally:
+            self._active_channel = None
 
     def search(self, pattern: str, path: str, include: Optional[str] = None,
                cwd: str = ".") -> str:

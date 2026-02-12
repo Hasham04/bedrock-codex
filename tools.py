@@ -8,6 +8,7 @@ import os
 import json
 import logging
 import re
+import ast
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 
@@ -123,6 +124,145 @@ def edit_file(path: str, old_string: str, new_string: str,
         new_content = content.replace(old_string, new_string, 1)
         b.write_file(path, new_content)
         return ToolResult(success=True, output=f"Applied edit to {path}")
+    except Exception as e:
+        return ToolResult(success=False, output="", error=str(e))
+
+
+def _python_symbol_spans(content: str, symbol: str, kind: str = "all") -> List[tuple]:
+    """Return (start_line_1idx, end_line_1idx) spans for python symbols."""
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+    spans: List[tuple] = []
+    for node in ast.walk(tree):
+        is_func = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        is_class = isinstance(node, ast.ClassDef)
+        if not (is_func or is_class):
+            continue
+        if getattr(node, "name", "") != symbol:
+            continue
+        if kind == "function" and not is_func:
+            continue
+        if kind == "class" and not is_class:
+            continue
+        start = getattr(node, "lineno", None)
+        end = getattr(node, "end_lineno", None) or start
+        if start and end:
+            spans.append((int(start), int(end)))
+    return spans
+
+
+def _regex_symbol_spans(content: str, symbol: str, kind: str = "all") -> List[tuple]:
+    """Fallback symbol span finder using language-aware regex anchors."""
+    sym = re.escape(symbol)
+    patterns: List[str] = []
+    if kind in ("all", "function"):
+        patterns.extend([
+            rf"^\s*(?:export\s+)?(?:async\s+)?function\s+{sym}\s*\(",
+            rf"^\s*(?:export\s+)?(?:const|let|var)\s+{sym}\s*=\s*(?:async\s*)?\(",
+            rf"^\s*def\s+{sym}\s*\(",
+            rf"^\s*async\s+def\s+{sym}\s*\(",
+        ])
+    if kind in ("all", "class"):
+        patterns.extend([
+            rf"^\s*class\s+{sym}\b",
+            rf"^\s*interface\s+{sym}\b",
+            rf"^\s*type\s+{sym}\b",
+            rf"^\s*struct\s+{sym}\b",
+            rf"^\s*enum\s+{sym}\b",
+            rf"^\s*trait\s+{sym}\b",
+        ])
+    lines = content.splitlines()
+    spans: List[tuple] = []
+    for i, line in enumerate(lines):
+        if not any(re.search(p, line) for p in patterns):
+            continue
+        base_indent = len(line) - len(line.lstrip(" "))
+        end = i + 1
+        j = i + 1
+        while j < len(lines):
+            ln = lines[j]
+            if ln.strip() == "":
+                end = j + 1
+                j += 1
+                continue
+            indent = len(ln) - len(ln.lstrip(" "))
+            if indent <= base_indent and not ln.lstrip().startswith(("@", "#")):
+                break
+            end = j + 1
+            j += 1
+        spans.append((i + 1, end))
+    return spans
+
+
+def symbol_edit(path: str, symbol: str, new_string: str, kind: str = "all", occurrence: int = 1,
+                backend: Optional[Backend] = None, working_directory: str = ".") -> ToolResult:
+    """Edit a symbol definition block using AST/tree-sitter/regex boundaries."""
+    try:
+        b = backend or LocalBackend(working_directory)
+        if not b.file_exists(path):
+            return ToolResult(success=False, output="", error=f"File not found: {path}")
+        if not symbol.strip():
+            return ToolResult(success=False, output="", error="symbol is required")
+
+        content = b.read_file(path)
+        ext = os.path.splitext(path.lower())[1]
+        kind = (kind or "all").lower()
+        spans: List[tuple] = []
+
+        # Python first-class AST handling
+        if ext == ".py":
+            spans = _python_symbol_spans(content, symbol.strip(), kind=kind)
+
+        # Optional tree-sitter path for non-python if available
+        if not spans and ext in (".js", ".jsx", ".ts", ".tsx"):
+            try:
+                from tree_sitter_languages import get_language, get_parser  # type: ignore
+                lang_name = "typescript" if ext in (".ts", ".tsx") else "javascript"
+                _ = get_language(lang_name)  # Ensure language exists
+                parser = get_parser(lang_name)
+                tree = parser.parse(bytes(content, "utf-8"))
+                root = tree.root_node
+                target = symbol.strip()
+                stack = [root]
+                while stack:
+                    node = stack.pop()
+                    if node.type in {
+                        "function_declaration", "class_declaration", "method_definition",
+                        "lexical_declaration", "variable_declaration", "interface_declaration",
+                        "type_alias_declaration", "enum_declaration",
+                    }:
+                        node_text = content[node.start_byte:node.end_byte]
+                        if re.search(rf"\b{re.escape(target)}\b", node_text):
+                            spans.append((node.start_point[0] + 1, node.end_point[0] + 1))
+                    stack.extend(list(node.children))
+                spans = list(dict.fromkeys(spans))
+            except Exception:
+                spans = []
+
+        # Regex fallback
+        if not spans:
+            spans = _regex_symbol_spans(content, symbol.strip(), kind=kind)
+
+        if not spans:
+            return ToolResult(success=False, output="", error=f"Symbol '{symbol}' not found in {path}")
+
+        if occurrence < 1:
+            occurrence = 1
+        if occurrence > len(spans):
+            return ToolResult(success=False, output="", error=f"occurrence {occurrence} out of range (found {len(spans)} matches)")
+
+        start, end = spans[occurrence - 1]
+        lines = content.splitlines(keepends=True)
+        before = "".join(lines[:start - 1])
+        after = "".join(lines[end:])
+        replacement = new_string
+        if replacement and not replacement.endswith("\n"):
+            replacement += "\n"
+        new_content = before + replacement + after
+        b.write_file(path, new_content)
+        return ToolResult(success=True, output=f"Applied symbol_edit to {path} ({symbol}, lines {start}-{end})")
     except Exception as e:
         return ToolResult(success=False, output="", error=str(e))
 
@@ -409,6 +549,21 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "symbol_edit",
+        "description": "Perform a symbol-aware edit of a function/class/type definition block using AST/tree-sitter when available, with regex fallback. Safer than plain string replacement for refactors. Use kind=function|class|all and occurrence to disambiguate.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path (relative to working directory)"},
+                "symbol": {"type": "string", "description": "Symbol name to edit, e.g. 'process_data'"},
+                "new_string": {"type": "string", "description": "Full replacement block for the symbol definition"},
+                "kind": {"type": "string", "description": "all|function|class (default: all)"},
+                "occurrence": {"type": "integer", "description": "1-based match index if multiple symbols share same name"},
+            },
+            "required": ["path", "symbol", "new_string"],
+        },
+    },
+    {
         "name": "run_command",
         "description": "Execute a shell command in the working directory. Use for running tests, installing packages, git operations, builds, linters, and type checkers. Always check both stdout and stderr in the output. Non-zero exit codes indicate failure — diagnose the error rather than retrying blindly. Use timeout for long-running processes.",
         "input_schema": {
@@ -486,6 +641,7 @@ TOOL_IMPLEMENTATIONS = {
     "read_file": read_file,
     "write_file": write_file,
     "edit_file": edit_file,
+    "symbol_edit": symbol_edit,
     "run_command": run_command,
     "search": search,
     "find_symbol": find_symbol,
@@ -494,7 +650,7 @@ TOOL_IMPLEMENTATIONS = {
     "lint_file": lint_file,
 }
 
-TOOLS_REQUIRING_APPROVAL = {"write_file", "edit_file", "run_command"}
+TOOLS_REQUIRING_APPROVAL = {"write_file", "edit_file", "symbol_edit", "run_command"}
 SAFE_TOOLS = {"read_file", "search", "find_symbol", "list_directory", "glob_find", "lint_file"}
 SCOUT_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     t for t in TOOL_DEFINITIONS if t["name"] in SAFE_TOOLS

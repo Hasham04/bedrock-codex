@@ -8,6 +8,7 @@ Open: http://localhost:8765
 
 import argparse
 import asyncio
+import base64
 import difflib
 import json
 import logging
@@ -81,6 +82,15 @@ _IGNORE_EXTENSIONS = {".pyc", ".pyo", ".so", ".dylib", ".o", ".a"}
 
 # Max chars for file content served via API
 _MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB
+_MAX_IMAGE_ATTACHMENTS = 3
+_MAX_IMAGE_BYTES = 2 * 1024 * 1024  # 2 MB per image
+_MAX_IMAGE_TOTAL_BYTES = 5 * 1024 * 1024  # 5 MB total raw image bytes
+_ALLOWED_IMAGE_MEDIA_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+}
 
 
 # ============================================================
@@ -306,6 +316,64 @@ def _safe_path(wd: str, rel: str) -> Optional[str]:
     return resolved
 
 
+def _normalize_user_images(raw_images: Any) -> List[Dict[str, Any]]:
+    """Validate image attachments and convert them into Anthropic image blocks."""
+    if not raw_images:
+        return []
+    if not isinstance(raw_images, list):
+        raise ValueError("images must be a list")
+    if len(raw_images) > _MAX_IMAGE_ATTACHMENTS:
+        raise ValueError(f"Too many images (max {_MAX_IMAGE_ATTACHMENTS})")
+
+    blocks: List[Dict[str, Any]] = []
+    total_bytes = 0
+    for idx, item in enumerate(raw_images, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Invalid image payload at index {idx}")
+
+        media_type = str(item.get("media_type", "")).strip().lower()
+        if media_type == "image/jpg":
+            media_type = "image/jpeg"
+        if media_type not in _ALLOWED_IMAGE_MEDIA_TYPES:
+            raise ValueError(f"Unsupported image media type: {media_type or 'unknown'}")
+
+        data_b64 = str(item.get("data", "")).strip()
+        if not data_b64:
+            raise ValueError(f"Missing image data at index {idx}")
+
+        # Accept data URLs and plain base64; keep only the payload.
+        if data_b64.startswith("data:"):
+            comma = data_b64.find(",")
+            if comma == -1:
+                raise ValueError(f"Invalid data URL for image {idx}")
+            data_b64 = data_b64[comma + 1:].strip()
+
+        try:
+            raw = base64.b64decode(data_b64, validate=True)
+        except Exception:
+            raise ValueError(f"Invalid base64 payload for image {idx}")
+
+        size = len(raw)
+        if size <= 0:
+            raise ValueError(f"Empty image payload at index {idx}")
+        if size > _MAX_IMAGE_BYTES:
+            raise ValueError(f"Image {idx} exceeds {_MAX_IMAGE_BYTES // (1024 * 1024)}MB limit")
+
+        total_bytes += size
+        if total_bytes > _MAX_IMAGE_TOTAL_BYTES:
+            raise ValueError("Total image payload exceeds size limit")
+
+        blocks.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": base64.b64encode(raw).decode("ascii"),
+            },
+        })
+    return blocks
+
+
 @app.get("/api/file")
 async def read_file(path: str = Query(...)):
     """Return the contents of a file as plain text."""
@@ -498,8 +566,14 @@ async def websocket_endpoint(ws: WebSocket):
     store = SessionStore()
     session: Optional[Session] = store.get_latest(wd)
     # Keys that are web.py UI state, not agent state
-    _ui_state_keys = {"ssh_info", "awaiting_build", "awaiting_keep_revert",
-                      "pending_task", "pending_plan"}
+    _ui_state_keys = {
+        "ssh_info",
+        "awaiting_build",
+        "awaiting_keep_revert",
+        "pending_task",
+        "pending_plan",
+        "pending_images",
+    }
     _restored_ui_state: Dict[str, Any] = {}
     if session and session.history:
         restore_data = {
@@ -535,6 +609,7 @@ async def websocket_endpoint(ws: WebSocket):
                 "awaiting_keep_revert": awaiting_keep_revert,
                 "pending_task": pending_task,
                 "pending_plan": pending_plan,
+                "pending_images": pending_images,
             }
             # Persist SSH connection info so it can be reused on reopen
             if _ssh_info:
@@ -548,6 +623,7 @@ async def websocket_endpoint(ws: WebSocket):
     # State machine — restore from session if reconnecting
     pending_task: Optional[str] = _restored_ui_state.get("pending_task")
     pending_plan: Optional[List[str]] = _restored_ui_state.get("pending_plan")
+    pending_images: List[Dict[str, Any]] = list(_restored_ui_state.get("pending_images") or [])
     awaiting_build: bool = bool(_restored_ui_state.get("awaiting_build"))
     awaiting_keep_revert: bool = bool(
         _restored_ui_state.get("awaiting_keep_revert")
@@ -640,14 +716,38 @@ async def websocket_endpoint(ws: WebSocket):
                     await ws.send_json({"type": "replay_user", "content": content})
                 elif isinstance(content, list):
                     # Tool result blocks are handled via pairing below
+                    image_count = 0
                     for block in content:
                         if block.get("type") == "text":
                             text = block.get("text", "")
                             # Skip system hints
                             if text.startswith("[System]"):
                                 continue
+                            if "(earlier context compressed)" in text or "(earlier work trimmed)" in text:
+                                continue
+                            if text.startswith("You have completed all plan steps"):
+                                continue
+                            if "<project_context>" in text:
+                                parts = text.split("</project_context>")
+                                text = parts[-1].strip() if len(parts) > 1 else text
+                            if "<codebase_context>" in text:
+                                parts = text.split("</codebase_context>")
+                                text = parts[-1].strip() if len(parts) > 1 else text
+                            if "<approved_plan>" in text:
+                                parts = text.split("</approved_plan>")
+                                if len(parts) > 1:
+                                    text = parts[-1].strip()
+                                    for suffix in ["Execute this plan step by step.", "State which step you are working on."]:
+                                        text = text.replace(suffix, "").strip()
                             if text.strip():
                                 await ws.send_json({"type": "replay_user", "content": text})
+                        elif block.get("type") == "image":
+                            image_count += 1
+                    if image_count > 0:
+                        await ws.send_json({
+                            "type": "replay_user",
+                            "content": f"📷 {image_count} image attachment{'s' if image_count != 1 else ''}",
+                        })
 
             elif role == "assistant":
                 if isinstance(content, str):
@@ -859,9 +959,9 @@ async def websocket_endpoint(ws: WebSocket):
                 _pending_question["future"] = None
                 _pending_question["tool_use_id"] = None
 
-        async def _run_task_bg(task_text: str):
+        async def _run_task_bg(task_text: str, task_images: Optional[List[Dict[str, Any]]] = None):
             """Run a task (plan or direct mode) in the background."""
-            nonlocal awaiting_build, awaiting_keep_revert, pending_task, pending_plan
+            nonlocal awaiting_build, awaiting_keep_revert, pending_task, pending_plan, pending_images
             task_start = time.time()
 
             # Use LLM to intelligently classify intent (runs on fast Haiku)
@@ -876,6 +976,7 @@ async def websocket_endpoint(ws: WebSocket):
                         task=task_text,
                         on_event=on_event,
                         request_question_answer=_request_question_answer,
+                        user_images=task_images or [],
                     )
                     if agent._cancelled:
                         return
@@ -886,6 +987,7 @@ async def websocket_endpoint(ws: WebSocket):
                     if plan_steps:
                         pending_task = task_text
                         pending_plan = plan_steps
+                        pending_images = list(task_images or [])
                         awaiting_build = True
                     else:
                         await ws.send_json({"type": "no_plan"})
@@ -905,6 +1007,7 @@ async def websocket_endpoint(ws: WebSocket):
                             on_event=on_event,
                             request_approval=dummy_approval,
                             enable_scout=intent.get("scout", True),
+                            user_images=task_images or [],
                         )
                     finally:
                         # Always restore the original model
@@ -934,7 +1037,7 @@ async def websocket_endpoint(ws: WebSocket):
                 save_session()
                 await _send_status()
 
-        async def _run_build_bg(task_text: str, steps: list):
+        async def _run_build_bg(task_text: str, steps: list, task_images: Optional[List[Dict[str, Any]]] = None):
             """Run build phase in the background."""
             nonlocal awaiting_keep_revert
             task_start = time.time()
@@ -945,6 +1048,7 @@ async def websocket_endpoint(ws: WebSocket):
                     plan_steps=steps,
                     on_event=on_event,
                     request_approval=dummy_approval,
+                    user_images=task_images or [],
                 )
                 if agent._cancelled:
                     return
@@ -1085,13 +1189,41 @@ async def websocket_endpoint(ws: WebSocket):
                 })
                 continue
 
+            # ── Session checkpoints (list / rewind) ───────────────
+            if msg_type == "checkpoint_list":
+                await ws.send_json({
+                    "type": "checkpoint_list",
+                    "data": {"checkpoints": agent.list_session_checkpoints()},
+                })
+                continue
+
+            if msg_type == "checkpoint_restore":
+                cp_id = str(data.get("checkpoint_id") or "latest")
+                reverted = agent.rewind_to_checkpoint(cp_id)
+                if reverted:
+                    save_session()
+                    await ws.send_json({
+                        "type": "checkpoint_restored",
+                        "data": {
+                            "checkpoint_id": cp_id,
+                            "count": len(reverted),
+                            "paths": [os.path.relpath(p, wd) for p in reverted],
+                        },
+                    })
+                else:
+                    await ws.send_json({
+                        "type": "checkpoint_error",
+                        "content": f"No checkpoint restored for '{cp_id}'.",
+                    })
+                continue
+
             # ── Build (approve plan) ───────────────────────────────
             if msg_type == "build" and awaiting_build:
                 awaiting_build = False
                 edited_steps = data.get("steps") or pending_plan or []
                 _cancel_ack_sent = False
                 _agent_task = asyncio.create_task(
-                    _run_build_bg(pending_task or "", edited_steps)
+                    _run_build_bg(pending_task or "", edited_steps, pending_images or [])
                 )
                 continue
 
@@ -1100,6 +1232,7 @@ async def websocket_endpoint(ws: WebSocket):
                 awaiting_build = False
                 pending_task = None
                 pending_plan = None
+                pending_images = []
                 await ws.send_json({"type": "plan_rejected"})
                 continue
 
@@ -1114,6 +1247,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # Fall through to task handling below
                 msg_type = "task"
                 data["content"] = task
+                data["images"] = pending_images
 
             # ── Reset ──────────────────────────────────────────────
             if msg_type == "reset":
@@ -1130,8 +1264,16 @@ async def websocket_endpoint(ws: WebSocket):
             # ── New task ───────────────────────────────────────────
             if msg_type == "task":
                 task_text = data.get("content", "").strip()
-                if not task_text:
+                try:
+                    task_images = _normalize_user_images(data.get("images") or [])
+                except ValueError as ve:
+                    await ws.send_json({"type": "error", "content": f"Image upload error: {ve}"})
                     continue
+
+                if not task_text and not task_images:
+                    continue
+                if not task_text and task_images:
+                    task_text = "Analyze the attached image(s) and help me with the request."
 
                 # Don't start a new task while one is running
                 if _agent_task and not _agent_task.done():
@@ -1140,11 +1282,14 @@ async def websocket_endpoint(ws: WebSocket):
 
                 # Name session from first task
                 if session and session.name == "default" and not agent.history:
-                    words = task_text.split()[:6]
-                    session.name = " ".join(words) + ("..." if len(task_text.split()) > 6 else "")
+                    if task_text:
+                        words = task_text.split()[:6]
+                        session.name = " ".join(words) + ("..." if len(task_text.split()) > 6 else "")
+                    else:
+                        session.name = "Image prompt"
 
                 _cancel_ack_sent = False
-                _agent_task = asyncio.create_task(_run_task_bg(task_text))
+                _agent_task = asyncio.create_task(_run_task_bg(task_text, task_images))
                 continue
 
     except WebSocketDisconnect:

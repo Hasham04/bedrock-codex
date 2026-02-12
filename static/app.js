@@ -35,6 +35,9 @@
     const $monacoEl      = document.getElementById("monaco-container");
     const $chatMessages  = document.getElementById("chat-messages");
     const $input         = document.getElementById("user-input");
+    const $attachImageBtn = document.getElementById("attach-image-btn");
+    const $imageInput    = document.getElementById("image-input");
+    const $imagePreviewStrip = document.getElementById("image-preview-strip");
     const $sendBtn       = document.getElementById("send-btn");
     const $cancelBtn     = document.getElementById("cancel-btn");
     const $actionBar     = document.getElementById("action-bar");
@@ -73,7 +76,9 @@
     let currentTextEl = null;
     let currentTextBuffer = "";
     let lastToolBlock = null;
+    const toolRunById = new Map(); // tool_use_id -> run element
     let scoutEl = null;
+    const pendingImages = []; // { id, file, previewUrl, name, size, media_type }
 
     // ── Markdown ──────────────────────────────────────────────
     if (typeof marked !== "undefined") {
@@ -150,6 +155,125 @@
     }
     function truncate(text, max) { return (!text || text.length <= max) ? text : text.slice(0, max) + `\n... (${text.length-max} more chars)`; }
     function basename(path) { return path.split("/").pop(); }
+    function formatBytes(bytes) {
+        if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+        const units = ["B", "KB", "MB", "GB"];
+        let size = bytes;
+        let i = 0;
+        while (size >= 1024 && i < units.length - 1) { size /= 1024; i++; }
+        return `${size.toFixed(size >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+    }
+    function mediaTypeFromName(name) {
+        const low = String(name || "").toLowerCase();
+        if (low.endsWith(".png")) return "image/png";
+        if (low.endsWith(".jpg") || low.endsWith(".jpeg")) return "image/jpeg";
+        if (low.endsWith(".webp")) return "image/webp";
+        if (low.endsWith(".gif")) return "image/gif";
+        return "application/octet-stream";
+    }
+    function imageSrcForMessage(img) {
+        if (img?.previewUrl) return img.previewUrl;
+        if (img?.data && img?.media_type) return `data:${img.media_type};base64,${img.data}`;
+        return "";
+    }
+    function renderImagePreviewStrip() {
+        if (!$imagePreviewStrip) return;
+        $imagePreviewStrip.innerHTML = "";
+        if (pendingImages.length === 0) {
+            $imagePreviewStrip.classList.add("hidden");
+            return;
+        }
+        pendingImages.forEach((img) => {
+            const chip = document.createElement("div");
+            chip.className = "image-preview-chip";
+            chip.innerHTML = `<img src="${escapeHtml(img.previewUrl)}" alt="${escapeHtml(img.name)}"><button class="image-preview-remove" title="Remove image" data-id="${escapeHtml(img.id)}">×</button>`;
+            chip.querySelector(".image-preview-remove").addEventListener("click", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                removePendingImage(img.id);
+            });
+            $imagePreviewStrip.appendChild(chip);
+        });
+        const meta = document.createElement("div");
+        meta.className = "image-preview-meta";
+        const totalBytes = pendingImages.reduce((acc, i) => acc + (i.size || 0), 0);
+        meta.textContent = `${pendingImages.length} image${pendingImages.length === 1 ? "" : "s"} • ${formatBytes(totalBytes)}`;
+        $imagePreviewStrip.appendChild(meta);
+        $imagePreviewStrip.classList.remove("hidden");
+    }
+    function removePendingImage(id) {
+        const idx = pendingImages.findIndex((x) => x.id === id);
+        if (idx === -1) return;
+        const [removed] = pendingImages.splice(idx, 1);
+        if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+        renderImagePreviewStrip();
+    }
+    function clearPendingImages() {
+        while (pendingImages.length) {
+            const img = pendingImages.pop();
+            if (img?.previewUrl) URL.revokeObjectURL(img.previewUrl);
+        }
+        if ($imageInput) $imageInput.value = "";
+        renderImagePreviewStrip();
+    }
+    function addPendingImageFiles(files) {
+        if (!files || files.length === 0) return;
+        const MAX_COUNT = 3;
+        const MAX_BYTES = 2 * 1024 * 1024;
+        for (const file of files) {
+            if (pendingImages.length >= MAX_COUNT) {
+                showInfo(`Max ${MAX_COUNT} images per message.`);
+                break;
+            }
+            if (!file.type || !file.type.startsWith("image/")) {
+                showInfo(`Skipped non-image file: ${file.name}`);
+                continue;
+            }
+            if (file.size > MAX_BYTES) {
+                showInfo(`Skipped ${file.name}: exceeds ${formatBytes(MAX_BYTES)}.`);
+                continue;
+            }
+            const previewUrl = URL.createObjectURL(file);
+            pendingImages.push({
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                file,
+                previewUrl,
+                name: file.name,
+                size: file.size,
+                media_type: file.type || mediaTypeFromName(file.name),
+            });
+        }
+        renderImagePreviewStrip();
+    }
+    function fileToBase64Data(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+                const result = String(reader.result || "");
+                const comma = result.indexOf(",");
+                if (comma < 0) {
+                    reject(new Error("Invalid file encoding"));
+                    return;
+                }
+                resolve(result.slice(comma + 1));
+            };
+            reader.onerror = () => reject(new Error("Failed to read image"));
+            reader.readAsDataURL(file);
+        });
+    }
+    async function serializePendingImages() {
+        const payload = [];
+        for (const img of pendingImages) {
+            const b64 = await fileToBase64Data(img.file);
+            payload.push({
+                name: img.name,
+                media_type: img.media_type || mediaTypeFromName(img.name),
+                data: b64,
+                size: img.size || 0,
+            });
+        }
+        return payload;
+    }
 
     // Language detection for Monaco
     function langFromExt(ext) {
@@ -877,11 +1001,32 @@
     // CHAT — Messages
     // ================================================================
 
-    function addUserMessage(text) {
+    function addUserMessage(text, images) {
         const div = document.createElement("div"); div.className = "message user";
         const bubble = document.createElement("div"); bubble.className = "msg-bubble";
-        bubble.textContent = text;
-        bubble.appendChild(makeCopyBtn(text));
+        const safeText = String(text || "");
+        const imgs = Array.isArray(images) ? images : [];
+        if (safeText) {
+            const textEl = document.createElement("div");
+            textEl.className = "user-message-text";
+            textEl.textContent = safeText;
+            bubble.appendChild(textEl);
+        }
+        if (imgs.length) {
+            const grid = document.createElement("div");
+            grid.className = "user-images-grid";
+            imgs.forEach((img) => {
+                const src = imageSrcForMessage(img);
+                if (!src) return;
+                const tile = document.createElement("div");
+                tile.className = "user-image-tile";
+                tile.innerHTML = `<img src="${escapeHtml(src)}" alt="${escapeHtml(img.name || "image")}">`;
+                grid.appendChild(tile);
+            });
+            if (grid.children.length > 0) bubble.appendChild(grid);
+        }
+        const copyPayload = safeText || `[${imgs.length} image attachment${imgs.length === 1 ? "" : "s"}]`;
+        bubble.appendChild(makeCopyBtn(copyPayload));
         div.appendChild(bubble);
         $chatMessages.appendChild(div);
         scrollChat();
@@ -964,7 +1109,7 @@
     }
     function toolGroupKey(name, input) { return `${name}::${toolDesc(name, input)}`; }
     function toolCanOpenFile(name, input) {
-        return Boolean((name === "read_file" || name === "write_file" || name === "edit_file" || name === "lint_file") && input?.path);
+        return Boolean((name === "read_file" || name === "write_file" || name === "edit_file" || name === "symbol_edit" || name === "lint_file") && input?.path);
     }
     function toolFollowupPrompt(name, input, failedOnly = false) {
         const title = toolTitle(name);
@@ -1016,6 +1161,13 @@
             if (oldLines.length > 8) removed.push(`-... (${oldLines.length - 8} more lines)`);
             if (newLines.length > 8) added.push(`+... (${newLines.length - 8} more lines)`);
             return `--- ${path}\n+++ ${path}\n@@ edit preview @@\n${removed.join("\n")}\n${added.join("\n")}`;
+        }
+        if (name === "symbol_edit") {
+            const symbol = input?.symbol || "(symbol)";
+            const newLines = String(input?.new_string || "").split("\n");
+            const added = newLines.slice(0, 12).map(l => `+${l}`);
+            if (newLines.length > 12) added.push(`+... (${newLines.length - 12} more lines)`);
+            return `--- ${path}\n+++ ${path}\n@@ symbol ${symbol} (${input?.kind || "all"}) @@\n${added.join("\n")}`;
         }
         return "";
     }
@@ -1172,7 +1324,7 @@
             const preview = makeReadFilePreview(content, input);
             if (preview) out.appendChild(preview);
         }
-        if (name === "write_file" || name === "edit_file") {
+        if (name === "write_file" || name === "edit_file" || name === "symbol_edit") {
             const diff = buildEditPreviewDiff(name, input);
             if (diff) {
                 const mini = document.createElement("div");
@@ -1204,7 +1356,7 @@
         if (body) body.scrollTop = body.scrollHeight;
         scrollChat();
     }
-    function addToolCall(name, input) {
+    function addToolCall(name, input, toolUseId = null) {
         const bubble = getOrCreateBubble();
         const isCmd = name === "run_command";
         const now = Date.now();
@@ -1336,6 +1488,7 @@
         run.className = "tool-run";
         run.dataset.runIndex = String(runIndex);
         run.dataset.toolName = name;
+        if (toolUseId) run.dataset.toolUseId = String(toolUseId);
         if (input?.path) run.dataset.path = input.path;
         run.innerHTML = `
             <div class="tool-run-header">
@@ -1347,6 +1500,7 @@
         run.appendChild(makeProgressiveBody(inputText || "{}", isCmd ? "tool-input tool-input-cmd" : "tool-input", isCmd ? 2800 : 1800));
         runList.appendChild(run);
         toolRunState.set(run, { name, input: input || {}, output: "" });
+        if (toolUseId) toolRunById.set(String(toolUseId), run);
         scrollChat();
         return run;
     }
@@ -1394,11 +1548,45 @@
         maybeAutoFollow(group, runEl);
         scrollChat();
     }
+
+    function appendCommandOutput(toolUseId, chunk, isStderr) {
+        if (!toolUseId || !chunk) return;
+        const runEl = toolRunById.get(String(toolUseId));
+        if (!runEl) return;
+        const state = toolRunState.get(runEl);
+        if (!state) return;
+        const group = runEl.closest(".tool-block");
+        if (!group) return;
+
+        const next = `${state.output || ""}${chunk}`;
+        state.output = next.length > 50000 ? next.slice(-50000) : next;
+        toolRunState.set(runEl, state);
+
+        let live = runEl.querySelector(".tool-terminal-live");
+        if (!live) {
+            const label = document.createElement("div");
+            label.className = "tool-section-label";
+            label.textContent = "Live output";
+            live = document.createElement("pre");
+            live.className = "tool-terminal-live";
+            runEl.appendChild(label);
+            runEl.appendChild(live);
+        }
+        live.textContent = state.output;
+        if (isStderr) live.classList.add("stderr");
+
+        group.dataset.latestOutput = state.output;
+        const copyBtn = group.querySelector(".tool-action-copy");
+        if (copyBtn) copyBtn.classList.remove("hidden");
+        maybeAutoFollow(group, runEl);
+        scrollChat();
+    }
     function toolLabel(n) {
         const labels = {
             read_file: "Read",
             write_file: "Write",
             edit_file: "Edit",
+            symbol_edit: "Symbol Edit",
             lint_file: "Lint",
             run_command: "Terminal",
             search: "Search",
@@ -1414,6 +1602,7 @@
             read_file: "Read File",
             write_file: "Write File",
             edit_file: "Edit File",
+            symbol_edit: "Symbol Edit",
             lint_file: "Lint File",
             run_command: "Run Command",
             search: "Search",
@@ -1429,6 +1618,7 @@
             case "read_file": return i?.path || "";
             case "write_file": return i?.path || "";
             case "edit_file": return i?.path || "";
+            case "symbol_edit": return `${i?.path || ""} :: ${i?.symbol || ""}`;
             case "lint_file": return i?.path || "";
             case "run_command": return i?.command || "";
             case "search": return `"${i?.pattern || ""}" in ${i?.path || "."}`;
@@ -1441,7 +1631,7 @@
     }
     function toolIcon(n, input) {
         // File-based tools → show the file type icon
-        if ((n === "read_file" || n === "write_file" || n === "edit_file" || n === "lint_file") && input?.path) {
+        if ((n === "read_file" || n === "write_file" || n === "edit_file" || n === "symbol_edit" || n === "lint_file") && input?.path) {
             return fileTypeIcon(input.path, 14);
         }
         const svgs = {
@@ -1870,6 +2060,7 @@
                 $sessionName.textContent = evt.session_name || "default";
                 $tokenCount.textContent = formatTokens(evt.total_tokens || 0) + " tokens";
                 $workingDir.textContent = evt.working_directory || "";
+                toolRunById.clear();
                 if (_isFirstConnect) {
                     // First connect: clear chat, load tree fresh
                     $chatMessages.innerHTML = "";
@@ -1910,24 +2101,65 @@
                 currentTextEl = null; currentTextBuffer = "";
                 break;
             case "tool_call":
-                lastToolBlock = addToolCall(evt.data?.name || "tool", evt.data?.input || evt.data || {});
+                lastToolBlock = addToolCall(
+                    evt.data?.name || "tool",
+                    evt.data?.input || evt.data || {},
+                    evt.data?.id || evt.data?.tool_use_id || null
+                );
                 // Track file modifications
-                if (evt.data?.name === "write_file" || evt.data?.name === "edit_file") {
+                if (evt.data?.name === "write_file" || evt.data?.name === "edit_file" || evt.data?.name === "symbol_edit") {
                     const p = evt.data?.input?.path;
                     if (p) { markFileModified(p); reloadFileInEditor(p); }
                 }
                 break;
             case "tool_result":
-                addToolResult(evt.content || "", evt.data?.success !== false, lastToolBlock, evt.data);
+                {
+                    const runEl = (evt.data?.tool_use_id && toolRunById.get(String(evt.data.tool_use_id))) || lastToolBlock;
+                    addToolResult(evt.content || "", evt.data?.success !== false, runEl, evt.data);
+                }
                 // Reload file if it was just written
-                if (lastToolBlock) {
-                    const tn = lastToolBlock.dataset.toolName;
-                    if (tn === "write_file" || tn === "edit_file") {
-                        const path = lastToolBlock.dataset.path;
-                        if (path) reloadFileInEditor(path);
+                {
+                    const runEl = (evt.data?.tool_use_id && toolRunById.get(String(evt.data.tool_use_id))) || lastToolBlock;
+                    if (runEl) {
+                        const tn = runEl.dataset.toolName;
+                        if (tn === "write_file" || tn === "edit_file" || tn === "symbol_edit") {
+                            const path = runEl.dataset.path;
+                            if (path) reloadFileInEditor(path);
+                        }
                     }
                 }
+                if (evt.data?.tool_use_id) {
+                    toolRunById.delete(String(evt.data.tool_use_id));
+                }
                 lastToolBlock = null;
+                break;
+            case "command_output":
+                appendCommandOutput(evt.data?.tool_use_id, evt.content || "", !!evt.data?.is_stderr);
+                break;
+            case "command_partial_failure":
+                showInfo(evt.content || "Potential command failure detected.");
+                break;
+            case "checkpoint_list":
+                if (Array.isArray(evt.data?.checkpoints)) {
+                    const rows = evt.data.checkpoints
+                        .slice(0, 12)
+                        .map(cp => `${cp.id} (${cp.file_count} files) ${cp.label || ""}`);
+                    showInfo(rows.length ? `Checkpoints:\n${rows.join("\n")}` : "No checkpoints available.");
+                }
+                break;
+            case "checkpoint_restored":
+                showInfo(`Rewound ${evt.data?.count || 0} files from checkpoint ${evt.data?.checkpoint_id || "latest"}.`);
+                if (Array.isArray(evt.data?.paths)) {
+                    evt.data.paths.slice(0, 20).forEach(p => reloadFileInEditor(p));
+                }
+                break;
+            case "checkpoint_created":
+                if (evt.data?.checkpoint_id) {
+                    showInfo(`Checkpoint created: ${evt.data.checkpoint_id}`);
+                }
+                break;
+            case "checkpoint_error":
+                showError(evt.content || "Checkpoint rewind failed.");
                 break;
             case "command_start":
                 // Update existing tool block with "running" status if visible
@@ -1998,6 +2230,8 @@
                 $chatMessages.innerHTML = "";
                 $sessionName.textContent = evt.session_name || "default";
                 $tokenCount.textContent = "0 tokens";
+                toolRunById.clear();
+                clearPendingImages();
                 hideActionBar(); modifiedFiles.clear(); refreshTree();
                 break;
             case "error": showError(evt.content || "Unknown error"); setRunning(false); break;
@@ -2029,10 +2263,18 @@
                 break;
             }
             case "replay_tool_call":
-                lastToolBlock = addToolCall(evt.data?.name || "tool", evt.data?.input || {});
+                lastToolBlock = addToolCall(
+                    evt.data?.name || "tool",
+                    evt.data?.input || {},
+                    evt.data?.id || evt.data?.tool_use_id || null
+                );
                 break;
             case "replay_tool_result":
-                addToolResult(evt.content || "", evt.data?.success !== false, lastToolBlock, evt.data);
+                {
+                    const runEl = (evt.data?.tool_use_id && toolRunById.get(String(evt.data.tool_use_id))) || lastToolBlock;
+                    addToolResult(evt.content || "", evt.data?.success !== false, runEl, evt.data);
+                    if (evt.data?.tool_use_id) toolRunById.delete(String(evt.data.tool_use_id));
+                }
                 lastToolBlock = null;
                 break;
             case "replay_done":
@@ -2084,23 +2326,41 @@
     // INPUT
     // ================================================================
 
-    function submitTask() {
+    async function submitTask() {
         const text = $input.value.trim();
-        if (!text || isRunning) return;
-        if (text.startsWith("/")) { handleCommand(text); $input.value = ""; autoResizeInput(); return; }
-        addUserMessage(text);
+        const hasImages = pendingImages.length > 0;
+        if ((!text && !hasImages) || isRunning) return;
+        if (text.startsWith("/") && !hasImages) { handleCommand(text); $input.value = ""; autoResizeInput(); return; }
+
+        let imagesPayload = [];
+        if (hasImages) {
+            try {
+                imagesPayload = await serializePendingImages();
+            } catch (e) {
+                showError(`Failed to attach image: ${e?.message || e}`);
+                return;
+            }
+        }
+
+        addUserMessage(text, imagesPayload);
         $input.value = ""; autoResizeInput();
+        clearPendingImages();
         setRunning(true);
         addAssistantMessage();
-        send({ type: "task", content: text });
+        send({ type: "task", content: text, images: imagesPayload });
     }
 
     function handleCommand(text) {
-        const cmd = text.split(/\s+/)[0].toLowerCase();
+        const parts = text.trim().split(/\s+/);
+        const cmd = (parts[0] || "").toLowerCase();
         switch(cmd) {
             case "/reset": send({type:"reset"}); break;
             case "/cancel": send({type:"cancel"}); break;
-            case "/help": showInfo("Commands: /reset \u2014 new session  |  /cancel \u2014 stop task"); break;
+            case "/checkpoints": send({ type: "checkpoint_list" }); break;
+            case "/rewind": send({ type: "checkpoint_restore", checkpoint_id: parts[1] || "latest" }); break;
+            case "/help":
+                showInfo("Commands: /reset | /cancel | /checkpoints | /rewind <checkpoint-id|latest>");
+                break;
             default: showInfo(`Unknown: ${cmd}`);
         }
     }
@@ -2108,6 +2368,14 @@
     function autoResizeInput() { $input.style.height = "auto"; $input.style.height = Math.min($input.scrollHeight, 150) + "px"; }
     $input.addEventListener("input", autoResizeInput);
     $input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitTask(); } });
+    if ($attachImageBtn && $imageInput) {
+        $attachImageBtn.addEventListener("click", () => $imageInput.click());
+        $imageInput.addEventListener("change", (e) => {
+            const files = Array.from(e.target.files || []);
+            addPendingImageFiles(files);
+            $imageInput.value = "";
+        });
+    }
     $sendBtn.addEventListener("click", submitTask);
     $cancelBtn.addEventListener("click", () => send({type:"cancel"}));
     $resetBtn.addEventListener("click", () => send({type:"reset"}));
@@ -2498,6 +2766,7 @@
         if (diffEditorInstance) { diffEditorInstance.dispose(); diffEditorInstance = null; }
         $editorWelcome.classList.remove("hidden");
         modifiedFiles.clear();
+        clearPendingImages();
         setRunning(false);
 
         // Show welcome, hide IDE

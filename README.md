@@ -1,35 +1,46 @@
 # Bedrock Codex
 
-A coding agent engine powered by Amazon Bedrock. Think Cursor / Claude Code / ChatGPT Codex, but running on your own AWS Bedrock backend.
+Bedrock Codex is a **Cursor-style coding engine** powered by Amazon Bedrock.
 
-This is **not a chatbot**. It's an autonomous coding agent that reads your codebase, edits files, runs commands, and reasons through tasks using extended thinking.
+It is not a simple chatbot UI. It is an agentic system that can:
+- inspect and edit real project files,
+- run commands and stream terminal output live,
+- produce plan/build workflows,
+- keep/revert code changes with diff review,
+- persist and replay sessions,
+- work on both local and SSH-backed projects.
 
-## Features
+## What You Get
 
-- **Agentic tool-use loop** - Reads, edits, searches, and runs commands autonomously
-- **Smart approval** - Auto-approves reads/searches, asks before writes and shell commands
-- **Extended thinking** - Claude thinks through complex problems step-by-step
-- **Streaming output** - See thinking and actions in real-time
-- **Terminal UI** - Rich terminal interface built with Textual
-- **Multiple models** - Claude Opus 4.5, Sonnet 4, Claude 3.7, and more
+- **Agentic IDE workflow**: scout -> plan -> build -> verify
+- **Web IDE**: file explorer + Monaco editor + agent panel
+- **Plan mode + Build gate**: editable plan steps before execution
+- **Keep/Revert gate**: review diffs before finalizing changes
+- **Live command streaming**: incremental terminal output with follow/pause
+- **Session checkpoints + rewind**: restore risky batches fast
+- **Symbol-aware refactors**: `symbol_edit` (AST/tree-sitter first, fallback safe heuristics)
+- **Parallel manager-worker assistance**: parallel lane analysis for complex plans
+- **Test impact selection**: run likely impacted tests first before full suite
+- **Conversation/session persistence**: reconnect and continue where you left off
+- **SSH remote support**: open and run projects on remote hosts
 
-## Tools
+## UIs
 
-The agent has access to 7 core tools:
+### Web IDE (recommended)
 
-| Tool | Description | Needs Approval |
-|------|-------------|:-:|
-| `read_file` | Read file contents with line numbers | No |
-| `write_file` | Create or overwrite a file | Yes |
-| `edit_file` | Targeted string replacement in a file | Yes |
-| `run_command` | Execute shell commands | Yes |
-| `search` | Ripgrep-powered regex search | No |
-| `list_directory` | List files and directories | No |
-| `glob_find` | Find files by glob pattern | No |
+```bash
+python web.py --dir .
+```
 
-## Quick Start
+Open: `http://127.0.0.1:8765`
 
-### 1. Install Dependencies
+### Textual TUI (legacy/alternative)
+
+```bash
+python main.py -d .
+```
+
+## Install
 
 ```bash
 python -m venv venv
@@ -37,101 +48,120 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Configure AWS Credentials
+## AWS / Bedrock Setup
 
-Edit `.env` with your AWS credentials:
+Set credentials in `.env` or your shell environment:
 
-```
+```env
 AWS_REGION=us-east-1
-AWS_ACCESS_KEY_ID=your-key
-AWS_SECRET_ACCESS_KEY=your-secret
-AWS_SESSION_TOKEN=your-token  # if using temporary credentials
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_SESSION_TOKEN=...   # optional
 ```
 
-### 3. Run
+Required IAM permissions:
+- `bedrock:InvokeModel`
+- `bedrock:InvokeModelWithResponseStream`
+
+## Remote Projects via SSH
+
+Start local server, then connect from the welcome page, or start directly in SSH mode:
 
 ```bash
-python main.py
+python web.py --ssh user@host --dir /path/on/remote
+python web.py --ssh user@host --key ~/.ssh/id_rsa --ssh-port 22 --dir /opt/app
 ```
 
-Or point it at a specific project:
+All reads/writes/commands run on the selected backend (local or SSH).
 
-```bash
-python main.py -d ~/my-project
-```
+## Tooling Surface
 
-## Usage
+| Tool | Purpose |
+|---|---|
+| `read_file` | Read file content (supports scoped reads) |
+| `write_file` | Create/overwrite files |
+| `edit_file` | Exact-context string edits |
+| `symbol_edit` | Symbol-level refactors via AST/tree-sitter where available |
+| `search` | Project-wide regex search |
+| `find_symbol` | Symbol definition/reference navigation |
+| `list_directory` | Directory listing |
+| `glob_find` | Glob-based file discovery |
+| `lint_file` | Per-file lint/typecheck detection and execution |
+| `run_command` | Shell command execution (with streaming support) |
 
-Once running, type a task and press Enter:
+## Core Workflow
 
-```
-> Fix the bug in main.py where it crashes on empty input
-> Add error handling to the API endpoint in routes.py
-> Refactor the database module to use async/await
-> Find all TODO comments and create a summary
-```
+1. Send a coding task.
+2. Agent decides whether scout/plan is needed.
+3. For complex work, it drafts an actionable plan with verification steps.
+4. On build, it executes tools, streams output, and verifies changes.
+5. Review diffs and choose Keep/Revert.
+6. Resume later from persisted session state.
 
-### Commands
+## Runtime Features You Can Use
 
-| Command | Description |
-|---------|-------------|
-| `/help` | Show available commands |
-| `/clear` | Clear the screen |
-| `/reset` | Reset conversation history |
-| `/cd <path>` | Change working directory |
-| `/model` | Show current model info |
-| `/tokens` | Show token usage |
-| `/quit` | Exit |
+- `/checkpoints` -> list available checkpoints
+- `/rewind latest` -> restore most recent checkpoint
+- `/rewind <checkpoint-id>` -> restore specific checkpoint
+- `cancel`/Stop button -> stop active command/task
 
-### Keyboard Shortcuts
+## Key Config Flags
 
-| Shortcut | Action |
-|----------|--------|
-| `Ctrl+C` | Cancel running task / Quit |
-| `Ctrl+L` | Clear screen |
-| `Ctrl+R` | Reset conversation |
+See `config.py` and `.env` for full list. Important flags include:
 
-## Configuration
-
-All settings are in `.env`:
-
-```
-# Model
-BEDROCK_MODEL_ID=us.anthropic.claude-opus-4-5-20251101-v1:0
-MAX_TOKENS=64000
-
-# Extended Thinking
+```env
+# Models / thinking
+BEDROCK_MODEL_ID=us.anthropic.claude-opus-4-6-v1
+MAX_TOKENS=128000
 ENABLE_THINKING=true
-THINKING_BUDGET=50000
+THINKING_BUDGET=120000
+USE_ADAPTIVE_THINKING=true
 
-# Throughput
-THROUGHPUT_MODE=cross-region
+# Agent execution
+MAX_TOOL_ITERATIONS=200
+PLAN_PHASE_ENABLED=true
+SCOUT_ENABLED=true
+AUTO_APPROVE_COMMANDS=false
 
-# Agent
-MAX_TOOL_ITERATIONS=50
+# Advanced execution features
+LIVE_COMMAND_STREAMING=true
+SESSION_CHECKPOINTS_ENABLED=true
+PARALLEL_SUBAGENTS_ENABLED=true
+PARALLEL_SUBAGENTS_MAX_WORKERS=3
+TEST_IMPACT_SELECTION_ENABLED=true
+TEST_RUN_FULL_AFTER_IMPACT=true
 ```
 
 ## Architecture
 
+```text
+web.py              FastAPI + WebSocket bridge + session/replay orchestration
+agent.py            Core coding engine (scout/plan/build, verification, policy, learning)
+tools.py            Tool schemas + implementations (including symbol-aware edits)
+backend.py          LocalBackend + SSHBackend abstraction
+bedrock_service.py  Bedrock streaming client and prompt formatting
+sessions.py         Session persistence store
+static/             Browser IDE frontend (explorer/editor/chat/tool timeline)
 ```
-main.py              Textual TUI - terminal interface
-agent.py             Agent engine - agentic tool-use loop
-tools.py             Tool definitions and implementations
-bedrock_service.py   AWS Bedrock API client (streaming, thinking, tool_use)
-config.py            Configuration and model definitions
+
+## Troubleshooting
+
+### Port already in use (`Errno 48`)
+
+Run on another port:
+
+```bash
+python web.py --dir . --port 8766
 ```
 
-The agent loop:
-1. User sends a task
-2. Agent calls Bedrock with the task + tool definitions
-3. Model responds with thinking + text + tool_use blocks
-4. Agent executes tools (with approval for writes/commands)
-5. Tool results are fed back to the model
-6. Loop continues until the task is complete
+### Bedrock "on-demand throughput isn't supported" for scout model
 
-## AWS Setup
+Use a supported inference profile/model ID in `.env` (especially for `SCOUT_MODEL`), or disable scout:
 
-You need:
-1. An AWS account with Bedrock access enabled
-2. Model access granted for Claude models in the Bedrock console
-3. IAM credentials with `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` permissions
+```env
+SCOUT_ENABLED=false
+```
+
+### Reconnect and lost UI state
+
+The app replays history and state from sessions. If behavior looks stale, hard refresh once and reconnect; session replay should restore plan/diff state where available.
