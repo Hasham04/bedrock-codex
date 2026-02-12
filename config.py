@@ -79,6 +79,15 @@ class AppConfig:
     deterministic_verification_gate: bool = os.getenv("DETERMINISTIC_VERIFICATION_GATE", "true").lower() == "true"
     # Run targeted tests in deterministic gate when test files are discovered
     deterministic_verification_run_tests: bool = os.getenv("DETERMINISTIC_VERIFICATION_RUN_TESTS", "true").lower() == "true"
+    # Language/framework-aware verification orchestrator
+    verification_orchestrator_enabled: bool = os.getenv("VERIFICATION_ORCHESTRATOR_ENABLED", "true").lower() == "true"
+    # Human review gate before build execution starts
+    human_review_mode: bool = os.getenv("HUMAN_REVIEW_MODE", "false").lower() == "true"
+    # Policy engine for risky operations
+    policy_engine_enabled: bool = os.getenv("POLICY_ENGINE_ENABLED", "true").lower() == "true"
+    block_destructive_commands: bool = os.getenv("BLOCK_DESTRUCTIVE_COMMANDS", "true").lower() == "true"
+    # Learning loop from failures
+    learning_loop_enabled: bool = os.getenv("LEARNING_LOOP_ENABLED", "true").lower() == "true"
 
 
 # ============================================================

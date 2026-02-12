@@ -12,6 +12,7 @@ import re
 import shlex
 import threading
 import time
+import hashlib
 from collections import defaultdict
 from typing import List, Dict, Any, Optional, Callable, Awaitable
 from dataclasses import dataclass, field
@@ -219,6 +220,7 @@ Before every batch of tool calls, output 1-2 sentences stating what you will do 
 - `write_file`: Overwrites entirely. Only for new files or when >50% changes. Prefer edit_file.
 - `run_command`: Runs in working directory. Check stdout AND stderr. Non-zero exit = failure.
 - `search`: Regex search across files with ripgrep. Returns matching lines with paths and line numbers. Use `include` to filter by file type.
+- `find_symbol`: Symbol-aware search for definitions/references. Use before editing ambiguous symbols or large codebases.
 - `glob_find`: Find files matching a pattern. Use to discover files before reading.
 - `lint_file`: Auto-detects the project linter. Use after every edit.
 </tool_usage>
@@ -310,6 +312,7 @@ Before every batch of tool calls, output 1-2 sentences stating your next move(s)
 - `write_file`: Overwrites entirely. Use only for new files or major rewrites. Prefer edit_file.
 - `run_command`: Runs in working directory. Check stdout and stderr. Non-zero exit = failure.
 - `search`: Regex search across files using ripgrep. Returns matching lines with file paths and line numbers. Use `include` to filter by file type (e.g. `*.py`).
+- `find_symbol`: Symbol-aware search for definitions/references across languages; useful before edits with many matches.
 - `glob_find`: Find files matching a pattern (e.g. `**/*.test.ts`). Use to discover files before reading.
 - `lint_file`: Auto-detects project linter. Use after every edit.
 </tool_usage>
@@ -365,6 +368,14 @@ class AgentEvent:
     #        error, done, cancelled
     content: str = ""
     data: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class PolicyDecision:
+    """Decision from the policy engine for a requested operation."""
+    require_approval: bool = False
+    blocked: bool = False
+    reason: str = ""
 
 
 # ============================================================
@@ -542,6 +553,10 @@ class CodingAgent:
         self._step_checkpoints: Dict[int, Dict[str, Optional[str]]] = {}
         # Deterministic verification gate status for current run/build
         self._deterministic_verification_done: bool = False
+        # Task decomposition of current plan (execution batches)
+        self._current_plan_decomposition: List[Dict[str, Any]] = []
+        # In-memory cache of learned failure patterns
+        self._failure_pattern_cache: Optional[List[Dict[str, Any]]] = None
 
     @property
     def total_tokens(self) -> int:
@@ -580,6 +595,8 @@ class CodingAgent:
         self._file_cache = {}
         self._step_checkpoints = {}
         self._deterministic_verification_done = False
+        self._current_plan_decomposition = []
+        self._failure_pattern_cache = None
 
     # ------------------------------------------------------------------
     # Plan step progress tracking
@@ -756,9 +773,178 @@ class CodingAgent:
     def _effective_system_prompt(self, base: str) -> str:
         """Return system prompt with project rules appended when present."""
         rules = self._load_project_rules()
-        if not rules:
-            return base
-        return base + "\n\n<project_rules>\nThese project-specific rules MUST be followed:\n\n" + rules + "\n</project_rules>"
+        prompt = base
+        if rules:
+            prompt += "\n\n<project_rules>\nThese project-specific rules MUST be followed:\n\n" + rules + "\n</project_rules>"
+        learned = self._failure_patterns_prompt()
+        if learned:
+            prompt += "\n\n<known_failure_patterns>\n" + learned + "\n</known_failure_patterns>"
+        return prompt
+
+    # ------------------------------------------------------------------
+    # Learning loop from failures
+    # ------------------------------------------------------------------
+
+    def _failure_memory_path(self) -> str:
+        return os.path.join(self.working_directory, ".bedrock-codex", "learning", "failure_patterns.json")
+
+    def _load_failure_patterns(self) -> List[Dict[str, Any]]:
+        if self._failure_pattern_cache is not None:
+            return self._failure_pattern_cache
+        path = self._failure_memory_path()
+        try:
+            if not os.path.exists(path):
+                self._failure_pattern_cache = []
+                return []
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self._failure_pattern_cache = data
+                return data
+        except Exception as e:
+            logger.debug(f"Could not load failure patterns: {e}")
+        self._failure_pattern_cache = []
+        return []
+
+    def _save_failure_patterns(self, rows: List[Dict[str, Any]]) -> None:
+        path = self._failure_memory_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(rows, f, indent=2)
+            self._failure_pattern_cache = rows
+        except Exception as e:
+            logger.debug(f"Could not save failure patterns: {e}")
+
+    def _record_failure_pattern(self, kind: str, detail: str, context: Optional[Dict[str, Any]] = None) -> None:
+        """Persist recurring failure signatures to improve future runs."""
+        if not app_config.learning_loop_enabled:
+            return
+        detail = (detail or "").strip()
+        if not detail:
+            return
+        sig_src = f"{kind}:{detail[:400]}"
+        signature = hashlib.sha1(sig_src.encode("utf-8")).hexdigest()[:16]
+        rows = self._load_failure_patterns()
+        now = int(time.time())
+        found = False
+        for row in rows:
+            if row.get("signature") == signature:
+                row["count"] = int(row.get("count", 1)) + 1
+                row["last_seen"] = now
+                if context:
+                    row["last_context"] = context
+                found = True
+                break
+        if not found:
+            rows.append({
+                "signature": signature,
+                "kind": kind,
+                "detail": detail[:1200],
+                "count": 1,
+                "first_seen": now,
+                "last_seen": now,
+                "last_context": context or {},
+            })
+        rows = sorted(rows, key=lambda r: (int(r.get("count", 1)), int(r.get("last_seen", 0))), reverse=True)[:200]
+        self._save_failure_patterns(rows)
+
+    def _failure_patterns_prompt(self) -> str:
+        rows = self._load_failure_patterns()
+        if not rows:
+            return ""
+        lines = []
+        for row in rows[:8]:
+            lines.append(
+                f"- [{row.get('kind','failure')}] x{row.get('count',1)}: {str(row.get('detail',''))[:180]}"
+            )
+        if not lines:
+            return ""
+        return "Avoid repeating these known failure patterns:\n" + "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Policy engine for risky operations
+    # ------------------------------------------------------------------
+
+    def _policy_decision(self, tool_name: str, tool_input: Dict[str, Any]) -> PolicyDecision:
+        if not app_config.policy_engine_enabled:
+            return PolicyDecision()
+
+        # File path protections
+        if tool_name in ("write_file", "edit_file"):
+            path = (tool_input.get("path", "") or "").lower()
+            protected = (".env", "credentials", "secret", "id_rsa", ".pem", "token")
+            if any(tok in path for tok in protected):
+                return PolicyDecision(require_approval=True, reason="Sensitive file path requires explicit approval.")
+
+        # Command protections
+        if tool_name == "run_command":
+            cmd = (tool_input.get("command", "") or "").strip().lower()
+            destructive_patterns = [
+                "rm -rf",
+                "git reset --hard",
+                "git checkout --",
+                "git clean -fd",
+                "drop table",
+                "truncate table",
+                "sudo rm",
+            ]
+            shared_impact_patterns = [
+                "git push --force",
+                "git push -f",
+                "gh pr merge",
+                "terraform apply",
+                "kubectl delete",
+                "helm uninstall",
+            ]
+            if any(p in cmd for p in destructive_patterns):
+                if app_config.block_destructive_commands:
+                    return PolicyDecision(blocked=True, reason="Blocked destructive command by policy engine.")
+                return PolicyDecision(require_approval=True, reason="Destructive command requires explicit approval.")
+            if any(p in cmd for p in shared_impact_patterns):
+                return PolicyDecision(require_approval=True, reason="Shared-impact command requires explicit approval.")
+
+        return PolicyDecision()
+
+    # ------------------------------------------------------------------
+    # Task decomposition executor metadata
+    # ------------------------------------------------------------------
+
+    def _extract_step_targets(self, step: str) -> List[str]:
+        """Extract likely file paths from a plan step line."""
+        if not step:
+            return []
+        quoted = re.findall(r"`([^`]+)`", step)
+        path_like = [q for q in quoted if "/" in q or "." in os.path.basename(q)]
+        if path_like:
+            return path_like[:3]
+        # Fallback: rough path-like tokens
+        toks = re.findall(r"[A-Za-z0-9_\-./]+\.[A-Za-z0-9]+", step)
+        return toks[:3]
+
+    def _decompose_plan_steps(self, steps: List[str]) -> List[Dict[str, Any]]:
+        """Create execution batches: file-work batches then command/verification batches."""
+        batches: List[Dict[str, Any]] = []
+        current: Dict[str, Any] = {"type": "file_batch", "steps": [], "targets": []}
+        for idx, step in enumerate(steps, start=1):
+            s = step.strip()
+            is_run = bool(re.search(r"\b\[run\]\b|\brun\b|\bverify\b|\btest\b|\blint\b", s, flags=re.IGNORECASE))
+            targets = self._extract_step_targets(s)
+            item = {"index": idx, "step": s, "targets": targets}
+            if is_run:
+                if current["steps"]:
+                    batches.append(current)
+                    current = {"type": "file_batch", "steps": [], "targets": []}
+                batches.append({"type": "command_batch", "steps": [item], "targets": targets})
+                continue
+            current["steps"].append(item)
+            current["targets"].extend(targets)
+        if current["steps"]:
+            batches.append(current)
+        for b_idx, b in enumerate(batches, start=1):
+            b["batch"] = b_idx
+            b["targets"] = sorted(list(dict.fromkeys(b.get("targets", []))))[:20]
+        return batches
 
     # ------------------------------------------------------------------
     # File snapshots — capture originals before modifications
@@ -906,6 +1092,7 @@ class CodingAgent:
             "approved_commands": list(self._approved_commands),
             "running_summary": self._running_summary,
             "current_plan": self._current_plan,
+            "current_plan_decomposition": self._current_plan_decomposition,
             "scout_context": self._scout_context,
             "file_snapshots": snapshots,
             "plan_step_index": self._plan_step_index,
@@ -923,6 +1110,7 @@ class CodingAgent:
         self._approved_commands = set(data.get("approved_commands", []))
         self._running_summary = data.get("running_summary", "")
         self._current_plan = data.get("current_plan")
+        self._current_plan_decomposition = data.get("current_plan_decomposition", [])
         self._scout_context = data.get("scout_context")
         self._plan_step_index = data.get("plan_step_index", 0)
         self._deterministic_verification_done = data.get("deterministic_verification_done", False)
@@ -2054,6 +2242,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                 steps = self._parse_plan_steps(plan_text)
 
             self._current_plan = steps
+            self._current_plan_decomposition = self._decompose_plan_steps(steps)
 
             # Write plan to a markdown file on disk
             plan_file_path = self._write_plan_file(task, plan_text)
@@ -2066,6 +2255,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                     "steps": steps,
                     "plan_text": plan_text,
                     "plan_file": plan_file_path,
+                    "decomposition": self._current_plan_decomposition,
                 },
             ))
 
@@ -2230,10 +2420,21 @@ Keep the whole response under 300 words. If the request is already very clear an
 
         # Build the user message with the approved plan and scout context
         plan_block = "\n".join(plan_steps)
+        decomposition = self._decompose_plan_steps(plan_steps)
+        self._current_plan_decomposition = decomposition
+        decomp_lines = []
+        for batch in decomposition:
+            step_ids = [str(s.get("index")) for s in batch.get("steps", [])]
+            targets = ", ".join(batch.get("targets", [])[:5]) if batch.get("targets") else "n/a"
+            decomp_lines.append(
+                f"- Batch {batch.get('batch')} [{batch.get('type')}]: steps {', '.join(step_ids)} | targets: {targets}"
+            )
+        decomp_text = "\n".join(decomp_lines) if decomp_lines else "- Single batch"
         parts = []
         if self._scout_context:
             parts.append(f"<codebase_context>\n{self._scout_context}\n</codebase_context>")
         parts.append(f"<approved_plan>\n{plan_block}\n</approved_plan>")
+        parts.append(f"<plan_decomposition>\n{decomp_text}\n</plan_decomposition>")
         parts.append(task)
         parts.append(
             "Execute this plan step by step.\n\n"
@@ -2249,6 +2450,29 @@ Keep the whole response under 300 words. If the request is already very clear an
             "a better approach — adapt. State what you changed and why."
         )
         user_content = "\n\n".join(parts)
+
+        # Human-in-the-loop review gate (optional, policy mode)
+        if app_config.human_review_mode:
+            review_desc = (
+                "Human review required before build execution.\n\n"
+                f"Task: {task[:300]}\n\n"
+                "Plan decomposition:\n"
+                f"{decomp_text}\n\n"
+                "Approve to proceed with implementation."
+            )
+            approved = await request_approval(
+                "plan_review",
+                review_desc,
+                {"task": task, "plan_steps": plan_steps, "decomposition": decomposition},
+            )
+            if not approved:
+                await on_event(AgentEvent(
+                    type="cancelled",
+                    content="Build cancelled: plan review was not approved.",
+                ))
+                self.system_prompt = saved_prompt
+                await on_event(AgentEvent(type="phase_end", content="build"))
+                return
 
         # Add to history
         self.history.append({"role": "user", "content": user_content})
@@ -2394,6 +2618,69 @@ Keep the whole response under 300 words. If the request is already very clear an
         hits = sum(1 for pat in patterns if re.search(pat, text, flags=re.IGNORECASE))
         return hits >= 4
 
+    def _verification_profiles(self, modified_abs: List[str]) -> Dict[str, Any]:
+        """Detect language/framework verification profiles from modified files and repo markers."""
+        exts = set()
+        rel_files: List[str] = []
+        for p in modified_abs:
+            rel = os.path.relpath(p, self.working_directory)
+            rel_files.append(rel)
+            _, ext = os.path.splitext(rel.lower())
+            if ext:
+                exts.add(ext)
+        profile = {
+            "python": any(e in exts for e in (".py", ".pyi")),
+            "javascript": any(e in exts for e in (".js", ".jsx", ".mjs")),
+            "typescript": any(e in exts for e in (".ts", ".tsx")),
+            "go": ".go" in exts,
+            "rust": ".rs" in exts,
+            "rel_files": rel_files,
+        }
+        return profile
+
+    def _verification_orchestrator_commands(self, modified_abs: List[str]) -> List[str]:
+        """Build language/framework-aware verification commands."""
+        prof = self._verification_profiles(modified_abs)
+        cmds: List[str] = []
+        rel_files = prof["rel_files"][:50]
+
+        # Python stack
+        if prof["python"]:
+            py_files = [shlex.quote(f) for f in rel_files if f.endswith((".py", ".pyi"))][:40]
+            if py_files:
+                cmds.append("python -m py_compile " + " ".join(py_files))
+            if self.backend.file_exists("pyproject.toml") or self.backend.file_exists("ruff.toml") or self.backend.file_exists(".ruff.toml"):
+                cmds.append("ruff check " + " ".join(py_files or ["."]))
+            elif self.backend.file_exists(".flake8") or self.backend.file_exists("setup.cfg"):
+                cmds.append("flake8 " + " ".join(py_files or ["."]))
+
+        # TS/JS stack
+        if prof["typescript"] and self.backend.file_exists("tsconfig.json"):
+            cmds.append("npx tsc --noEmit")
+        if (prof["javascript"] or prof["typescript"]) and (
+            self.backend.file_exists(".eslintrc.js")
+            or self.backend.file_exists(".eslintrc.json")
+            or self.backend.file_exists("eslint.config.js")
+        ):
+            js_files = [shlex.quote(f) for f in rel_files if f.endswith((".js", ".jsx", ".mjs", ".ts", ".tsx"))][:80]
+            if js_files:
+                cmds.append("npx eslint " + " ".join(js_files))
+
+        # Go/Rust
+        if prof["go"]:
+            cmds.append("go test ./...")
+        if prof["rust"] and self.backend.file_exists("Cargo.toml"):
+            cmds.append("cargo test -q")
+
+        # De-dup while preserving order
+        seen = set()
+        dedup = []
+        for c in cmds:
+            if c not in seen:
+                seen.add(c)
+                dedup.append(c)
+        return dedup[:8]
+
     async def _run_deterministic_verification_gate(
         self,
         on_event: Callable[[AgentEvent], Awaitable[None]],
@@ -2467,9 +2754,37 @@ Keep the whole response under 300 words. If the request is already very clear an
                 if not test_result.success:
                     failures.append(f"{cmd}: {test_text[:1600]}")
 
+        # 3) Verification orchestrator (language/framework aware)
+        if app_config.verification_orchestrator_enabled:
+            for idx, cmd in enumerate(self._verification_orchestrator_commands(modified_abs), start=1):
+                run_result = await loop.run_in_executor(
+                    None,
+                    lambda c=cmd: execute_tool(
+                        "run_command",
+                        {"command": c, "timeout": 240},
+                        self.working_directory,
+                        backend=self.backend,
+                    ),
+                )
+                out = run_result.output if run_result.success else (run_result.error or run_result.output or "Verification command failed")
+                checks_run.append(cmd)
+                await on_event(AgentEvent(
+                    type="tool_result",
+                    content=out,
+                    data={
+                        "tool_name": "run_command",
+                        "tool_use_id": f"verification-orchestrator-{idx}",
+                        "success": run_result.success,
+                        "deterministic_gate": True,
+                    },
+                ))
+                if not run_result.success:
+                    failures.append(f"{cmd}: {out[:1600]}")
+
         summary = "Deterministic verification checks:\n- " + "\n- ".join(checks_run[:30])
         if failures:
             summary += "\n\nFailures:\n- " + "\n- ".join(failures[:20])
+            self._record_failure_pattern("verification_gate_failure", summary[:2000], {"checks_run": checks_run[:30]})
             return False, summary
         summary += "\n\nAll deterministic verification checks passed."
         return True, summary
@@ -2740,6 +3055,11 @@ Keep the whole response under 300 words. If the request is already very clear an
                         self._cache_write_tokens = snapshot_cache_write
 
                         # Single event with full error — no double display
+                        self._record_failure_pattern(
+                            "stream_failure",
+                            err_msg[:1200],
+                            {"attempt": attempt, "max_retries": max_retries},
+                        )
                         await on_event(AgentEvent(
                             type="stream_failed",
                             content=f"Streaming error: {err_msg}\n\nYour message was rolled back — you can re-send it.",
@@ -2983,10 +3303,16 @@ Keep the whole response under 300 words. If the request is already very clear an
                     "content": result_text,
                     "is_error": not result.success,
                 }
+                if not result.success:
+                    self._record_failure_pattern(
+                        "safe_tool_failure",
+                        result_text[:1000],
+                        {"tool_name": tu["name"], "tool_input": tu.get("input", {})},
+                    )
 
         # ---- 2. Handle dangerous tools ----
-        #   File writes: auto-approved (user reviews via keep/revert at end)
-        #   Commands: require explicit approval (they cannot be reverted)
+        #   File writes: generally revertible, but policy engine may force approval.
+        #   Commands: require explicit approval unless configured otherwise.
         if dangerous_calls:
             file_write_calls = [
                 tu for tu in dangerous_calls
@@ -2996,6 +3322,55 @@ Keep the whole response under 300 words. If the request is already very clear an
                 tu for tu in dangerous_calls
                 if tu["name"] not in ("write_file", "edit_file")
             ]
+
+            # Policy engine + explicit approvals for risky file writes
+            filtered_file_writes: List[Dict[str, Any]] = []
+            for tu in file_write_calls:
+                decision = self._policy_decision(tu["name"], tu["input"])
+                if decision.blocked:
+                    msg = f"Blocked by policy engine: {decision.reason or 'Operation is not allowed.'}"
+                    results_by_id[tu["id"]] = {
+                        "type": "tool_result",
+                        "tool_use_id": tu["id"],
+                        "content": msg,
+                        "is_error": True,
+                    }
+                    await on_event(AgentEvent(
+                        type="tool_rejected",
+                        content=tu["name"],
+                        data={"tool_use_id": tu["id"], "reason": decision.reason, "policy_blocked": True},
+                    ))
+                    self._record_failure_pattern("policy_block", msg, {"tool_name": tu["name"], "input": tu["input"]})
+                    continue
+
+                if decision.require_approval:
+                    if self.was_previously_approved(tu["name"], tu["input"]):
+                        await on_event(AgentEvent(
+                            type="auto_approved",
+                            content=tu["name"],
+                            data={"tool_input": tu["input"], "policy_reason": decision.reason},
+                        ))
+                    else:
+                        desc = self._format_tool_description(tu["name"], tu["input"])
+                        if decision.reason:
+                            desc += f"\n\nPolicy note: {decision.reason}"
+                        approved = await request_approval(tu["name"], desc, tu["input"])
+                        if not approved:
+                            results_by_id[tu["id"]] = {
+                                "type": "tool_result",
+                                "tool_use_id": tu["id"],
+                                "content": "User rejected this operation.",
+                                "is_error": True,
+                            }
+                            await on_event(AgentEvent(
+                                type="tool_rejected",
+                                content=tu["name"],
+                                data={"tool_use_id": tu["id"], "reason": decision.reason},
+                            ))
+                            continue
+                        self.remember_approval(tu["name"], tu["input"])
+                filtered_file_writes.append(tu)
+            file_write_calls = filtered_file_writes
 
             # --- Phase A: file writes (auto-approved, revertible) ---
             if file_write_calls:
@@ -3127,6 +3502,12 @@ Keep the whole response under 300 words. If the request is already very clear an
                             "content": result_text,
                             "is_error": not result.success,
                         }
+                        if not result.success:
+                            self._record_failure_pattern(
+                                "file_edit_failure",
+                                result_text[:1200],
+                                {"tool_name": tu["name"], "tool_input": tu.get("input", {})},
+                            )
 
             # --- Phase B: commands — require approval (irreversible) ---
             # In YOLO mode, auto-approve all commands
@@ -3134,9 +3515,52 @@ Keep the whole response under 300 words. If the request is already very clear an
                 tool_name = tu["name"]
                 tool_input = tu["input"]
                 tool_id = tu["id"]
+                decision = self._policy_decision(tool_name, tool_input)
+
+                if decision.blocked:
+                    blocked_msg = f"Blocked by policy engine: {decision.reason or 'Operation is not allowed.'}"
+                    results_by_id[tool_id] = {
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": blocked_msg,
+                        "is_error": True,
+                    }
+                    await on_event(AgentEvent(
+                        type="tool_rejected",
+                        content=tool_name,
+                        data={"tool_use_id": tool_id, "reason": decision.reason, "policy_blocked": True},
+                    ))
+                    self._record_failure_pattern("policy_block", blocked_msg, {"tool_name": tool_name, "tool_input": tool_input})
+                    continue
 
                 # Check YOLO mode, approval memory, or ask for approval
-                if app_config.auto_approve_commands:
+                if decision.require_approval:
+                    if self.was_previously_approved(tool_name, tool_input):
+                        await on_event(AgentEvent(
+                            type="auto_approved",
+                            content=tool_name,
+                            data={"tool_input": tool_input, "policy_reason": decision.reason},
+                        ))
+                    else:
+                        description = self._format_tool_description(tool_name, tool_input)
+                        if decision.reason:
+                            description += f"\n\nPolicy note: {decision.reason}"
+                        approved = await request_approval(tool_name, description, tool_input)
+                        if not approved:
+                            results_by_id[tool_id] = {
+                                "type": "tool_result",
+                                "tool_use_id": tool_id,
+                                "content": "User rejected this operation.",
+                                "is_error": True,
+                            }
+                            await on_event(AgentEvent(
+                                type="tool_rejected",
+                                content=tool_name,
+                                data={"tool_use_id": tool_id},
+                            ))
+                            continue
+                        self.remember_approval(tool_name, tool_input)
+                elif app_config.auto_approve_commands:
                     await on_event(AgentEvent(
                         type="auto_approved",
                         content=tool_name,
@@ -3215,6 +3639,12 @@ Keep the whole response under 300 words. If the request is already very clear an
                     "content": result_text,
                     "is_error": not result.success,
                 }
+                if not result.success:
+                    self._record_failure_pattern(
+                        "command_failure",
+                        result_text[:1200],
+                        {"tool_name": tool_name, "tool_input": tool_input},
+                    )
 
         # Return results in the original tool_use order
         return [results_by_id[tu["id"]] for tu in tool_uses if tu["id"] in results_by_id]
@@ -3229,4 +3659,7 @@ Keep the whole response under 300 words. If the request is already very clear an
             return f"Edit {inputs.get('path', '?')}: replace string"
         elif name == "run_command":
             return f"Run: {inputs.get('command', '?')}"
+        elif name == "plan_review":
+            step_count = len(inputs.get("plan_steps", []) or [])
+            return f"Review and approve plan execution ({step_count} steps)"
         return f"{name}({json.dumps(inputs)[:200]})"

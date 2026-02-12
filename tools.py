@@ -7,6 +7,7 @@ Tools use a Backend abstraction for file/command operations (local or SSH).
 import os
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 
@@ -178,6 +179,66 @@ def search(pattern: str, path: Optional[str] = None, include: Optional[str] = No
     except Exception as e:
         if "timed out" in str(e).lower():
             return ToolResult(success=False, output="", error="Search timed out")
+        return ToolResult(success=False, output="", error=str(e))
+
+
+def find_symbol(symbol: str, kind: str = "all", path: Optional[str] = None, include: Optional[str] = None,
+                backend: Optional[Backend] = None, working_directory: str = ".") -> ToolResult:
+    """Find symbol definitions/references with language-aware regex heuristics."""
+    try:
+        b = backend or LocalBackend(working_directory)
+        target = path or "."
+        sym = re.escape(symbol.strip())
+        if not sym:
+            return ToolResult(success=False, output="", error="symbol is required")
+
+        definition_patterns = [
+            rf"^\s*def\s+{sym}\s*\(",
+            rf"^\s*class\s+{sym}\b",
+            rf"^\s*async\s+def\s+{sym}\s*\(",
+            rf"^\s*(?:export\s+)?(?:async\s+)?function\s+{sym}\s*\(",
+            rf"^\s*(?:export\s+)?(?:const|let|var)\s+{sym}\s*=\s*(?:async\s*)?\(",
+            rf"^\s*(?:public|private|protected)?\s*(?:static\s+)?{sym}\s*\(",
+            rf"\b{sym}\s*:\s*(?:function|\()",
+            rf"^\s*interface\s+{sym}\b",
+            rf"^\s*type\s+{sym}\b",
+            rf"^\s*struct\s+{sym}\b",
+            rf"^\s*enum\s+{sym}\b",
+            rf"^\s*trait\s+{sym}\b",
+        ]
+        reference_pattern = rf"\b{sym}\b"
+
+        outputs: List[str] = []
+        if kind in ("all", "definition", "definitions", "def"):
+            def_hits: List[str] = []
+            for pat in definition_patterns:
+                res = b.search(pat, target, include=include, cwd=".")
+                if res:
+                    def_hits.extend([ln for ln in res.split("\n") if ln.strip()])
+            # Deduplicate while preserving order
+            seen = set()
+            dedup_defs = []
+            for line in def_hits:
+                if line not in seen:
+                    seen.add(line)
+                    dedup_defs.append(line)
+            if dedup_defs:
+                outputs.append("Definitions:\n" + "\n".join(dedup_defs[:120]))
+            else:
+                outputs.append("Definitions:\nNo matches found.")
+
+        if kind in ("all", "reference", "references", "ref"):
+            refs = b.search(reference_pattern, target, include=include, cwd=".")
+            if refs:
+                lines = [ln for ln in refs.split("\n") if ln.strip()]
+                outputs.append("References:\n" + "\n".join(lines[:160]))
+            else:
+                outputs.append("References:\nNo matches found.")
+
+        return ToolResult(success=True, output="\n\n".join(outputs))
+    except Exception as e:
+        if "timed out" in str(e).lower():
+            return ToolResult(success=False, output="", error="Symbol search timed out")
         return ToolResult(success=False, output="", error=str(e))
 
 
@@ -373,6 +434,20 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "find_symbol",
+        "description": "Symbol-aware navigation helper. Finds symbol definitions and/or references using language-aware patterns across Python/JS/TS and common typed languages. Use this before editing ambiguous symbols with many occurrences.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Symbol name, e.g. 'AuthService' or 'validate_user'"},
+                "kind": {"type": "string", "description": "One of: all|definition|reference (default: all)"},
+                "path": {"type": "string", "description": "Directory or file to search in (default: working directory)"},
+                "include": {"type": "string", "description": "Glob filter, e.g. '*.py' or '*.{ts,tsx}'"},
+            },
+            "required": ["symbol"],
+        },
+    },
+    {
         "name": "list_directory",
         "description": "List files and directories at a given path with file sizes. Good first step to understand project structure before diving into specific files.",
         "input_schema": {
@@ -413,13 +488,14 @@ TOOL_IMPLEMENTATIONS = {
     "edit_file": edit_file,
     "run_command": run_command,
     "search": search,
+    "find_symbol": find_symbol,
     "list_directory": list_directory,
     "glob_find": glob_find,
     "lint_file": lint_file,
 }
 
 TOOLS_REQUIRING_APPROVAL = {"write_file", "edit_file", "run_command"}
-SAFE_TOOLS = {"read_file", "search", "list_directory", "glob_find", "lint_file"}
+SAFE_TOOLS = {"read_file", "search", "find_symbol", "list_directory", "glob_find", "lint_file"}
 SCOUT_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     t for t in TOOL_DEFINITIONS if t["name"] in SAFE_TOOLS
 ]

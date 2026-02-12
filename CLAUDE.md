@@ -52,6 +52,33 @@ These standards are the default behavior for all agent work in this repository.
   - targeted tests when discoverable
 - If gate fails, fix issues first; do not finalize early.
 
+## Verification Orchestrator
+- Use language/framework-aware verification commands in addition to per-file lint.
+- Python: py_compile + ruff/flake8 + targeted pytest when tests are discoverable.
+- TS/JS: tsc (when tsconfig exists) + eslint on modified files.
+- Rust/Go: run project-appropriate test commands when those file types are modified.
+
+## Policy Engine
+- Evaluate every risky operation with policy checks.
+- Block destructive commands by default (unless policy is explicitly relaxed).
+- Require explicit approval for sensitive file writes and shared-impact commands.
+
+## Symbol-Aware Navigation
+- Prefer symbol-level search (`find_symbol`) over broad text search for ambiguous edits.
+- Resolve definitions/references before editing high-fanout identifiers.
+
+## Task Decomposition
+- Decompose plan steps into execution batches (file work vs command/verification work).
+- Use decomposition metadata to execute and report progress deterministically.
+
+## Human Review Mode
+- When review mode is enabled, require explicit approval before build execution starts.
+- Present task + plan decomposition in the review prompt.
+
+## Learning Loop
+- Persist recurring failure signatures.
+- Surface top known failure patterns in system context to prevent repeat mistakes.
+
 ## Safety and Reversibility
 - Prefer local reversible actions.
 - Ask before hard-to-reverse or shared-impact actions (destructive operations, force pushes, dropping data).
