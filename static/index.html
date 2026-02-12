@@ -204,18 +204,21 @@
                     <div id="search-status" class="search-status"></div>
                     <div id="search-results" class="search-results"></div>
                 </div>
-                <div id="file-tree" class="file-tree"></div>
-                <!-- Source Control (VS Code / Cursor style) -->
-                <div id="source-control-panel" class="source-control-panel">
-                    <div class="panel-header source-control-header">
-                        <span class="panel-title">Source Control</span>
-                        <button id="source-control-refresh-btn" class="icon-btn-sm" title="Refresh" aria-label="Refresh">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
-                            </svg>
-                        </button>
+                <div class="explorer-body">
+                    <div id="file-tree" class="file-tree"></div>
+                    <div class="resize-handle resize-handle-explorer-sc" id="resize-explorer-sc" title="Drag to resize Source Control"></div>
+                    <!-- Source Control (VS Code / Cursor style) -->
+                    <div id="source-control-panel" class="source-control-panel">
+                        <div class="panel-header source-control-header">
+                            <span class="panel-title">Source Control</span>
+                            <button id="source-control-refresh-btn" class="icon-btn-sm" title="Refresh" aria-label="Refresh">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <div id="source-control-list" class="source-control-list"></div>
                     </div>
-                    <div id="source-control-list" class="source-control-list"></div>
                 </div>
             </aside>
 

@@ -1144,6 +1144,37 @@
     setupResize("resize-left", document.getElementById("file-explorer"), null, "left");
     setupResize("resize-right", null, document.getElementById("chat-panel"), "right");
 
+    // Source Control panel vertical resize (expand/collapse in explorer)
+    const SOURCE_CONTROL_MIN_HEIGHT = 80;
+    const SOURCE_CONTROL_MAX_HEIGHT = 0.6 * window.innerHeight;
+    const $resizeExplorerSc = document.getElementById("resize-explorer-sc");
+    const $sourceControlPanel = document.getElementById("source-control-panel");
+    const $fileExplorer = document.getElementById("file-explorer");
+    if ($resizeExplorerSc && $sourceControlPanel && $fileExplorer) {
+        $resizeExplorerSc.addEventListener("mousedown", (e) => {
+            e.preventDefault();
+            const startY = e.clientY;
+            const startHeight = $sourceControlPanel.offsetHeight;
+            $resizeExplorerSc.classList.add("dragging");
+            document.body.style.cursor = "row-resize";
+            document.body.style.userSelect = "none";
+            function onMove(ev) {
+                const dy = ev.clientY - startY;
+                const newHeight = Math.max(SOURCE_CONTROL_MIN_HEIGHT, Math.min(SOURCE_CONTROL_MAX_HEIGHT, startHeight - dy));
+                $fileExplorer.style.setProperty("--source-control-height", newHeight + "px");
+            }
+            function onUp() {
+                $resizeExplorerSc.classList.remove("dragging");
+                document.body.style.cursor = "";
+                document.body.style.userSelect = "";
+                document.removeEventListener("mousemove", onMove);
+                document.removeEventListener("mouseup", onUp);
+            }
+            document.addEventListener("mousemove", onMove);
+            document.addEventListener("mouseup", onUp);
+        });
+    }
+
     // ================================================================
     // INTEGRATED TERMINAL (bottom of editor panel)
     // ================================================================
