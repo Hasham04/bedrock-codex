@@ -1108,6 +1108,19 @@
         return new Date(ts).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
     }
     function toolGroupKey(name, input) { return `${name}::${toolDesc(name, input)}`; }
+    function toolActionIcon(kind) {
+        const icons = {
+            done: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+            pending: `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5" stroke="currentColor" stroke-width="2" fill="none"/></svg>`,
+            failed: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>`,
+            open: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+            rerun: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+            retry: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m1 4 4 4 4-4M23 20l-4-4-4 4M20 8a8 8 0 0 0-13-3M4 16a8 8 0 0 0 13 3" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+            copy: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" stroke="currentColor" stroke-width="2" fill="none"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>`,
+            stop: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.5" ry="1.5" stroke="currentColor" stroke-width="2" fill="none"/></svg>`,
+        };
+        return icons[kind] || "";
+    }
     function toolCanOpenFile(name, input) {
         return Boolean((name === "read_file" || name === "write_file" || name === "edit_file" || name === "symbol_edit" || name === "lint_file") && input?.path);
     }
@@ -1378,21 +1391,23 @@
             const statusEl = group.querySelector(".tool-status");
             if (statusEl) {
                 statusEl.outerHTML = isCmd
-                    ? `<span class="tool-status tool-status-running"><span class="tool-spinner"></span> Running</span>`
-                    : `<span class="tool-status tool-status-pending">pending</span>`;
+                    ? `<span class="tool-status tool-status-running" title="Running"><span class="tool-spinner"></span></span>`
+                    : `<span class="tool-status tool-status-pending" title="Pending">${toolActionIcon("pending")}</span>`;
             }
             if (isCmd && !group.querySelector(".tool-stop-btn")) {
                 const actions = group.querySelector(".tool-actions");
                 if (actions) {
                     const stopBtn = document.createElement("button");
-                    stopBtn.className = "tool-stop-btn";
+                    stopBtn.className = "tool-stop-btn tool-icon-btn";
+                    stopBtn.setAttribute("aria-label", "Stop command");
                     stopBtn.title = "Stop command";
-                    stopBtn.textContent = "Stop";
+                    stopBtn.innerHTML = toolActionIcon("stop");
                     stopBtn.addEventListener("click", (e) => {
                         e.stopPropagation();
                         send({ type: "cancel" });
                         stopBtn.disabled = true;
-                        stopBtn.textContent = "Stopping\u2026";
+                        stopBtn.classList.add("is-stopping");
+                        stopBtn.innerHTML = `<span class="tool-stop-spinner"></span>`;
                         stopBtn.title = "Stopping\u2026";
                     });
                     actions.appendChild(stopBtn);
@@ -1411,8 +1426,8 @@
             group.dataset.follow = "1";
             if (input?.path) group.dataset.path = input.path;
             const statusHtml = isCmd
-                ? `<span class="tool-status tool-status-running"><span class="tool-spinner"></span> Running</span>`
-                : `<span class="tool-status tool-status-pending">pending</span>`;
+                ? `<span class="tool-status tool-status-running" title="Running"><span class="tool-spinner"></span></span>`
+                : `<span class="tool-status tool-status-pending" title="Pending">${toolActionIcon("pending")}</span>`;
 
             group.innerHTML = `
                 <div class="tool-header ${isCmd ? "tool-header-cmd" : ""}">
@@ -1428,12 +1443,12 @@
                         <span class="tool-time-range">${formatClock(now)}</span>
                         ${statusHtml}
                         <div class="tool-actions">
-                            <button type="button" class="tool-action-btn tool-action-open ${toolCanOpenFile(name, input) ? "" : "hidden"}">Open</button>
-                            <button type="button" class="tool-action-btn tool-action-rerun">Rerun</button>
-                            <button type="button" class="tool-action-btn tool-action-retry hidden">Retry</button>
-                            <button type="button" class="tool-action-btn tool-action-copy hidden">Copy output</button>
+                            <button type="button" class="tool-action-btn tool-icon-btn tool-action-open ${toolCanOpenFile(name, input) ? "" : "hidden"}" title="Open file" aria-label="Open file">${toolActionIcon("open")}</button>
+                            <button type="button" class="tool-action-btn tool-icon-btn tool-action-rerun" title="Rerun" aria-label="Rerun">${toolActionIcon("rerun")}</button>
+                            <button type="button" class="tool-action-btn tool-icon-btn tool-action-retry hidden" title="Retry failed" aria-label="Retry failed">${toolActionIcon("retry")}</button>
+                            <button type="button" class="tool-action-btn tool-icon-btn tool-action-copy hidden" title="Copy output" aria-label="Copy output">${toolActionIcon("copy")}</button>
                             ${isCmd ? `<button type="button" class="tool-action-btn tool-follow-btn">Pause follow</button>` : ""}
-                            ${isCmd ? `<button class="tool-stop-btn" title="Stop command">Stop</button>` : ""}
+                            ${isCmd ? `<button type="button" class="tool-stop-btn tool-icon-btn" title="Stop command" aria-label="Stop command">${toolActionIcon("stop")}</button>` : ""}
                         </div>
                         <span class="tool-chevron">\u25BC</span>
                     </div>
@@ -1472,7 +1487,8 @@
                     e.stopPropagation();
                     send({ type: "cancel" });
                     stopBtn.disabled = true;
-                    stopBtn.textContent = "Stopping\u2026";
+                    stopBtn.classList.add("is-stopping");
+                    stopBtn.innerHTML = `<span class="tool-stop-spinner"></span>`;
                     stopBtn.title = "Stopping\u2026";
                 });
             }
@@ -1535,11 +1551,15 @@
             if (isCmd) {
                 const exitCode = extraData?.exit_code;
                 const duration = extraData?.duration;
-                let badge = success ? `<span class="tool-status tool-status-success">exit 0</span>` : `<span class="tool-status tool-status-error">exit ${exitCode ?? "?"}</span>`;
+                let badge = success
+                    ? `<span class="tool-status tool-status-success" title="Command succeeded">${toolActionIcon("done")}</span>`
+                    : `<span class="tool-status tool-status-error" title="Command failed (exit ${exitCode ?? "?"})">${toolActionIcon("failed")}</span>`;
                 if (duration !== undefined && duration !== null) badge += `<span class="tool-status tool-status-duration">${duration}s</span>`;
                 statusEl.outerHTML = badge;
             } else {
-                statusEl.outerHTML = success ? `<span class="tool-status tool-status-success">done</span>` : `<span class="tool-status tool-status-error">failed</span>`;
+                statusEl.outerHTML = success
+                    ? `<span class="tool-status tool-status-success" title="Done">${toolActionIcon("done")}</span>`
+                    : `<span class="tool-status tool-status-error" title="Failed">${toolActionIcon("failed")}</span>`;
             }
         }
 
@@ -1586,29 +1606,29 @@
             read_file: "Read",
             write_file: "Write",
             edit_file: "Edit",
-            symbol_edit: "Symbol Edit",
+            symbol_edit: "Symbol",
             lint_file: "Lint",
-            run_command: "Terminal",
+            run_command: "Run",
             search: "Search",
-            list_directory: "List Files",
-            glob_find: "Find Files",
-            find_symbol: "Find Symbol",
+            list_directory: "List",
+            glob_find: "Glob",
+            find_symbol: "Symbols",
             scout: "Scout",
         };
         return labels[n] || n;
     }
     function toolTitle(n) {
         const titles = {
-            read_file: "Read File",
-            write_file: "Write File",
-            edit_file: "Edit File",
-            symbol_edit: "Symbol Edit",
-            lint_file: "Lint File",
-            run_command: "Run Command",
+            read_file: "Read",
+            write_file: "Write",
+            edit_file: "Edit",
+            symbol_edit: "Symbol",
+            lint_file: "Lint",
+            run_command: "Run",
             search: "Search",
-            list_directory: "List Directory",
-            glob_find: "Find Files",
-            find_symbol: "Find Symbol",
+            list_directory: "List",
+            glob_find: "Glob",
+            find_symbol: "Symbols",
             scout: "Scout",
         };
         return titles[n] || toolLabel(n);
@@ -2209,7 +2229,7 @@
                 // Clean up ALL running indicators
                 // 1. Tool running badges & stop buttons
                 document.querySelectorAll(".tool-status-running").forEach(el => {
-                    el.outerHTML = `<span class="tool-status tool-status-error">cancelled</span>`;
+                    el.outerHTML = `<span class="tool-status tool-status-error" title="Cancelled">${toolActionIcon("stop")}</span>`;
                 });
                 document.querySelectorAll(".tool-stop-btn").forEach(el => el.remove());
                 // 2. Scout spinner
