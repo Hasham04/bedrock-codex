@@ -120,6 +120,13 @@ ComponentA → ComponentB → ComponentC
 | path/to/file.py | EDIT | Specific description |
 | path/to/new.py | CREATE | What it contains and why |
 
+## Checklist
+Short execution checklist for the implementer. One line per distinct user-requested item.
+Use strict numbered format:
+1. <distinct item #1>
+2. <distinct item #2>
+3. <distinct item #3>
+
 ## Steps
 Each step must name the exact file, exact function/class, and describe the specific change — not "update the handler" but "in `handle_request()`, add a check for `if user.is_admin` before the existing authorization block, returning 403 if false."
 
@@ -134,6 +141,13 @@ For each risk: the scenario, the consequence if unhandled, and the mitigation.
 
 ## Verification
 Exact commands and checks. Not "run the tests" but "run `pytest tests/test_auth.py -v` and expect the new `test_admin_access` to pass alongside existing tests."
+
+<critical_requirements>
+- Do not output a single vague todo.
+- If the request includes multiple actions/locations/files, produce multiple checklist items and multiple numbered steps.
+- Every numbered step must be actionable and specific (file + function/class + exact change).
+- Never use meta placeholders like "let me check X" as a plan step.
+</critical_requirements>
 </plan_document_format>
 
 <working_directory>{working_directory}</working_directory>
@@ -1945,6 +1959,41 @@ Keep the whole response under 300 words. If the request is already very clear an
             # Parse numbered steps from the Implementation Steps section
             steps = self._parse_plan_steps(plan_text)
 
+            # Quality gate: if the plan is too shallow, force a stricter rewrite.
+            # This prevents one-line "todo" outputs from passing through.
+            repair_attempts = 0
+            while repair_attempts < 2 and not self._plan_quality_sufficient(task_for_plan, plan_text, steps):
+                repair_attempts += 1
+                await on_event(AgentEvent(
+                    type="scout_progress",
+                    content=(
+                        f"Planning: refining plan quality (attempt {repair_attempts}) — "
+                        "requesting explicit multi-item checklist and actionable steps..."
+                    ),
+                ))
+                min_steps = 3 if self._task_looks_multi_item(task_for_plan) else 1
+                plan_messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous plan was too shallow. Rewrite the COMPLETE plan now.\n\n"
+                        "STRICT REQUIREMENTS:\n"
+                        "1) Include sections: Why, Approach, Affected Files, Checklist, Steps, Verification.\n"
+                        f"2) Provide at least {min_steps} numbered, actionable Steps.\n"
+                        "3) Each step must include specific file path + target function/class + exact change.\n"
+                        "4) Do NOT output meta/planning chatter (e.g. 'let me check...').\n"
+                        "5) If the request has multiple asks, include all asks in Checklist and Steps.\n"
+                    ),
+                })
+                repaired_text, _, repaired_content = await _stream_plan_call(plan_messages, None)
+                if not repaired_text:
+                    break
+                plan_text = repaired_text.strip()
+                extracted = _extract_plan(plan_text)
+                if extracted:
+                    plan_text = extracted
+                plan_messages.append({"role": "assistant", "content": repaired_content})
+                steps = self._parse_plan_steps(plan_text)
+
             self._current_plan = steps
 
             # Write plan to a markdown file on disk
@@ -1970,40 +2019,111 @@ Keep the whole response under 300 words. If the request is already very clear an
 
     @staticmethod
     def _parse_plan_steps(plan_text: str) -> List[str]:
-        """Extract numbered steps from a plan document.
-        Looks specifically in the '## Implementation Steps' section if present,
-        otherwise parses from the entire text."""
-        # Try to find the steps section
-        sections = re.split(r"^##\s+", plan_text, flags=re.MULTILINE)
+        """Extract actionable numbered steps from the plan document.
+        Prefers the explicit Steps section and avoids swallowing generic bullets."""
+        # 1) Prefer explicit steps section ("## Steps" / "## Implementation Steps")
         steps_section = None
-        for section in sections:
-            header = section.split("\n", 1)[0].strip().lower()
-            if "implementation" in header or "steps" in header:
-                steps_section = section.split("\n", 1)[1] if "\n" in section else ""
-                break
+        sec_match = re.search(
+            r"(?ims)^##\s*(?:implementation\s+steps|steps)\s*$\n(.*?)(?=^##\s+|\Z)",
+            plan_text,
+        )
+        if sec_match:
+            steps_section = sec_match.group(1).strip()
 
         target = steps_section if steps_section else plan_text
 
-        steps = []
-        for line in target.split("\n"):
-            line = line.strip()
+        # 2) Primary parse: numbered lines only
+        steps: List[str] = []
+        for raw_line in target.split("\n"):
+            line = raw_line.strip()
             if not line:
                 continue
-            # Match numbered lines: "1. ...", "1) ...", "- **[EDIT]** ..."
-            if re.match(r"^(\d+[\.\)]\s|[-*]\s)", line):
+            if re.match(r"^\d+[\.\)]\s+", line):
                 steps.append(line)
-            elif steps and not line.startswith("#"):
-                # Continuation of previous step
-                steps[-1] += " " + line
+            elif steps and not line.startswith("#") and not re.match(r"^\|.*\|$", line):
+                # Continuation line for the previous numbered step
+                if raw_line.startswith(" ") or raw_line.startswith("\t") or line.startswith(("-", "*")):
+                    steps[-1] += " " + line
 
+        # 3) Fallback parse if none found: structured action bullets only
+        if not steps:
+            for raw_line in target.split("\n"):
+                line = raw_line.strip()
+                if re.match(r"^[-*]\s+\*\*\[(EDIT|CREATE|RUN|VERIFY|DELETE)\]\*\*", line, flags=re.IGNORECASE):
+                    steps.append(line)
+
+        # 4) Last resort: numbered lines anywhere
         if not steps and plan_text:
-            # Fallback: any numbered lines in the document
-            for line in plan_text.split("\n"):
-                line = line.strip()
-                if re.match(r"^\d+[\.\)]\s", line):
+            for raw_line in plan_text.split("\n"):
+                line = raw_line.strip()
+                if re.match(r"^\d+[\.\)]\s+", line):
                     steps.append(line)
 
         return steps
+
+    @staticmethod
+    def _task_looks_multi_item(task: str) -> bool:
+        """Heuristic: does the request likely contain multiple distinct items?"""
+        if not task:
+            return False
+        t = task.lower()
+        if re.search(r"\n\s*[-*]\s+", t) or re.search(r"\n\s*\d+[\.\)]\s+", t):
+            return True
+        markers = [
+            " also ",
+            " then ",
+            " next ",
+            " in addition ",
+            " as well ",
+            " after that ",
+            " plus ",
+        ]
+        if any(m in t for m in markers):
+            return True
+        # Two or more "and" often indicates multiple asks
+        return t.count(" and ") >= 2
+
+    @staticmethod
+    def _is_actionable_plan_step(step: str) -> bool:
+        """Filter out weak/meta steps like 'let me check X'."""
+        s = (step or "").strip()
+        if len(s) < 20:
+            return False
+        low = s.lower()
+        weak_prefixes = (
+            "ok",
+            "okay",
+            "let me",
+            "now let me",
+            "i will check",
+            "check line",
+            "todo",
+        )
+        if any(low.startswith(p) for p in weak_prefixes):
+            return False
+        verbs = (
+            "edit", "update", "change", "replace", "add", "remove", "create",
+            "run", "test", "lint", "verify", "refactor", "fix", "inject",
+        )
+        return any(v in low for v in verbs)
+
+    def _plan_quality_sufficient(self, task: str, plan_text: str, steps: List[str]) -> bool:
+        """Require structured, actionable plans before moving to build."""
+        low = (plan_text or "").lower()
+        has_steps_section = ("## steps" in low) or ("## implementation steps" in low)
+        if not has_steps_section:
+            return False
+        required_sections = ("## affected files", "## verification")
+        if not all(sec in low for sec in required_sections):
+            return False
+
+        multi_item = self._task_looks_multi_item(task)
+        min_steps = 3 if multi_item else 1
+        if len(steps) < min_steps:
+            return False
+
+        actionable_count = sum(1 for s in steps if self._is_actionable_plan_step(s))
+        return actionable_count >= min_steps
 
     def _write_plan_file(self, task: str, plan_text: str) -> Optional[str]:
         """Write the plan as a markdown file under .bedrock-codex/plans/.
@@ -2057,6 +2177,8 @@ Keep the whole response under 300 words. If the request is already very clear an
         parts.append(task)
         parts.append(
             "Execute this plan step by step.\n\n"
+            "Before touching files, first output a short numbered TODO checklist that covers all plan items.\n"
+            "Then execute them in order and clearly report progress like 'Todo i of N'.\n\n"
             "For each step:\n"
             "1. State which step you are working on (e.g. 'Step 3: ...')\n"
             "2. Read the target file(s) first — never edit blind\n"
