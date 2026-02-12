@@ -70,6 +70,8 @@ class AppConfig:
     fast_model: str = os.getenv("FAST_MODEL", "us.anthropic.claude-sonnet-4-20250514-v1:0")
     # Refine user task into output spec + constraints before planning (Cursor-style)
     task_refinement_enabled: bool = os.getenv("TASK_REFINEMENT_ENABLED", "true").lower() == "true"
+    # After build phase, run a short verification loop (lint + tests)
+    post_build_verification_enabled: bool = os.getenv("POST_BUILD_VERIFICATION_ENABLED", "true").lower() == "true"
 
 
 # ============================================================
