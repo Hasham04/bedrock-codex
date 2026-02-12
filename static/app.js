@@ -80,7 +80,10 @@
     const $terminalCloseBtn = document.getElementById("terminal-close-btn");
     const $terminalClearBtn = document.getElementById("terminal-clear-btn");
     const $resizeTerminal = document.getElementById("resize-terminal");
+    const $sourceControlList = document.getElementById("source-control-list");
+    const $sourceControlRefreshBtn = document.getElementById("source-control-refresh-btn");
     let terminalCwd = null;  // current working directory for terminal (project root or after cd)
+    let terminalCompletionState = null;  // { prefix, completions, index } for Tab cycling
 
     // ── State ─────────────────────────────────────────────────
     let ws = null;
@@ -90,6 +93,7 @@
     let activeTab = null;         // path of active tab
     const openTabs = new Map();   // path -> { model, viewState, content }
     const modifiedFiles = new Set(); // paths changed by agent
+    let gitStatus = new Map();       // path -> 'M'|'A'|'D'|'U' (git status for explorer + inline diffs)
     let currentThinkingEl = null;
     let currentTextEl = null;
     let currentTextBuffer = "";
@@ -338,8 +342,52 @@
 
     const treeState = {}; // path -> expanded (bool)
 
+    async function fetchGitStatus() {
+        try {
+            const res = await fetch("/api/git-status?t=" + Date.now());
+            if (!res.ok) {
+                gitStatus = new Map();
+                return;
+            }
+            const data = await res.json();
+            const status = data.status && typeof data.status === "object" ? data.status : {};
+            gitStatus = new Map(Object.entries(status));
+            if (data.error && gitStatus.size === 0) {
+                console.warn("Git status unavailable:", data.error);
+            }
+            renderSourceControl();
+        } catch (e) {
+            gitStatus = new Map();
+            console.warn("Git status fetch failed:", e);
+            renderSourceControl();
+        }
+    }
+
+    function renderSourceControl() {
+        if (!$sourceControlList) return;
+        const entries = [...gitStatus.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+        if (entries.length === 0) {
+            $sourceControlList.innerHTML = '<div class="source-control-empty">No changes</div>';
+            return;
+        }
+        let html = "";
+        for (const [path, status] of entries) {
+            const statusCls = status === "M" ? "modified" : status === "A" ? "added" : status === "D" ? "deleted" : "untracked";
+            const label = status === "M" ? "M" : status === "A" ? "A" : status === "D" ? "D" : "U";
+            html += `<div class="source-control-item" data-path="${escapeHtml(path)}" data-status="${statusCls}">
+                <span class="sc-status ${statusCls}">${escapeHtml(label)}</span>
+                <span class="sc-path">${escapeHtml(path)}</span>
+            </div>`;
+        }
+        $sourceControlList.innerHTML = html;
+        $sourceControlList.querySelectorAll(".source-control-item").forEach(el => {
+            el.addEventListener("click", () => openFile(el.dataset.path));
+        });
+    }
+
     async function loadTree(parentPath = "", parentEl = null) {
         const target = parentEl || $fileTree;
+        if (!parentEl) await fetchGitStatus();
         try {
             const res = await fetch(`/api/files?path=${encodeURIComponent(parentPath)}`);
             const items = await res.json();
@@ -376,8 +424,12 @@
                     if (isOpen) loadTree(item.path, children);
                 } else {
                     const icon = fileIcon(item.ext);
+                    const pathNorm = (item.path || "").replace(/\\/g, "/");
+                    const g = gitStatus.get(pathNorm);
+                    const agentMod = modifiedFiles.has(item.path) || modifiedFiles.has(pathNorm);
+                    const statusCls = agentMod ? "modified" : (g === "M" ? "modified" : g === "A" ? "added" : g === "D" ? "deleted" : g === "U" ? "untracked" : "");
                     el.innerHTML = `
-                        <div class="tree-item ${modifiedFiles.has(item.path) ? 'modified' : ''}" data-path="${escapeHtml(item.path)}" data-type="file" style="padding-left:${8 + depth*16 + 16}px">
+                        <div class="tree-item ${statusCls}" data-path="${escapeHtml(item.path)}" data-type="file" style="padding-left:${8 + depth*16 + 16}px">
                             <span class="tree-icon">${icon}</span>
                             <span class="tree-file-name">${escapeHtml(item.name)}</span>
                         </div>
@@ -464,8 +516,20 @@
         if (tab) tab.classList.add("modified");
     }
 
-    function refreshTree() { $fileTree.innerHTML = ""; loadTree(); }
+    async function refreshTree() {
+        await fetchGitStatus();
+        $fileTree.innerHTML = "";
+        loadTree();
+    }
     $refreshTree.addEventListener("click", refreshTree);
+    if ($sourceControlRefreshBtn) {
+        $sourceControlRefreshBtn.addEventListener("click", async () => {
+            await fetchGitStatus();
+            renderSourceControl();
+            $fileTree.innerHTML = "";
+            loadTree();
+        });
+    }
 
     // ================================================================
     // MONACO EDITOR
@@ -568,9 +632,14 @@
         if (info.viewState) monacoInstance.restoreViewState(info.viewState);
         monacoInstance.focus();
 
-        // Apply inline diff decorations if this file was modified by the agent
+        // Apply inline diff decorations: agent-modified first, else git changes
         if (modifiedFiles.has(path)) {
             applyInlineDiffDecorations(path);
+        } else {
+            const pathNorm = (path || "").replace(/\\/g, "/");
+            const g = gitStatus.get(pathNorm);
+            if (g === "M" || g === "A" || g === "U") applyGitInlineDiffDecorations(path);
+            else clearDiffDecorations(path);
         }
 
         // Update tab bar UI
@@ -588,7 +657,9 @@
         const tab = document.createElement("div");
         tab.className = "tab active";
         tab.dataset.path = path;
-        if (modifiedFiles.has(path)) tab.classList.add("modified");
+        const pathNorm = (path || "").replace(/\\/g, "/");
+        const g = gitStatus.get(pathNorm);
+        if (modifiedFiles.has(path) || modifiedFiles.has(pathNorm) || g === "M" || g === "A" || g === "U") tab.classList.add("modified");
 
         tab.innerHTML = `<span class="tab-name">${escapeHtml(basename(path))}</span><span class="tab-close">\u00D7</span>`;
         tab.addEventListener("click", (e) => {
@@ -929,6 +1000,62 @@
     }
 
     /**
+     * Fetch git original vs current and apply inline diff decorations (same gutter as agent diffs).
+     */
+    async function applyGitInlineDiffDecorations(path) {
+        if (!monacoInstance || !openTabs.has(path) || typeof monaco === "undefined") return;
+        try {
+            const pathForApi = (path || "").replace(/\\/g, "/");
+            const res = await fetch(`/api/git-file-diff?path=${encodeURIComponent(pathForApi)}`);
+            if (!res.ok) return;
+            const data = await res.json();
+            const info = openTabs.get(path);
+            if (!info || !info.model) return;
+            const currentText = info.model.getValue();
+            const diff = computeLineDiff(data.original || "", currentText);
+            const decorations = [];
+            for (const r of diff.added) {
+                decorations.push({
+                    range: new monaco.Range(r.start, 1, r.end, 1),
+                    options: {
+                        isWholeLine: true,
+                        linesDecorationsClassName: "diff-gutter-added",
+                        className: "diff-line-added-bg",
+                        overviewRuler: { color: "#3fb950", position: monaco.editor.OverviewRulerLane.Left },
+                    }
+                });
+            }
+            for (const r of diff.modified) {
+                decorations.push({
+                    range: new monaco.Range(r.start, 1, r.end, 1),
+                    options: {
+                        isWholeLine: true,
+                        linesDecorationsClassName: "diff-gutter-modified",
+                        className: "diff-line-modified-bg",
+                        overviewRuler: { color: "#58a6ff", position: monaco.editor.OverviewRulerLane.Left },
+                    }
+                });
+            }
+            for (const lineNum of diff.deleted) {
+                decorations.push({
+                    range: new monaco.Range(lineNum, 1, lineNum, 1),
+                    options: {
+                        isWholeLine: false,
+                        linesDecorationsClassName: "diff-gutter-deleted",
+                        overviewRuler: { color: "#f85149", position: monaco.editor.OverviewRulerLane.Left },
+                    }
+                });
+            }
+            if (activeTab !== path) return;
+            const oldIds = diffDecorationIds.get(path) || [];
+            const newIds = monacoInstance.deltaDecorations(oldIds, decorations);
+            diffDecorationIds.set(path, newIds);
+        } catch (e) {
+            console.warn("Git inline diff decorations failed:", e);
+        }
+    }
+
+    /**
      * Clear diff decorations for a file (called on keep/revert).
      */
     function clearDiffDecorations(path) {
@@ -1103,6 +1230,77 @@
         if ($terminalOutput) $terminalOutput.scrollTop = $terminalOutput.scrollHeight;
     }
 
+    function getTerminalWordAtCursor() {
+        if (!$terminalInput) return null;
+        const line = $terminalInput.value;
+        const pos = $terminalInput.selectionStart;
+        let start = pos;
+        while (start > 0 && line[start - 1] !== " " && line[start - 1] !== "\t") start--;
+        let end = pos;
+        while (end < line.length && line[end] !== " " && line[end] !== "\t") end++;
+        const word = line.slice(start, end);
+        const beforeCursor = line.slice(0, start);
+        const isFirstWord = !beforeCursor.trim();
+        return { word, start, end, isFirstWord };
+    }
+
+    function commonPrefix(arr) {
+        if (!arr.length) return "";
+        let p = arr[0];
+        for (let i = 1; i < arr.length; i++) {
+            while (arr[i].indexOf(p) !== 0) {
+                p = p.slice(0, -1);
+                if (!p) return "";
+            }
+        }
+        return p;
+    }
+
+    async function handleTerminalTab() {
+        if (!$terminalInput) return;
+        const info = getTerminalWordAtCursor();
+        if (!info) return;
+        const { word, start, end, isFirstWord } = info;
+        const completeType = isFirstWord ? "command" : "path";
+        const body = { prefix: word, type: completeType };
+        if (terminalCwd) body.cwd = terminalCwd;
+        let completions = [];
+        let prefix = word;
+        try {
+            const res = await fetch("/api/terminal-complete", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+            const data = await res.json();
+            if (!data.ok || !Array.isArray(data.completions)) return;
+            completions = data.completions;
+            prefix = data.prefix != null ? data.prefix : word;
+        } catch {
+            return;
+        }
+        if (!completions.length) return;
+        let replacement;
+        if (completions.length === 1) {
+            replacement = completions[0];
+            terminalCompletionState = null;
+        } else {
+            const samePrefix = terminalCompletionState && terminalCompletionState.prefix === prefix &&
+                JSON.stringify(terminalCompletionState.completions) === JSON.stringify(completions);
+            if (samePrefix && terminalCompletionState.index != null) {
+                terminalCompletionState.index = (terminalCompletionState.index + 1) % completions.length;
+                replacement = completions[terminalCompletionState.index];
+            } else {
+                const cp = commonPrefix(completions);
+                replacement = cp && cp.length > prefix.length ? cp : completions[0];
+                terminalCompletionState = { prefix, completions, index: 0 };
+            }
+        }
+        const line = $terminalInput.value;
+        $terminalInput.value = line.slice(0, start) + replacement + line.slice(end);
+        $terminalInput.setSelectionRange(start + replacement.length, start + replacement.length);
+    }
+
     function setTerminalPanelVisible(visible) {
         if (!$terminalPanel || !$resizeTerminal) return;
         if (visible) {
@@ -1145,7 +1343,14 @@
             if (e.key === "Enter") {
                 e.preventDefault();
                 runTerminalCommand();
+                return;
             }
+            if (e.key === "Tab") {
+                e.preventDefault();
+                handleTerminalTab();
+                return;
+            }
+            terminalCompletionState = null;
         });
     }
 

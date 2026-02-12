@@ -402,12 +402,14 @@ class SSHBackend(Backend):
         return posixpath.normpath(posixpath.join(self._working_directory, path))
 
     def _expand_remote_tilde(self, path: str) -> str:
-        """Expand ~ in path on the remote (SFTP doesn't expand it). Returns path unchanged on failure."""
+        """Expand ~ in path on the remote (SFTP doesn't expand it). Returns path unchanged on failure.
+        Uses ${1/#\\~/$HOME} so we don't rely on cd and work when path doesn't exist yet."""
         if "~" not in path:
             return path
         try:
+            # Replace leading ~ with $HOME on remote; works without cd and when dir doesn't exist
             out, err, rc = self._exec(
-                "bash -c 'cd \"$1\" && pwd' _ " + shlex.quote(path),
+                "bash -c 'echo \"${1/#\\~/$HOME}\"' _ " + shlex.quote(path),
                 timeout=5,
             )
             if rc == 0 and out and out.strip():
