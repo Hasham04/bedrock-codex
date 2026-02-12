@@ -100,12 +100,32 @@
                     <input id="ssh-key" type="text" placeholder="~/.ssh/id_rsa (optional)" spellcheck="false">
 
                     <label>Remote directory <span class="ssh-required">*</span></label>
-                    <input id="ssh-dir" type="text" placeholder="/home/user/project" spellcheck="false">
+                    <div class="ssh-dir-row">
+                        <input id="ssh-dir" type="text" placeholder="/home/user/project" spellcheck="false">
+                        <button type="button" id="ssh-browse-btn" class="wm-btn secondary" title="Browse remote folder">Browse…</button>
+                    </div>
                 </div>
                 <div id="welcome-ssh-error" class="welcome-modal-error hidden"></div>
                 <div class="welcome-modal-actions">
                     <button id="welcome-ssh-cancel" class="wm-btn secondary">Cancel</button>
                     <button id="welcome-ssh-open" class="wm-btn primary">Connect</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- SSH browse remote folder modal -->
+        <div id="ssh-browse-modal" class="welcome-modal hidden">
+            <div class="welcome-modal-overlay"></div>
+            <div class="welcome-modal-body ssh-browse-body">
+                <h3>Choose remote folder</h3>
+                <div class="ssh-browse-breadcrumb" id="ssh-browse-breadcrumb"></div>
+                <div class="ssh-browse-list" id="ssh-browse-list">
+                    <div class="ssh-browse-loading">Connecting…</div>
+                </div>
+                <div class="ssh-browse-current" id="ssh-browse-current"></div>
+                <div class="welcome-modal-actions">
+                    <button type="button" id="ssh-browse-select" class="wm-btn primary">Select this folder</button>
+                    <button type="button" id="ssh-browse-cancel" class="wm-btn secondary">Cancel</button>
                 </div>
             </div>
         </div>

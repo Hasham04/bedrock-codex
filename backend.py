@@ -373,6 +373,21 @@ class SSHBackend(Backend):
 
         logger.info(f"SSH connected to {user}@{host}:{port}, dir: {working_directory}")
 
+    def close(self) -> None:
+        """Close the SSH connection. Safe to call multiple times."""
+        try:
+            if getattr(self, "_sftp", None):
+                self._sftp.close()
+                self._sftp = None
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_client", None):
+                self._client.close()
+                self._client = None
+        except Exception:
+            pass
+
     @property
     def working_directory(self) -> str:
         return self._working_directory

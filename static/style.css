@@ -2037,6 +2037,86 @@ body { display: flex; flex-direction: column; }
 }
 .ssh-form-grid input[type="text"]:focus { border-color: var(--accent); }
 
+.ssh-dir-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+.ssh-dir-row input { flex: 1; min-width: 0; }
+
+/* SSH browse remote folder modal */
+.ssh-browse-body {
+    min-width: 420px;
+    max-width: 90vw;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+}
+.ssh-browse-body h3 { margin-bottom: 10px; }
+.ssh-browse-breadcrumb {
+    font-size: 12px;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    margin-bottom: 8px;
+    word-break: break-all;
+    min-height: 20px;
+}
+.ssh-browse-up, .ssh-browse-seg {
+    background: none;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+    padding: 0 2px;
+    font: inherit;
+}
+.ssh-browse-up:hover, .ssh-browse-seg:hover { text-decoration: underline; }
+.ssh-browse-seg.current { color: var(--text-primary); cursor: default; }
+.ssh-browse-seg.current:hover { text-decoration: none; }
+.ssh-browse-list {
+    flex: 1;
+    min-height: 200px;
+    max-height: 320px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-primary);
+    padding: 6px 0;
+    margin-bottom: 8px;
+}
+.ssh-browse-loading, .ssh-browse-error, .ssh-browse-empty {
+    padding: 16px;
+    text-align: center;
+    color: var(--text-muted);
+}
+.ssh-browse-error { color: var(--red); }
+.ssh-browse-entry {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 6px 12px;
+    text-align: left;
+    border: none;
+    background: none;
+    color: var(--text-primary);
+    font-size: 13px;
+    cursor: pointer;
+    transition: background var(--transition);
+}
+.ssh-browse-entry.dir:hover { background: var(--bg-hover); }
+.ssh-browse-entry.file {
+    cursor: default;
+    color: var(--text-muted);
+}
+.ssh-browse-icon { font-size: 14px; flex-shrink: 0; }
+.ssh-browse-current {
+    font-size: 11px;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    margin-bottom: 10px;
+    word-break: break-all;
+}
+
 /* ============================================================
    Inline Diff Gutter Decorations (Cursor-style)
    ============================================================ */

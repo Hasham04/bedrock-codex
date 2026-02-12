@@ -26,6 +26,13 @@
     const $sshError         = document.getElementById("welcome-ssh-error");
     const $sshOpen          = document.getElementById("welcome-ssh-open");
     const $sshCancel        = document.getElementById("welcome-ssh-cancel");
+    const $sshBrowseBtn     = document.getElementById("ssh-browse-btn");
+    const $sshBrowseModal   = document.getElementById("ssh-browse-modal");
+    const $sshBrowseList    = document.getElementById("ssh-browse-list");
+    const $sshBrowseBreadcrumb = document.getElementById("ssh-browse-breadcrumb");
+    const $sshBrowseCurrent = document.getElementById("ssh-browse-current");
+    const $sshBrowseSelect  = document.getElementById("ssh-browse-select");
+    const $sshBrowseCancel  = document.getElementById("ssh-browse-cancel");
 
     // ── DOM refs — IDE ────────────────────────────────────────
     const $fileTree      = document.getElementById("file-tree");
@@ -3038,6 +3045,112 @@
         if (e.key === "Enter") submitSSH();
         if (e.key === "Escape") $sshModal.classList.add("hidden");
     });
+
+    // ── SSH browse remote folder ──
+    let sshBrowseCurrentPath = "";
+
+    async function loadSshBrowseDir(directory) {
+        if (!$sshBrowseList) return;
+        const host = $sshHost.value.trim();
+        const user = $sshUser.value.trim();
+        const port = $sshPort.value.trim() || "22";
+        const key = $sshKey.value.trim();
+        if (!host || !user) {
+            $sshBrowseList.innerHTML = '<div class="ssh-browse-error">Enter host and user first.</div>';
+            return;
+        }
+        $sshBrowseList.innerHTML = '<div class="ssh-browse-loading">Loading…</div>';
+        $sshBrowseCurrent.textContent = "";
+        try {
+            const res = await fetch("/api/ssh-list-dir", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    host,
+                    user,
+                    port: parseInt(port, 10) || 22,
+                    key_path: key || "",
+                    directory: directory || "~",
+                }),
+            });
+            const data = await res.json();
+            if (!data.ok) {
+                $sshBrowseList.innerHTML = `<div class="ssh-browse-error">${escapeHtml(data.error || "Failed to list directory")}</div>`;
+                return;
+            }
+            sshBrowseCurrentPath = data.path || directory || "~";
+            const entries = data.entries || [];
+            const parent = data.parent;
+
+            // Breadcrumb: e.g. / home user project -> clickable segments
+            let pathParts = sshBrowseCurrentPath.replace(/\/$/, "").split("/").filter(Boolean);
+            if (!sshBrowseCurrentPath.startsWith("/") && sshBrowseCurrentPath !== "") pathParts.unshift(sshBrowseCurrentPath);
+            if (sshBrowseCurrentPath === "/" && pathParts.length === 0) pathParts = ["/"];
+            let breadcrumbHtml = "";
+            if (parent) {
+                breadcrumbHtml += `<button type="button" class="ssh-browse-up" data-dir="${escapeHtml(parent)}" title="Parent">↩</button> `;
+            }
+            const isAbsolute = sshBrowseCurrentPath.startsWith("/");
+            breadcrumbHtml += pathParts.map((p, i) => {
+                const segPath = (isAbsolute && pathParts[0] !== "/")
+                    ? "/" + pathParts.slice(0, i + 1).join("/")
+                    : pathParts.slice(0, i + 1).join("/");
+                const isLast = i === pathParts.length - 1;
+                return isLast
+                    ? `<span class="ssh-browse-seg current">${escapeHtml(p)}</span>`
+                    : `<button type="button" class="ssh-browse-seg" data-dir="${escapeHtml(segPath)}">${escapeHtml(p)}</button> / `;
+            }).join("");
+            $sshBrowseBreadcrumb.innerHTML = breadcrumbHtml || escapeHtml(sshBrowseCurrentPath);
+            $sshBrowseCurrent.textContent = sshBrowseCurrentPath;
+
+            const dirs = entries.filter(e => e.type === "directory");
+            const files = entries.filter(e => e.type === "file");
+            let listHtml = "";
+            dirs.forEach(e => {
+                const nextPath = sshBrowseCurrentPath.replace(/\/?$/, "") + "/" + e.name;
+                listHtml += `<button type="button" class="ssh-browse-entry dir" data-dir="${escapeHtml(nextPath)}"><span class="ssh-browse-icon">📁</span> ${escapeHtml(e.name)}</button>`;
+            });
+            files.forEach(e => {
+                listHtml += `<div class="ssh-browse-entry file"><span class="ssh-browse-icon">📄</span> ${escapeHtml(e.name)}</div>`;
+            });
+            if (listHtml === "") listHtml = '<div class="ssh-browse-empty">No entries</div>';
+            $sshBrowseList.innerHTML = listHtml;
+
+            $sshBrowseList.querySelectorAll(".ssh-browse-entry.dir, .ssh-browse-up, .ssh-browse-seg[data-dir]").forEach(btn => {
+                btn.addEventListener("click", () => {
+                    const dir = btn.dataset.dir;
+                    if (dir) loadSshBrowseDir(dir);
+                });
+            });
+        } catch (e) {
+            $sshBrowseList.innerHTML = `<div class="ssh-browse-error">${escapeHtml(e.message || "Network error")}</div>`;
+        }
+    }
+
+    if ($sshBrowseBtn) {
+        $sshBrowseBtn.addEventListener("click", () => {
+            if (!$sshBrowseModal) return;
+            $sshBrowseModal.classList.remove("hidden");
+            sshBrowseCurrentPath = $sshDir.value.trim() || "~";
+            loadSshBrowseDir(sshBrowseCurrentPath);
+        });
+    }
+    if ($sshBrowseSelect) {
+        $sshBrowseSelect.addEventListener("click", () => {
+            $sshDir.value = sshBrowseCurrentPath;
+            if ($sshBrowseModal) $sshBrowseModal.classList.add("hidden");
+        });
+    }
+    if ($sshBrowseCancel) {
+        $sshBrowseCancel.addEventListener("click", () => {
+            if ($sshBrowseModal) $sshBrowseModal.classList.add("hidden");
+        });
+    }
+    if ($sshBrowseModal && $sshBrowseModal.querySelector(".welcome-modal-overlay")) {
+        $sshBrowseModal.querySelector(".welcome-modal-overlay").addEventListener("click", () => {
+            $sshBrowseModal.classList.add("hidden");
+        });
+    }
 
     // ── Logo click → back to welcome ──
     if ($logoHome) {

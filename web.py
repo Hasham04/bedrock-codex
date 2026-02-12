@@ -14,6 +14,8 @@ import json
 import logging
 import mimetypes
 import os
+import posixpath
+import shlex
 import time
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -193,6 +195,67 @@ async def list_projects():
     """List all known projects from session history — used by the welcome screen."""
     store = SessionStore()
     return store.list_all_projects()
+
+
+@app.post("/api/ssh-list-dir")
+async def ssh_list_dir(request: Request):
+    """List a directory on a remote host via a one-off SSH connection.
+    Used by the SSH connect flow to let the user browse and pick a folder.
+    Body: host, user, port?, key_path?, directory? (default '~').
+    Returns: { ok, path, parent, entries: [ { name, type, ... } ] }."""
+    body = await request.json() if request.body else {}
+    host = str(body.get("host", "") or "").strip()
+    user = str(body.get("user", "") or "").strip()
+    port = body.get("port", 22)
+    key_path = (body.get("key_path") or "").strip() or None
+    directory = str(body.get("directory", "") or "").strip() or "~"
+
+    if host.startswith("ssh://"):
+        host = host[len("ssh://"):].strip()
+    if "@" in host and not user:
+        parts = host.split("@", 1)
+        if parts[0].strip() and parts[1].strip():
+            user, host = parts[0].strip(), parts[1].strip()
+    try:
+        port = int(port)
+    except Exception:
+        port = 22
+    if not host or not user:
+        return JSONResponse({"ok": False, "error": "host and user are required"}, status_code=400)
+
+    try:
+        from backend import SSHBackend
+
+        def _do_list():
+            backend = SSHBackend(
+                host=host,
+                working_directory=directory,
+                user=user,
+                key_path=key_path,
+                port=port,
+            )
+            try:
+                # Resolve absolute path (e.g. expand ~)
+                stdout, stderr, rc = backend._exec(
+                    "cd " + shlex.quote(backend.working_directory) + " && pwd",
+                    timeout=10,
+                )
+                resolved = stdout.strip() if rc == 0 and stdout.strip() else directory
+                entries = backend.list_dir(".")
+                parent = None
+                if resolved and resolved != "/":
+                    parent = posixpath.dirname(resolved)
+                    if parent == resolved:
+                        parent = None
+                return {"path": resolved, "parent": parent, "entries": entries}
+            finally:
+                backend.close()
+
+        result = await asyncio.to_thread(_do_list)
+        return {"ok": True, **result}
+    except Exception as e:
+        logger.exception("SSH list-dir failed")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 @app.post("/api/ssh-connect")
