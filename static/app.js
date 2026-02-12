@@ -46,6 +46,8 @@
     const $tokenCount    = document.getElementById("token-count");
     const $connStatus    = document.getElementById("connection-status");
     const $sessionName   = document.getElementById("session-name");
+    const $agentSelect   = document.getElementById("agent-select");
+    const $newAgentBtn   = document.getElementById("new-agent-btn");
     const $workingDir    = document.getElementById("working-dir");
     const $resetBtn      = document.getElementById("reset-btn");
     const $openBtn       = document.getElementById("open-project-btn");
@@ -79,6 +81,8 @@
     const toolRunById = new Map(); // tool_use_id -> run element
     let scoutEl = null;
     const pendingImages = []; // { id, file, previewUrl, name, size, media_type }
+    let currentSessionId = null;
+    let suppressAgentSwitch = false;
 
     // ── Markdown ──────────────────────────────────────────────
     if (typeof marked !== "undefined") {
@@ -1351,15 +1355,7 @@
         runEl.appendChild(out);
         return out;
     }
-    function updateToolGroupHeader(groupEl) {
-        const count = Number(groupEl.dataset.count || "1");
-        const firstAt = Number(groupEl.dataset.firstAt || Date.now());
-        const lastAt = Number(groupEl.dataset.lastAt || firstAt);
-        const countEl = groupEl.querySelector(".tool-count-badge");
-        if (countEl) countEl.textContent = count === 1 ? "1 call" : `${count} calls`;
-        const timeEl = groupEl.querySelector(".tool-time-range");
-        if (timeEl) timeEl.textContent = count === 1 ? formatClock(firstAt) : `${formatClock(firstAt)} - ${formatClock(lastAt)}`;
-    }
+    function updateToolGroupHeader(_groupEl) {}
     function maybeAutoFollow(groupEl, runEl) {
         if (!groupEl || groupEl.dataset.toolName !== "run_command") return;
         if (groupEl.dataset.follow !== "1") return;
@@ -1397,6 +1393,9 @@
             if (isCmd && !group.querySelector(".tool-stop-btn")) {
                 const actions = group.querySelector(".tool-actions");
                 if (actions) {
+                    const iconRow = actions.querySelector(".tool-action-icons") || actions;
+                    const slot = document.createElement("span");
+                    slot.className = "tool-action-slot";
                     const stopBtn = document.createElement("button");
                     stopBtn.className = "tool-stop-btn tool-icon-btn";
                     stopBtn.setAttribute("aria-label", "Stop command");
@@ -1410,7 +1409,8 @@
                         stopBtn.innerHTML = `<span class="tool-stop-spinner"></span>`;
                         stopBtn.title = "Stopping\u2026";
                     });
-                    actions.appendChild(stopBtn);
+                    slot.appendChild(stopBtn);
+                    iconRow.appendChild(slot);
                 }
             }
         } else {
@@ -1439,16 +1439,16 @@
                         </div>
                     </div>
                     <div class="tool-right">
-                        <span class="tool-count-badge">1 call</span>
-                        <span class="tool-time-range">${formatClock(now)}</span>
                         ${statusHtml}
                         <div class="tool-actions">
-                            <button type="button" class="tool-action-btn tool-icon-btn tool-action-open ${toolCanOpenFile(name, input) ? "" : "hidden"}" title="Open file" aria-label="Open file">${toolActionIcon("open")}</button>
-                            <button type="button" class="tool-action-btn tool-icon-btn tool-action-rerun" title="Rerun" aria-label="Rerun">${toolActionIcon("rerun")}</button>
-                            <button type="button" class="tool-action-btn tool-icon-btn tool-action-retry hidden" title="Retry failed" aria-label="Retry failed">${toolActionIcon("retry")}</button>
-                            <button type="button" class="tool-action-btn tool-icon-btn tool-action-copy hidden" title="Copy output" aria-label="Copy output">${toolActionIcon("copy")}</button>
+                            <div class="tool-action-icons">
+                                <span class="tool-action-slot"><button type="button" class="tool-action-btn tool-icon-btn tool-action-open ${toolCanOpenFile(name, input) ? "" : "hidden"}" title="Open file" aria-label="Open file">${toolActionIcon("open")}</button></span>
+                                <span class="tool-action-slot"><button type="button" class="tool-action-btn tool-icon-btn tool-action-rerun" title="Rerun" aria-label="Rerun">${toolActionIcon("rerun")}</button></span>
+                                <span class="tool-action-slot"><button type="button" class="tool-action-btn tool-icon-btn tool-action-retry hidden" title="Retry failed" aria-label="Retry failed">${toolActionIcon("retry")}</button></span>
+                                <span class="tool-action-slot"><button type="button" class="tool-action-btn tool-icon-btn tool-action-copy hidden" title="Copy output" aria-label="Copy output">${toolActionIcon("copy")}</button></span>
+                                <span class="tool-action-slot"><button type="button" class="tool-stop-btn tool-icon-btn ${isCmd ? "" : "hidden"}" title="Stop command" aria-label="Stop command">${toolActionIcon("stop")}</button></span>
+                            </div>
                             ${isCmd ? `<button type="button" class="tool-action-btn tool-follow-btn">Pause follow</button>` : ""}
-                            ${isCmd ? `<button type="button" class="tool-stop-btn tool-icon-btn" title="Stop command" aria-label="Stop command">${toolActionIcon("stop")}</button>` : ""}
                         </div>
                         <span class="tool-chevron">\u25BC</span>
                     </div>
@@ -2037,7 +2037,11 @@
         _preventReconnect = false;
         if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
-        ws = new WebSocket(`${proto}//${location.host}/ws`);
+        let wsUrl = `${proto}//${location.host}/ws`;
+        if (currentSessionId) {
+            wsUrl += `?session_id=${encodeURIComponent(currentSessionId)}`;
+        }
+        ws = new WebSocket(wsUrl);
         $connStatus.className = "status-dot connecting"; $connStatus.title = "Connecting\u2026";
 
         ws.onopen = () => {
@@ -2069,7 +2073,12 @@
         _isFirstConnect = true;
         _reconnectAttempt = 0;
         if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
-        if (ws) { ws.close(); ws = null; }
+        if (ws) {
+            ws.onclose = null;
+            ws.onerror = null;
+            ws.close();
+            ws = null;
+        }
     }
     function send(obj) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
 
@@ -2077,9 +2086,11 @@
         switch (evt.type) {
             case "init":
                 $modelName.textContent = evt.model_name || "?";
+                currentSessionId = evt.session_id || currentSessionId;
                 $sessionName.textContent = evt.session_name || "default";
                 $tokenCount.textContent = formatTokens(evt.total_tokens || 0) + " tokens";
                 $workingDir.textContent = evt.working_directory || "";
+                loadAgentSessions();
                 toolRunById.clear();
                 if (_isFirstConnect) {
                     // First connect: clear chat, load tree fresh
@@ -2248,8 +2259,10 @@
                 break;
             case "reset_done":
                 $chatMessages.innerHTML = "";
+                currentSessionId = evt.session_id || currentSessionId;
                 $sessionName.textContent = evt.session_name || "default";
                 $tokenCount.textContent = "0 tokens";
+                loadAgentSessions();
                 toolRunById.clear();
                 clearPendingImages();
                 hideActionBar(); modifiedFiles.clear(); refreshTree();
@@ -2399,6 +2412,19 @@
     $sendBtn.addEventListener("click", submitTask);
     $cancelBtn.addEventListener("click", () => send({type:"cancel"}));
     $resetBtn.addEventListener("click", () => send({type:"reset"}));
+    if ($newAgentBtn) {
+        $newAgentBtn.addEventListener("click", createNewAgentSession);
+    }
+    if ($agentSelect) {
+        $agentSelect.addEventListener("change", () => {
+            if (suppressAgentSwitch) return;
+            const nextId = $agentSelect.value || null;
+            if (!nextId || nextId === currentSessionId) return;
+            currentSessionId = nextId;
+            disconnectWs();
+            connect();
+        });
+    }
     // Escape key cancels the running agent
     document.addEventListener("keydown", e => {
         if (e.key === "Escape" && isRunning) { e.preventDefault(); send({type:"cancel"}); }
@@ -2669,6 +2695,73 @@
         return d.toLocaleDateString();
     }
 
+    function formatAgentOptionLabel(session) {
+        const name = String(session?.name || "default");
+        const age = timeAgo(session?.updated_at || "");
+        return age ? `${name} (${age})` : name;
+    }
+
+    async function loadAgentSessions() {
+        if (!$agentSelect) return;
+        try {
+            const res = await fetch("/api/sessions");
+            if (!res.ok) throw new Error("Failed to load sessions");
+            const sessions = await res.json();
+            const list = Array.isArray(sessions) ? sessions : [];
+
+            suppressAgentSwitch = true;
+            $agentSelect.innerHTML = "";
+            for (const s of list) {
+                const opt = document.createElement("option");
+                opt.value = s.session_id || "";
+                opt.textContent = formatAgentOptionLabel(s);
+                $agentSelect.appendChild(opt);
+            }
+
+            const hasCurrent = !!currentSessionId && list.some(s => s.session_id === currentSessionId);
+            if (!hasCurrent && list.length > 0) {
+                currentSessionId = list[0].session_id;
+            }
+            if (currentSessionId) {
+                $agentSelect.value = currentSessionId;
+            }
+            $agentSelect.disabled = list.length === 0;
+        } catch {
+            suppressAgentSwitch = true;
+            $agentSelect.innerHTML = "";
+            const opt = document.createElement("option");
+            opt.value = "";
+            opt.textContent = "No agents";
+            $agentSelect.appendChild(opt);
+            $agentSelect.disabled = true;
+        } finally {
+            suppressAgentSwitch = false;
+        }
+    }
+
+    async function createNewAgentSession() {
+        const name = (window.prompt("New agent name (optional):", "") || "").trim();
+        try {
+            const res = await fetch("/api/sessions/new", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name }),
+            });
+            const data = await res.json();
+            if (!data.ok) {
+                showToast("Failed to create agent");
+                return;
+            }
+            currentSessionId = data.session_id || null;
+            await loadAgentSessions();
+            disconnectWs();
+            connect();
+            showToast(`New agent: ${data.name || "agent"}`);
+        } catch (e) {
+            showToast("Error: " + (e?.message || "unable to create agent"));
+        }
+    }
+
     async function loadRecentProjects() {
         try {
             const res = await fetch("/api/projects");
@@ -2687,8 +2780,9 @@
                 const badge = p.is_ssh ? '<span class="welcome-project-badge ssh">SSH</span>' : "";
                 // Display-friendly path: for SSH show user@host:directory, for local show full path
                 let displayPath = p.path;
-                if (p.is_ssh && p.ssh_info) {
-                    displayPath = `${p.ssh_info.user}@${p.ssh_info.host}:${p.ssh_info.directory}`;
+                const sshMeta = getSshProjectInfo(p);
+                if (p.is_ssh && sshMeta) {
+                    displayPath = `${sshMeta.user}@${sshMeta.host}:${sshMeta.directory}`;
                 }
                 el.innerHTML = `
                     <div class="welcome-project-icon">${icon}</div>
@@ -2710,12 +2804,51 @@
         }
     }
 
+    function parseSshCompositePath(path) {
+        const raw = String(path || "").trim();
+        const m = raw.match(/^([^@:\s]+)@([^:\s]+):(\d+):(.*)$/);
+        if (!m) return null;
+        const port = parseInt(m[3], 10);
+        return {
+            user: m[1].trim(),
+            host: m[2].trim(),
+            port: Number.isFinite(port) ? port : 22,
+            key_path: "",
+            directory: (m[4] || "").trim() || "/",
+        };
+    }
+
+    function getSshProjectInfo(project) {
+        const fromSaved = (project && typeof project.ssh_info === "object" && project.ssh_info) ? project.ssh_info : {};
+        const fromPath = parseSshCompositePath(project?.path);
+        const merged = {
+            user: String(fromSaved.user || fromPath?.user || "").trim(),
+            host: String(fromSaved.host || fromPath?.host || "").trim(),
+            port: Number(fromSaved.port || fromPath?.port || 22) || 22,
+            key_path: String(fromSaved.key_path || "").trim(),
+            directory: String(fromSaved.directory || fromPath?.directory || "").trim(),
+        };
+        if (merged.host.startsWith("ssh://")) merged.host = merged.host.slice("ssh://".length).trim();
+        if (merged.host.includes("@") && !merged.user) {
+            const parts = merged.host.split("@");
+            merged.user = (parts[0] || "").trim();
+            merged.host = (parts[1] || "").trim();
+        }
+        if (!merged.directory) merged.directory = "/";
+        if (!merged.user || !merged.host) return null;
+        return merged;
+    }
+
     async function openProject(project) {
         // If it's an SSH project, reconnect via SSH with saved details
-        if (project.is_ssh && project.ssh_info) {
+        if (project.is_ssh) {
             try {
                 showToast("Reconnecting via SSH...");
-                const info = project.ssh_info;
+                const info = getSshProjectInfo(project);
+                if (!info) {
+                    showToast("SSH reconnect failed: missing host/user. Reconnect manually.");
+                    return;
+                }
                 const res = await fetch("/api/ssh-connect", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
@@ -2788,6 +2921,17 @@
         modifiedFiles.clear();
         clearPendingImages();
         setRunning(false);
+        currentSessionId = null;
+        if ($agentSelect) {
+            suppressAgentSwitch = true;
+            $agentSelect.innerHTML = "";
+            const opt = document.createElement("option");
+            opt.value = "";
+            opt.textContent = "No agents";
+            $agentSelect.appendChild(opt);
+            $agentSelect.disabled = true;
+            suppressAgentSwitch = false;
+        }
 
         // Show welcome, hide IDE
         $ideWrapper.classList.add("hidden");

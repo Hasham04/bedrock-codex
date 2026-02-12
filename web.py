@@ -133,8 +133,13 @@ async def info():
 
 @app.get("/api/sessions")
 async def list_sessions():
+    def _session_wd_key() -> str:
+        if _ssh_info is not None:
+            return _working_directory
+        return os.path.abspath(_working_directory)
+
     store = SessionStore()
-    sessions = store.list_sessions(os.path.abspath(_working_directory))
+    sessions = store.list_sessions(_session_wd_key())
     return [
         {
             "session_id": s.session_id,
@@ -145,6 +150,42 @@ async def list_sessions():
         }
         for s in sessions
     ]
+
+
+@app.post("/api/sessions/new")
+async def create_session(request: Request):
+    def _session_wd_key() -> str:
+        if _ssh_info is not None:
+            return _working_directory
+        return os.path.abspath(_working_directory)
+
+    def _unique_name(store: SessionStore, wd_key: str, raw_name: str) -> str:
+        base = (raw_name or "agent").strip() or "agent"
+        existing = {s.name.strip().lower() for s in store.list_sessions(wd_key)}
+        if base.lower() not in existing:
+            return base
+        idx = 2
+        while f"{base} {idx}".lower() in existing:
+            idx += 1
+        return f"{base} {idx}"
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    store = SessionStore()
+    wd_key = _session_wd_key()
+    desired_name = str(body.get("name", "") or "").strip()
+    session_name = _unique_name(store, wd_key, desired_name)
+    session = store.create_session(wd_key, model_config.model_id, name=session_name)
+    store.save(session)
+    return {
+        "ok": True,
+        "session_id": session.session_id,
+        "name": session.name,
+        "updated_at": session.updated_at,
+    }
 
 
 @app.get("/api/projects")
@@ -159,14 +200,37 @@ async def ssh_connect(request: Request):
     """Connect to a remote host via SSH at runtime."""
     global _backend, _working_directory, _ssh_info
     body = await request.json()
-    host = body.get("host", "").strip()
-    user = body.get("user", "").strip()
+    host = str(body.get("host", "") or "").strip()
+    user = str(body.get("user", "") or "").strip()
     port = body.get("port", 22)
     key_path = body.get("key_path", "").strip() or None
-    directory = body.get("directory", "").strip()
+    directory = str(body.get("directory", "") or "").strip()
+
+    # Normalize lenient host input from recents/manual entry:
+    # - ssh://host
+    # - user@host when user is omitted
+    # - host:port when port is omitted
+    if host.startswith("ssh://"):
+        host = host[len("ssh://"):].strip()
+    if "@" in host and not user:
+        maybe_user, maybe_host = host.split("@", 1)
+        if maybe_user and maybe_host:
+            user = maybe_user.strip()
+            host = maybe_host.strip()
+    if ":" in host and host.count(":") == 1:
+        maybe_host, maybe_port = host.rsplit(":", 1)
+        if maybe_host and maybe_port.isdigit():
+            host = maybe_host.strip()
+            if not body.get("port"):
+                port = int(maybe_port)
+    host = host.strip("[] ").strip()
 
     if not host or not user or not directory:
         return JSONResponse({"ok": False, "error": "host, user, and directory are required"}, status_code=400)
+    try:
+        port = int(port)
+    except Exception:
+        port = 22
 
     try:
         from backend import SSHBackend
@@ -531,7 +595,7 @@ async def api_replace(request: Request):
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
+async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
     global _active_agent
     await ws.accept()
 
@@ -563,8 +627,20 @@ async def websocket_endpoint(ws: WebSocket):
         return
 
     # Session management — wd is the composite key (unique per project + SSH target)
+    requested_session_id = (ws.query_params.get("session_id") or "").strip()
+    if not requested_session_id and session_id:
+        requested_session_id = str(session_id).strip()
+
     store = SessionStore()
-    session: Optional[Session] = store.get_latest(wd)
+    session: Optional[Session] = None
+    if requested_session_id:
+        loaded = store.load(requested_session_id)
+        if loaded and loaded.working_directory == wd:
+            session = loaded
+        else:
+            logger.warning(f"Ignoring invalid session_id for workspace: {requested_session_id}")
+    if session is None:
+        session = store.get_latest(wd)
     # Keys that are web.py UI state, not agent state
     _ui_state_keys = {
         "ssh_info",
@@ -575,10 +651,15 @@ async def websocket_endpoint(ws: WebSocket):
         "pending_images",
     }
     _restored_ui_state: Dict[str, Any] = {}
-    if session and session.history:
+    if session is None:
+        session = store.create_session(wd, model_config.model_id)
+    else:
+        # Restore agent/session state even for empty-history sessions.
+        # Otherwise, switching to a newly created agent session would
+        # incorrectly fall back to a fresh default session.
         restore_data = {
-            "history": session.history,
-            "token_usage": session.token_usage,
+            "history": session.history or [],
+            "token_usage": session.token_usage or {},
         }
         # Restore extra state (running_summary, current_plan, approved_commands, etc.)
         if session.extra_state:
@@ -589,8 +670,6 @@ async def websocket_endpoint(ws: WebSocket):
                 else:
                     restore_data[k] = v
         agent.from_dict(restore_data)
-    else:
-        session = store.create_session(wd, model_config.model_id)
 
     def save_session():
         if session and agent:
@@ -914,6 +993,7 @@ async def websocket_endpoint(ws: WebSocket):
             "context_window": mcfg.get("context_window", 0),
             "thinking": supports_thinking(model_config.model_id),
             "caching": supports_caching(model_config.model_id),
+            "session_id": session.session_id if session else "",
             "session_name": session.name if session else "default",
             "message_count": session.message_count if session else 0,
             "total_tokens": agent.total_tokens,
@@ -1189,34 +1269,6 @@ async def websocket_endpoint(ws: WebSocket):
                 })
                 continue
 
-            # ── Session checkpoints (list / rewind) ───────────────
-            if msg_type == "checkpoint_list":
-                await ws.send_json({
-                    "type": "checkpoint_list",
-                    "data": {"checkpoints": agent.list_session_checkpoints()},
-                })
-                continue
-
-            if msg_type == "checkpoint_restore":
-                cp_id = str(data.get("checkpoint_id") or "latest")
-                reverted = agent.rewind_to_checkpoint(cp_id)
-                if reverted:
-                    save_session()
-                    await ws.send_json({
-                        "type": "checkpoint_restored",
-                        "data": {
-                            "checkpoint_id": cp_id,
-                            "count": len(reverted),
-                            "paths": [os.path.relpath(p, wd) for p in reverted],
-                        },
-                    })
-                else:
-                    await ws.send_json({
-                        "type": "checkpoint_error",
-                        "content": f"No checkpoint restored for '{cp_id}'.",
-                    })
-                continue
-
             # ── Build (approve plan) ───────────────────────────────
             if msg_type == "build" and awaiting_build:
                 awaiting_build = False
@@ -1258,7 +1310,11 @@ async def websocket_endpoint(ws: WebSocket):
                 agent.reset()
                 session = store.create_session(wd, model_config.model_id)
                 save_session()
-                await ws.send_json({"type": "reset_done", "session_name": session.name})
+                await ws.send_json({
+                    "type": "reset_done",
+                    "session_id": session.session_id,
+                    "session_name": session.name,
+                })
                 continue
 
             # ── New task ───────────────────────────────────────────

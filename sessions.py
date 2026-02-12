@@ -64,6 +64,27 @@ def _is_ssh_path(wd: str) -> bool:
     return "@" in wd and ":" in wd
 
 
+def _parse_ssh_composite(wd: str) -> Optional[Dict[str, Any]]:
+    """Parse user@host:port:directory composite path into SSH info."""
+    if not _is_ssh_path(wd):
+        return None
+    try:
+        user_host, port_s, directory = wd.split(":", 2)
+        if "@" not in user_host:
+            return None
+        user, host = user_host.split("@", 1)
+        port = int(port_s)
+        return {
+            "host": host.strip(),
+            "user": user.strip(),
+            "port": port,
+            "key_path": "",
+            "directory": directory.strip() or "/",
+        }
+    except Exception:
+        return None
+
+
 def _normalize_wd(working_directory: str) -> str:
     """Normalize a working directory for hashing/storage.
     SSH paths are kept as-is; local paths are made absolute."""
@@ -179,6 +200,7 @@ class SessionStore:
                 continue
             wd = sess.working_directory
             is_ssh = _is_ssh_path(wd)
+            parsed_ssh = _parse_ssh_composite(wd) if is_ssh else None
             if wd not in projects:
                 if is_ssh:
                     # Parse display name from composite path: user@host:port:dir
@@ -198,7 +220,7 @@ class SessionStore:
                     "updated_at": "",
                     "session_name": "",
                     "is_ssh": is_ssh,
-                    "ssh_info": None,
+                    "ssh_info": parsed_ssh,
                 }
             p = projects[wd]
             p["session_count"] += 1
@@ -209,8 +231,11 @@ class SessionStore:
                 p["updated_at"] = sess.updated_at
                 p["session_name"] = sess.name
                 # Extract SSH info from the latest session's extra_state
-                if is_ssh and sess.extra_state:
-                    p["ssh_info"] = sess.extra_state.get("ssh_info")
+                if is_ssh:
+                    merged = dict(parsed_ssh or {})
+                    if sess.extra_state and isinstance(sess.extra_state.get("ssh_info"), dict):
+                        merged.update({k: v for k, v in sess.extra_state.get("ssh_info", {}).items() if v not in (None, "")})
+                    p["ssh_info"] = merged or None
 
         result = sorted(projects.values(), key=lambda x: x["updated_at"] or "", reverse=True)
         return result
