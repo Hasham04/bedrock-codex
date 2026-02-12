@@ -6,6 +6,7 @@ Supports local filesystem (default) and SSH remote via paramiko.
 import logging
 import os
 import pathlib
+import shlex
 import subprocess
 import threading
 import time
@@ -400,6 +401,21 @@ class SSHBackend(Backend):
         import posixpath
         return posixpath.normpath(posixpath.join(self._working_directory, path))
 
+    def _expand_remote_tilde(self, path: str) -> str:
+        """Expand ~ in path on the remote (SFTP doesn't expand it). Returns path unchanged on failure."""
+        if "~" not in path:
+            return path
+        try:
+            out, err, rc = self._exec(
+                "bash -c 'cd \"$1\" && pwd' _ " + shlex.quote(path),
+                timeout=5,
+            )
+            if rc == 0 and out and out.strip():
+                return out.strip()
+        except Exception as e:
+            logger.debug("SSH tilde expand failed for %r: %s", path, e)
+        return path
+
     def _reconnect_if_needed(self):
         """Reconnect SSH if the connection dropped.  Caller MUST hold self._lock."""
         try:
@@ -475,6 +491,8 @@ class SSHBackend(Backend):
     def list_dir(self, path: str) -> List[Dict[str, Any]]:
         import stat as stat_mod
         remote = self._remote_path(path) if path else self._working_directory
+        if "~" in remote:
+            remote = self._expand_remote_tilde(remote)
         entries = []
         with self._lock:
             self._reconnect_if_needed()

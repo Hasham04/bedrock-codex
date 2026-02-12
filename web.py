@@ -235,9 +235,9 @@ async def ssh_list_dir(request: Request):
                 port=port,
             )
             try:
-                # Resolve absolute path (e.g. expand ~)
+                # Resolve absolute path (e.g. expand ~); shell must expand ~ so use bash -c 'cd "$1" && pwd'
                 stdout, stderr, rc = backend._exec(
-                    "cd " + shlex.quote(backend.working_directory) + " && pwd",
+                    "bash -c 'cd \"$1\" && pwd' _ " + shlex.quote(backend.working_directory),
                     timeout=10,
                 )
                 resolved = stdout.strip() if rc == 0 and stdout.strip() else directory
@@ -308,6 +308,14 @@ async def ssh_connect(request: Request):
             )
 
         _backend = await asyncio.to_thread(_do_connect)
+        # Resolve directory to absolute path so terminal cd .. / cd back works
+        try:
+            out, err, rc = await asyncio.to_thread(_backend.run_command, "pwd", ".", 10)
+            if rc == 0 and out and out.strip():
+                directory = out.strip()
+                _backend._working_directory = directory
+        except Exception:
+            pass
         # Composite working directory: user@host:port:directory — unique per SSH target
         _working_directory = f"{user}@{host}:{port}:{directory}"
         _ssh_info = {
@@ -354,23 +362,31 @@ async def terminal_cwd():
 
 
 def _terminal_cwd_ok(backend, requested_cwd: str) -> Tuple[bool, str]:
-    """Validate requested cwd is under project root. Returns (ok, resolved_cwd)."""
+    """Validate requested cwd is project root, a subdir, or an ancestor (so cd .. works).
+    Returns (ok, resolved_cwd)."""
     root = backend.working_directory
     if not requested_cwd or requested_cwd == ".":
         return True, root
-    # SSH backend: root is remote path; allow root or subdirs (string prefix)
+    # SSH backend: allow root, subdirs, or ancestors of project root
     if getattr(backend, "_host", None) is not None:
         root_norm = root.rstrip("/")
         req_norm = requested_cwd.rstrip("/")
         if req_norm == root_norm or req_norm.startswith(root_norm + "/"):
             return True, requested_cwd
+        if root_norm.startswith(req_norm + "/"):
+            return True, requested_cwd
         return False, root
-    # Local: resolve and ensure under project root
+    # Local: allow under project root or ancestor of project root
     try:
         req_abs = os.path.abspath(os.path.join(root, requested_cwd)) if not os.path.isabs(requested_cwd) else requested_cwd
         req_real = os.path.realpath(req_abs)
         root_real = os.path.realpath(root)
-        if req_real == root_real or req_real.startswith(root_real.rstrip(os.sep) + os.sep):
+        sep = os.sep
+        root_prefix = root_real.rstrip(sep) + sep
+        req_prefix = req_real.rstrip(sep) + sep
+        if req_real == root_real or req_real.startswith(root_prefix):
+            return True, req_real
+        if root_real.startswith(req_prefix) or root_real == req_real:
             return True, req_real
     except Exception:
         pass
