@@ -9,6 +9,7 @@ Open: http://localhost:8765
 import argparse
 import asyncio
 import base64
+import errno
 import difflib
 import json
 import logging
@@ -195,6 +196,25 @@ async def list_projects():
     """List all known projects from session history — used by the welcome screen."""
     store = SessionStore()
     return store.list_all_projects()
+
+
+@app.post("/api/projects/remove")
+async def remove_project(request: Request):
+    """Remove a project from recents (deletes all its session files). Body: { \"path\": \"...\" }."""
+    try:
+        body = await request.json() if request.body else {}
+    except Exception:
+        body = {}
+    path = (body.get("path") or "").strip()
+    if not path:
+        return JSONResponse({"ok": False, "error": "path required"}, status_code=400)
+    store = SessionStore()
+    try:
+        n = store.delete_all_sessions_for_project(path)
+        return {"ok": True, "deleted": n}
+    except Exception as e:
+        logger.exception("Remove project failed")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 @app.post("/api/ssh-list-dir")
@@ -646,14 +666,24 @@ def _normalize_user_images(raw_images: Any) -> List[Dict[str, Any]]:
 @app.get("/api/file")
 async def read_file(path: str = Query(...)):
     """Return the contents of a file as plain text."""
+    path = (path or "").strip().replace("\\", "/")
+    if not path or path.endswith("/") or ".." in path or path.startswith("/"):
+        return JSONResponse({"error": "Invalid path or directory"}, status_code=400)
     b = _backend or LocalBackend(os.path.abspath(_working_directory))
     try:
+        if await asyncio.to_thread(b.is_dir, path):
+            return JSONResponse({"error": "Cannot read a directory"}, status_code=400)
         content = await asyncio.to_thread(b.read_file, path)
         if len(content) > _MAX_FILE_SIZE:
             return JSONResponse({"error": f"File too large"}, status_code=413)
         return PlainTextResponse(content)
     except FileNotFoundError:
         return JSONResponse({"error": "File not found"}, status_code=404)
+    except OSError as e:
+        if getattr(e, "errno", None) == errno.ENOENT:
+            return JSONResponse({"error": "File not found"}, status_code=404)
+        logger.error(f"read_file error for path={path!r}: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
     except Exception as e:
         logger.error(f"read_file error for path={path!r}: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -680,15 +710,15 @@ async def write_file(request: Request):
 
 def _parse_git_status_porcelain(stdout: str) -> Dict[str, str]:
     """Parse 'git status --porcelain' output. Returns dict path -> 'M'|'A'|'D'|'U'.
-    Paths are normalized to forward slashes."""
+    Paths are normalized to forward slashes. Skips directory-only entries (e.g. gradle, submodules)."""
     result = {}
     for line in (stdout or "").strip().splitlines():
         line = line.strip()
-        if len(line) < 4:
+        if len(line) < 3:
             continue
-        # First two chars: index and work tree. " M" = modified, "??" = untracked, "D " = deleted, "A " = added
+        # First two chars: index and work tree. Then path starts after any spaces (robust: use lstrip so we never drop 's' from "src")
         idx, wt = line[0], line[1]
-        path = line[3:].strip()
+        path = line[2:].lstrip()
         # Strip double quotes (git uses these for paths with spaces)
         if path.startswith('"') and path.endswith('"') and len(path) >= 2:
             path = path[1:-1].replace('\\"', '"')
@@ -697,8 +727,12 @@ def _parse_git_status_porcelain(stdout: str) -> Dict[str, str]:
             path = path.split(" -> ", 1)[1].strip()
             if path.startswith('"') and path.endswith('"') and len(path) >= 2:
                 path = path[1:-1].replace('\\"', '"')
-        path = path.replace("\\", "/").strip()
+        path = path.replace("\\", "/").strip().rstrip("/")
         if not path:
+            continue
+        # Skip directory-only entries that git can list (e.g. submodules like gradle); avoids "can't read a directory"
+        _skip_dir_names = ("gradle", "build", "node_modules", ".git")
+        if path in _skip_dir_names or any(path == d or path.endswith("/" + d) for d in _skip_dir_names):
             continue
         if wt == "M" or idx == "M" or (wt == " " and idx == "M"):
             result[path] = "M"  # modified
@@ -1164,6 +1198,8 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 "approved_commands": state.get("approved_commands", []),
                 "running_summary": state.get("running_summary", ""),
                 "current_plan": state.get("current_plan"),
+                "plan_file_path": state.get("plan_file_path"),
+                "plan_text": state.get("plan_text", ""),
                 "scout_context": state.get("scout_context"),
                 "file_snapshots": state.get("file_snapshots", {}),
                 "plan_step_index": state.get("plan_step_index", 0),
@@ -1360,6 +1396,28 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         if awaiting_build and pending_plan:
             state_msg["pending_plan"] = pending_plan
             state_msg["plan_step_index"] = agent._plan_step_index
+            # Restore plan file / text so "Open in Editor" and full plan doc survive reload
+            plan_file = getattr(agent, "_plan_file_path", None) or None
+            plan_text = getattr(agent, "_plan_text", "") or ""
+            # Fallback: if session has no plan_file (e.g. old session or two plans on disk),
+            # use the latest plan file from .bedrock-codex/plans/ so the button always shows
+            if not plan_file and agent.backend:
+                try:
+                    entries = agent.backend.list_dir(".bedrock-codex/plans")
+                    md_files = [e["name"] for e in (entries or []) if e.get("type") == "file" and (e.get("name") or "").endswith(".md")]
+                    if md_files:
+                        # Newest by name (plan-YYYYMMDD-HHMMSS-slug.md sorts chronologically)
+                        latest_name = max(md_files)
+                        plan_file = ".bedrock-codex/plans/" + latest_name
+                        if not plan_text:
+                            try:
+                                plan_text = agent.backend.read_file(plan_file)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            state_msg["plan_file"] = plan_file
+            state_msg["plan_text"] = plan_text or ""
         if awaiting_keep_revert and agent._file_snapshots:
             # Generate and send actual diffs for the keep/revert bar
             diffs = generate_diffs()
@@ -1523,8 +1581,8 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 _pending_question["future"] = None
                 _pending_question["tool_use_id"] = None
 
-        async def _run_task_bg(task_text: str, task_images: Optional[List[Dict[str, Any]]] = None):
-            """Run a task (plan or direct mode) in the background."""
+        async def _run_task_bg(task_text: str, task_images: Optional[List[Dict[str, Any]]] = None, preserve_snapshots: bool = False):
+            """Run a task (plan or direct mode) in the background. preserve_snapshots=True keeps diff/revert cumulative."""
             nonlocal awaiting_build, awaiting_keep_revert, pending_task, pending_plan, pending_images
             task_start = time.time()
 
@@ -1572,6 +1630,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                             request_approval=dummy_approval,
                             enable_scout=intent.get("scout", True),
                             user_images=task_images or [],
+                            preserve_snapshots=preserve_snapshots,
                         )
                     finally:
                         # Always restore the original model
@@ -1581,14 +1640,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
                     elapsed = round(time.time() - task_start, 1)
                     await ws.send_json({"type": "phase_end", "content": "direct", "elapsed": elapsed})
-
-                    # Show diffs
-                    diffs = generate_diffs()
-                    if diffs:
-                        awaiting_keep_revert = True
-                        await ws.send_json({"type": "diff", "files": diffs})
-                    else:
-                        await ws.send_json({"type": "done"})
+                    await ws.send_json({"type": "done"})
             except asyncio.CancelledError:
                 return
             except Exception as exc:
@@ -1619,14 +1671,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
                 elapsed = round(time.time() - task_start, 1)
                 await ws.send_json({"type": "phase_end", "content": "build", "elapsed": elapsed})
-
-                # Show diffs
-                diffs = generate_diffs()
-                if diffs:
-                    awaiting_keep_revert = True
-                    await ws.send_json({"type": "diff", "files": diffs})
-                else:
-                    await ws.send_json({"type": "no_changes"})
+                await ws.send_json({"type": "done"})
             except asyncio.CancelledError:
                 return
             except Exception as exc:
@@ -1725,19 +1770,33 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
             # ── Keep / Revert ──────────────────────────────────────
             if msg_type == "keep" and awaiting_keep_revert:
+                # Record which files were kept so the agent knows its changes were accepted
+                kept_paths = [os.path.relpath(p, wd) for p in agent.modified_files]
                 agent.clear_snapshots()
                 awaiting_keep_revert = False
+                feedback = "[System] The user accepted your changes."
+                if kept_paths:
+                    feedback += f" The following files were kept: {', '.join(kept_paths[:20])}"
+                    if len(kept_paths) > 20:
+                        feedback += f" (and {len(kept_paths) - 20} more)"
+                agent.history.append({"role": "user", "content": feedback})
                 save_session()
                 await ws.send_json({"type": "kept"})
                 continue
 
             if msg_type == "revert" and awaiting_keep_revert:
                 reverted = agent.revert_all()
+                reverted_rel = [os.path.relpath(p, wd) for p in reverted]
                 awaiting_keep_revert = False
+                feedback = "[System] The user reverted your changes. The following files were reverted to their previous state: "
+                feedback += ", ".join(reverted_rel[:20]) if reverted_rel else "(none)"
+                if len(reverted_rel) > 20:
+                    feedback += f" (and {len(reverted_rel) - 20} more)"
+                agent.history.append({"role": "user", "content": feedback})
                 save_session()
                 await ws.send_json({
                     "type": "reverted",
-                    "files": [os.path.relpath(p, wd) for p in reverted],
+                    "files": reverted_rel,
                 })
                 continue
 
@@ -1745,11 +1804,17 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             if msg_type == "revert_to_step":
                 step = data.get("step", 0)
                 reverted = agent.revert_to_step(step)
+                reverted_rel = [os.path.relpath(p, wd) for p in reverted]
+                feedback = f"[System] The user reverted to step {step}. The following files were reverted: "
+                feedback += ", ".join(reverted_rel[:20]) if reverted_rel else "(none)"
+                if len(reverted_rel) > 20:
+                    feedback += f" (and {len(reverted_rel) - 20} more)"
+                agent.history.append({"role": "user", "content": feedback})
                 save_session()
                 await ws.send_json({
                     "type": "reverted_to_step",
                     "step": step,
-                    "files": [os.path.relpath(p, wd) for p in reverted],
+                    "files": reverted_rel,
                 })
                 continue
 
@@ -1820,6 +1885,10 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     await ws.send_json({"type": "error", "content": "Agent is already running. Cancel first."})
                     continue
 
+                # When user has uncommitted changes and sends a new task: preserve snapshots so
+                # diff/revert keep growing (cumulative). Don't clear the keep/revert UI.
+                preserve_snapshots = bool(awaiting_keep_revert and agent._file_snapshots)
+
                 # Name session from first task
                 if session and session.name == "default" and not agent.history:
                     if task_text:
@@ -1829,7 +1898,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                         session.name = "Image prompt"
 
                 _cancel_ack_sent = False
-                _agent_task = asyncio.create_task(_run_task_bg(task_text, task_images))
+                _agent_task = asyncio.create_task(_run_task_bg(task_text, task_images, preserve_snapshots))
                 continue
 
     except WebSocketDisconnect:

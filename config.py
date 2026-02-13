@@ -44,8 +44,8 @@ class ModelConfig:
     # Extended thinking settings
     enable_thinking: bool = os.getenv("ENABLE_THINKING", "true").lower() == "true"
     thinking_budget: int = int(os.getenv("THINKING_BUDGET", "120000"))
-    # Claude 4.6 adaptive thinking defaults (can be overridden per-request)
-    use_adaptive_thinking: bool = os.getenv("USE_ADAPTIVE_THINKING", "true").lower() == "true"
+    # Deep (fixed-budget) vs adaptive thinking. Default: deep for predictable reasoning depth.
+    use_adaptive_thinking: bool = os.getenv("USE_ADAPTIVE_THINKING", "false").lower() == "true"
     adaptive_thinking_effort: str = os.getenv("ADAPTIVE_THINKING_EFFORT", "high")
 
 
@@ -64,7 +64,7 @@ class AppConfig:
     # Scout sub-agent settings
     scout_enabled: bool = os.getenv("SCOUT_ENABLED", "true").lower() == "true"
     scout_model: str = os.getenv("SCOUT_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
-    scout_max_iterations: int = int(os.getenv("SCOUT_MAX_ITERATIONS", "15"))
+    scout_max_iterations: int = int(os.getenv("SCOUT_MAX_ITERATIONS", "28"))
     # Plan-then-Build phase
     plan_phase_enabled: bool = os.getenv("PLAN_PHASE_ENABLED", "true").lower() == "true"
     # YOLO mode — auto-approve all operations including shell commands
@@ -98,6 +98,9 @@ class AppConfig:
     # Test impact selection: run likely impacted tests before full suite
     test_impact_selection_enabled: bool = os.getenv("TEST_IMPACT_SELECTION_ENABLED", "true").lower() == "true"
     test_run_full_after_impact: bool = os.getenv("TEST_RUN_FULL_AFTER_IMPACT", "true").lower() == "true"
+    # Enterprise: semantic codebase index (Cursor-style)
+    codebase_index_enabled: bool = os.getenv("CODEBASE_INDEX_ENABLED", "true").lower() == "true"
+    embedding_model_id: str = os.getenv("EMBEDDING_MODEL_ID", "cohere.embed-english-v3")
 
 
 # ============================================================

@@ -20,7 +20,14 @@ from dataclasses import dataclass, field
 from bedrock_service import BedrockService, GenerationConfig, BedrockError
 from tools import TOOL_DEFINITIONS, SCOUT_TOOL_DEFINITIONS, SAFE_TOOLS, execute_tool, needs_approval, ToolResult, ASK_USER_QUESTION_DEFINITION
 from backend import Backend, LocalBackend
-from config import model_config, supports_thinking, app_config, get_context_window
+from config import (
+    model_config,
+    supports_thinking,
+    app_config,
+    get_context_window,
+    get_max_output_tokens,
+    get_default_max_tokens,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +49,7 @@ You are not skimming. You are building a mental model of this codebase — how i
 <strategy>
 1. **Start smart**: List root. Read manifest files (package.json, pyproject.toml, Cargo.toml, go.mod, requirements.txt, Makefile). Know the stack.
 2. **Read with purpose**: Every batch of file reads should answer a specific question — "how does auth work?", "what does this handler call?", "what patterns do the tests follow?" Don't read files just because they exist.
-3. **Batch aggressively**: Read 3-8 files per turn. They execute in parallel. Don't read files one by one.
+3. **Batch aggressively**: Read 5-12 files per turn. They execute in parallel. Don't read files one by one.
 4. **Follow the relevant path**: Read the files that will be touched, their imports, and related tests. Understand the data flow end-to-end for THIS task. Don't map the entire codebase.
 5. **Know when to stop**: You have enough context when you can answer: What's the stack? What files need changing? What patterns must I follow? What could go wrong? Once you can answer all four, produce your summary and stop.
 6. Skip vendored code, lock files, build artifacts, node_modules, __pycache__, generated files.
@@ -175,19 +182,9 @@ When the user or plan gives multiple distinct tasks (e.g. "do X. Also do Y. Then
 </checklist_workflow>
 
 <execution_principles>
-1. **Follow the plan, think for yourself**: Execute steps in order, but you're not a robot. If you see something the plan missed — a better approach, a missed edge case, a simpler solution — adapt. State what you changed and why.
-2. **Read before write. Always.**: Never modify a file you haven't read in this session. Understand the surrounding code, the imports, the patterns. Your change must fit seamlessly into the existing codebase — same style, same patterns, same level of quality.
-3. **Surgical precision**: Use `symbol_edit` for symbol-level refactors (function/class/type blocks). Use `edit_file` with enough context (3-5 surrounding lines) for exact string edits. Use `write_file` only for new files or complete rewrites. Every edit should be the minimum change that fully solves the problem.
-4. **Verify everything**: After every file modification:
-   (a) Re-read the changed section. Confirm the edit is correct.
-   (b) Run the linter or type checker on the file. Fix any errors before moving on.
-   (c) If a test exists for this code, run it.
-   You are not done with a step until verification passes.
-5. **When things go wrong, diagnose**: If a tool call fails or a test breaks, stop. Read the error. Think about the root cause. Don't retry blindly — understand what went wrong, fix the cause, then proceed.
-6. **Write code that belongs**: Match the existing codebase's conventions exactly — naming, formatting, error handling, abstraction level. Your code should look like the same person wrote it. Do not introduce new patterns, new abstractions, or new dependencies unless the plan explicitly calls for it.
-7. **Think about the edges**: Empty inputs. None values. Concurrent access. Error paths. Large inputs. Off-by-one errors. Missing permissions. These are where bugs live. Handle them or explicitly note why they don't apply.
-8. **Security is non-negotiable**: No command injection. No XSS. No SQL injection. No path traversal. If user-controlled input touches a dangerous operation, sanitize it.
-9. **Final pass**: After all steps are complete, re-read every modified file. Run the full linter/test suite. Fix anything broken. The bar is: someone reviewing this PR would approve it without comments.
+**Meta-patterns (abide by all; see CLAUDE.md § Meta-Patterns for detail):** Systematic skepticism (prove by tracing). Minimal necessary change. State made visible. Fail fast, fail loud. Reversibility. Contract before implementation. Read the room. One level of indirection.
+
+**Actionable:** Follow the plan; adapt when you see a real gap and state why. Read before write — never edit a file you haven't read this session. Surgical precision: symbol_edit for refactors, edit_file with 3–5 lines context, write_file only for new/whole-file. After every edit: re-read changed section, run linter, run tests if present. When a tool or test fails, diagnose root cause before retrying. Match existing conventions; no new patterns/abstractions unless the plan says so. Security: no injection, no path traversal; sanitize user input. Final pass: re-read all modified files, full lint/test, bar = reviewer would approve.
 </execution_principles>
 
 <how_you_think>
@@ -304,10 +301,12 @@ Before every batch of tool calls, output 1-2 sentences stating your next move(s)
 - To read a whole small file (<200 lines): just `read_file` with no offset
 - To understand a large file: `read_file` with no offset (gets structural overview), then targeted reads of sections you care about
 - To find all usages of something: `search` with `include` to filter by file type
+- **Large codebases**: Use `semantic_retrieve` first (natural-language query) to get relevant code chunks; then `read_file` with offset/limit only those locations.
 - **Batch reads**: when you need multiple files or sections, request them all in one turn — they run in parallel
 </tool_strategy>
 
 <tool_usage>
+- `semantic_retrieve`: Semantic codebase search. Query in natural language; returns relevant functions/classes with path and line range. Use first when exploring, then read_file(offset, limit) only those spots.
 - `read_file`: Reads with line numbers. For large files (>500 lines), returns structural overview. Use `offset` + `limit` to read specific sections.
 - `edit_file`: old_string must match exactly one location, including whitespace. Include 3-5 surrounding lines. If "not found", re-read the file.
 - `write_file`: Overwrites entirely. Use only for new files or major rewrites. Prefer edit_file.
@@ -559,6 +558,9 @@ class CodingAgent:
         self._deterministic_verification_done: bool = False
         # Task decomposition of current plan (execution batches)
         self._current_plan_decomposition: List[Dict[str, Any]] = []
+        # Plan file path and full text — persisted so "Open in Editor" survives reload
+        self._plan_file_path: Optional[str] = None
+        self._plan_text: str = ""
         # In-memory cache of learned failure patterns
         self._failure_pattern_cache: Optional[List[Dict[str, Any]]] = None
 
@@ -602,6 +604,8 @@ class CodingAgent:
         self._checkpoint_counter = 0
         self._deterministic_verification_done = False
         self._current_plan_decomposition = []
+        self._plan_file_path = None
+        self._plan_text = ""
         self._failure_pattern_cache = None
 
     # ------------------------------------------------------------------
@@ -1298,6 +1302,8 @@ class CodingAgent:
             "running_summary": self._running_summary,
             "current_plan": self._current_plan,
             "current_plan_decomposition": self._current_plan_decomposition,
+            "plan_file_path": self._plan_file_path,
+            "plan_text": self._plan_text,
             "scout_context": self._scout_context,
             "file_snapshots": snapshots,
             "session_checkpoints": checkpoints,
@@ -1318,6 +1324,8 @@ class CodingAgent:
         self._running_summary = data.get("running_summary", "")
         self._current_plan = data.get("current_plan")
         self._current_plan_decomposition = data.get("current_plan_decomposition", [])
+        self._plan_file_path = data.get("plan_file_path")
+        self._plan_text = data.get("plan_text", "") or ""
         self._scout_context = data.get("scout_context")
         self._plan_step_index = data.get("plan_step_index", 0)
         self._deterministic_verification_done = data.get("deterministic_verification_done", False)
@@ -1349,10 +1357,12 @@ class CodingAgent:
         self._checkpoint_counter = int(data.get("checkpoint_counter", 0) or 0)
 
     def _default_config(self) -> GenerationConfig:
-        """Create default generation config from environment settings"""
+        """Create default generation config. Use at least the model's default max_tokens so we never hit 'ran out of tokens'."""
         model_id = self.service.model_id
+        default_max = get_default_max_tokens(model_id)
+        max_tok = max(model_config.max_tokens, default_max)
         return GenerationConfig(
-            max_tokens=model_config.max_tokens,
+            max_tokens=max_tok,
             enable_thinking=model_config.enable_thinking and supports_thinking(model_id),
             thinking_budget=model_config.thinking_budget if supports_thinking(model_id) else 0,
             use_adaptive_thinking=model_config.use_adaptive_thinking,
@@ -1520,13 +1530,14 @@ class CodingAgent:
             result = self.service.generate_response(
                 messages=[{"role": "user", "content": conversation_text}],
                 system_prompt=(
-                    "Summarize this coding agent conversation segment concisely. Focus on:\n"
-                    "1. What task was the user working on?\n"
-                    "2. What files were read and modified?\n"
-                    "3. What key decisions were made and why?\n"
-                    "4. What is the current state?\n"
-                    "Be concise — this summary replaces the original messages in context.\n"
-                    "Use bullet points. Max 500 words."
+                    "COMPACTION CONTRACT: This summary must allow the agent to continue the task without re-reading everything.\n"
+                    "Include exactly:\n"
+                    "1. **Task**: What the user asked for (exact goal).\n"
+                    "2. **Files touched**: Paths read, edited, or created (with one-line reason each).\n"
+                    "3. **Decisions**: Key design/implementation choices and why.\n"
+                    "4. **Current state**: What is done, what remains, any errors or blockers.\n"
+                    "5. **Next steps**: What the agent should do next (concrete).\n"
+                    "Be concise but reconstruction-grade — the agent will continue from this summary. Use bullet points. Max 500 words."
                 ),
                 model_id=app_config.scout_model,
                 config=summary_config,
@@ -1614,9 +1625,12 @@ class CodingAgent:
         Tier 1 is usually sufficient. Tiers 2-3 are safety nets.
         """
         context_window = get_context_window(self.service.model_id)
-        tier1_limit = int(context_window * 0.60)    # gentle compression starts
-        tier2_limit = int(context_window * 0.78)    # aggressive compression
-        tier3_limit = int(context_window * 0.90)    # emergency
+        # Reserve output headroom so the model always has room to respond (never "ran out of tokens")
+        reserved_output = min(64_000, get_max_output_tokens(self.service.model_id) // 2)
+        usable = max(1, context_window - reserved_output)
+        tier1_limit = int(usable * 0.52)
+        tier2_limit = int(usable * 0.70)
+        tier3_limit = int(usable * 0.85)
 
         current = self._current_token_estimate()
         if current <= tier1_limit:
@@ -1914,8 +1928,8 @@ class CodingAgent:
             return 8000    # ~2.3k tokens — tight, preserve room
 
     def _cap_tool_results(self, tool_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Cap tool result content at ingestion — adaptive based on context usage.
-        Generous early in the session, progressively tighter as context fills."""
+        """Microcompaction: cap tool result content at ingestion so context stays manageable.
+        Enterprise-grade: large outputs are head/tail + explicit instruction to use read_file with offset/limit for full content."""
         cap = self._adaptive_result_cap()
         capped = []
         for result in tool_results:
@@ -1923,19 +1937,18 @@ class CodingAgent:
             if isinstance(text, str) and len(text) > cap:
                 lines = text.split("\n")
                 if len(lines) > 50:
-                    # Proportional head/tail based on budget
                     head_n = max(20, cap // 400)
                     tail_n = max(10, cap // 800)
                     head = "\n".join(lines[:head_n])
                     tail = "\n".join(lines[-tail_n:])
                     text = (
-                        head
-                        + f"\n\n... ({len(lines) - head_n - tail_n} lines omitted to fit context budget"
-                        + f" — use offset/limit to read specific sections) ...\n\n"
+                        "[Large output — excerpt below. Use read_file with offset/limit for full content.]\n\n"
+                        + head
+                        + f"\n\n... ({len(lines) - head_n - tail_n} lines omitted) ...\n\n"
                         + tail
                     )
                 else:
-                    text = text[:cap - 200] + "\n... (output truncated to fit context budget) ..."
+                    text = text[:cap - 200] + "\n... (truncated; use read_file with offset/limit for full content) ..."
                 capped.append({**result, "content": text})
             else:
                 capped.append(result)
@@ -2471,8 +2484,10 @@ Keep the whole response under 300 words. If the request is already very clear an
             self._current_plan = steps
             self._current_plan_decomposition = self._decompose_plan_steps(steps)
 
-            # Write plan to a markdown file on disk
+            # Write plan to a markdown file on disk (persisted for "Open in Editor" on reload)
             plan_file_path = self._write_plan_file(task, plan_text)
+            self._plan_file_path = plan_file_path
+            self._plan_text = plan_text or ""
 
             # Emit plan steps + full plan text + file path
             await on_event(AgentEvent(
@@ -2665,7 +2680,9 @@ Keep the whole response under 300 words. If the request is already very clear an
         The plan is injected into the conversation so the model follows it.
         """
         self._cancelled = False
-        self._file_snapshots = {}  # fresh snapshot tracking per build
+        # Preserve existing snapshots so diff/revert stay cumulative across prompts
+        if not self._file_snapshots:
+            self._file_snapshots = {}  # fresh snapshot tracking per build
         self._deterministic_verification_done = False
 
         await on_event(AgentEvent(type="phase_start", content="build"))
@@ -2809,6 +2826,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         config: Optional[GenerationConfig] = None,
         enable_scout: bool = True,
         user_images: Optional[List[Dict[str, Any]]] = None,
+        preserve_snapshots: bool = False,
     ):
         """
         Run the agent on a task. If plan phase is enabled, this is called
@@ -2816,9 +2834,11 @@ Keep the whole response under 300 words. If the request is already very clear an
         When plan phase is disabled, this runs everything directly.
 
         enable_scout: Whether to run the scout phase. Set by intent classification.
+        preserve_snapshots: If True, keep existing _file_snapshots so revert/diff stay cumulative.
         """
         self._cancelled = False
-        self._file_snapshots = {}  # fresh snapshot tracking per run
+        if not preserve_snapshots:
+            self._file_snapshots = {}  # fresh snapshot tracking per run
         self._deterministic_verification_done = False
 
         # Run scout for first message — controlled by intent classification
@@ -3087,6 +3107,12 @@ Keep the whole response under 300 words. If the request is already very clear an
         config: Optional[GenerationConfig] = None,
     ):
         """Core streaming agent loop with tool execution."""
+        if app_config.codebase_index_enabled and hasattr(self.service, "embed_texts"):
+            try:
+                from codebase_index import set_embed_fn
+                set_embed_fn(self.service.embed_texts)
+            except Exception:
+                pass
         gen_config = config or self._default_config()
         iteration = 0
         reasoning_trace_repairs = 0
@@ -3125,6 +3151,8 @@ Keep the whole response under 300 words. If the request is already very clear an
             snapshot_cache_read = self._cache_read_tokens
             snapshot_cache_write = self._cache_write_tokens
 
+            last_stop_reason: Optional[str] = None
+            should_auto_continue = False  # max_tokens cut-off: next iteration will send continuation
             for attempt in range(1, max_retries + 1):
                 try:
                     # Reset per-attempt accumulators
@@ -3271,6 +3299,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                         elif chunk_type == "message_end":
                             usage = chunk.get("usage", {})
                             self._total_output_tokens += usage.get("output_tokens", 0)
+                            last_stop_reason = chunk.get("stop_reason") or None
 
                     producer_thread.join(timeout=5)
                     stream_succeeded = True
@@ -3280,13 +3309,15 @@ Keep the whole response under 300 words. If the request is already very clear an
                 except (BedrockError, Exception) as stream_err:
                     producer_thread.join(timeout=2)
 
-                    # Determine if this error is retryable (connection/timeout/throttle)
+                    # Determine if this error is retryable (connection/timeout/throttle/token limit)
                     err_str = str(stream_err).lower()
                     retryable_keywords = [
                         "timeout", "timed out", "connection", "reset by peer",
                         "broken pipe", "eof", "throttl", "serviceunav",
                         "read timeout", "endpoint url", "connect timeout",
                         "network", "socket", "aborted",
+                        "max_tokens", "token limit", "ran out of tokens", "output length",
+                        "context length", "input length",
                     ]
                     is_retryable = any(kw in err_str for kw in retryable_keywords)
 
@@ -3347,10 +3378,15 @@ Keep the whole response under 300 words. If the request is already very clear an
                             err_msg[:1200],
                             {"attempt": attempt, "max_retries": max_retries},
                         )
-                        await on_event(AgentEvent(
-                            type="stream_failed",
-                            content=f"Streaming error: {err_msg}\n\nYour message was rolled back — you can re-send it.",
-                        ))
+                        # Never show "ran out of tokens" or raw token errors to the user
+                        if any(phrase in err_str for phrase in ("token", "max_tokens", "length limit", "context")):
+                            user_msg = (
+                                "Response hit a length limit. You can re-send your message "
+                                "(conversation will be compacted automatically), or break the task into smaller steps."
+                            )
+                        else:
+                            user_msg = f"Streaming error: {err_msg}\n\nYour message was rolled back — you can re-send it."
+                        await on_event(AgentEvent(type="stream_failed", content=user_msg))
                         stream_succeeded = False
                         break  # exit retry loop
 
@@ -3384,6 +3420,25 @@ Keep the whole response under 300 words. If the request is already very clear an
 
             # Check for tool calls
             tool_uses = [b for b in assistant_content if b.get("type") == "tool_use"]
+
+            # Response was cut off by max_tokens — continue next iteration (user never sees "ran out of tokens")
+            if not tool_uses and last_stop_reason in ("max_tokens", "length"):
+                self.history.append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM] Your previous response was cut off due to length. "
+                        "Continue from where you left off. If you were mid tool call, complete it. "
+                        "If you were explaining, briefly summarize progress and continue the task."
+                    ),
+                })
+                await on_event(AgentEvent(
+                    type="stream_recovering",
+                    content="Continuing automatically...",
+                ))
+                should_auto_continue = True
+
+            if should_auto_continue:
+                continue  # next while iteration: stream again with continuation user message
 
             if not tool_uses:
                 assistant_text = self._extract_assistant_text(assistant_content)
@@ -3758,7 +3813,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                 if cp_id:
                     await on_event(AgentEvent(
                         type="checkpoint_created",
-                        content=f"Checkpoint created: {cp_id}",
+                        content="Checkpoint",
                         data={"checkpoint_id": cp_id, "label": "before_file_batch"},
                     ))
 
@@ -3983,7 +4038,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                 if cp_id:
                     await on_event(AgentEvent(
                         type="checkpoint_created",
-                        content=f"Checkpoint created: {cp_id}",
+                        content="Checkpoint",
                         data={"checkpoint_id": cp_id, "label": f"before_command:{tool_name}"},
                     ))
 

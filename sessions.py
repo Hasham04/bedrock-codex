@@ -186,6 +186,14 @@ class SessionStore:
         sessions = self.list_sessions(working_directory)
         return sessions[0] if sessions else None
 
+    def delete_all_sessions_for_project(self, working_directory: str) -> int:
+        """Delete all session files for this project (removes it from recents). Returns count deleted."""
+        wd = _normalize_wd(working_directory)
+        sessions = self.list_sessions(wd)
+        for s in sessions:
+            self.delete(s.session_id)
+        return len(sessions)
+
     def list_all_projects(self) -> List[Dict[str, Any]]:
         """List all known projects, grouped by working directory.
         Returns: [{path, name, session_count, message_count, total_tokens, updated_at,

@@ -577,6 +577,59 @@ class BedrockService:
             logger.warning(f"Failed to generate title: {e}")
             return first_message[:40] + "..." if len(first_message) > 40 else first_message
     
+    def embed_text(self, text: str, input_type: str = "search_document") -> List[float]:
+        """Embed a single text using the configured embedding model (Cohere Embed v3).
+        Used for codebase indexing and semantic retrieval."""
+        return self.embed_texts([text], input_type=input_type)[0]
+
+    def embed_texts(
+        self,
+        texts: List[str],
+        input_type: str = "search_document",
+        model_id: Optional[str] = None,
+    ) -> List[List[float]]:
+        """Embed texts using Bedrock Cohere Embed. Batches to stay under 2048 chars per call.
+        input_type: 'search_document' for corpus, 'search_query' for queries."""
+        from config import app_config
+        embed_model = model_id or getattr(app_config, "embedding_model_id", "cohere.embed-english-v3")
+        # Cohere limit: 2048 chars total per request, 96 texts; ~512 tokens per text recommended
+        batch_size = 8
+        char_limit = 1800
+        all_embeddings: List[List[float]] = []
+        i = 0
+        while i < len(texts):
+            batch = []
+            batch_chars = 0
+            while i < len(texts) and len(batch) < batch_size and batch_chars + len(texts[i]) <= char_limit:
+                t = texts[i][:1500]
+                batch.append(t)
+                batch_chars += len(t)
+                i += 1
+            if not batch:
+                t = texts[i][:1500]
+                batch.append(t)
+                i += 1
+            body = json.dumps({"texts": batch, "input_type": input_type})
+            try:
+                response = self.client.invoke_model(
+                    modelId=embed_model,
+                    body=body,
+                    contentType="application/json",
+                    accept="application/json",
+                )
+                response_body = json.loads(response["body"].read())
+                embeddings = response_body.get("embeddings")
+                if isinstance(embeddings, list) and embeddings and isinstance(embeddings[0], list):
+                    all_embeddings.extend(embeddings)
+                elif isinstance(embeddings, dict) and "float" in embeddings:
+                    all_embeddings.extend(embeddings["float"])
+                else:
+                    all_embeddings.extend([[]] * len(batch))
+            except ClientError as e:
+                logger.warning(f"Embed API error: {e}")
+                all_embeddings.extend([[0.0] * 1024 for _ in batch])
+        return all_embeddings
+
     def test_connection(self) -> tuple:
         """Test the Bedrock connection"""
         try:

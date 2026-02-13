@@ -394,12 +394,15 @@ class SSHBackend(Backend):
         return self._working_directory
 
     def _remote_path(self, path: str) -> str:
-        """Resolve a relative path to absolute on the remote."""
+        """Resolve a relative path to absolute on the remote. Expands ~ so SFTP can open paths."""
         if os.path.isabs(path):
             return path
         # Use posixpath for remote (always Linux)
         import posixpath
-        return posixpath.normpath(posixpath.join(self._working_directory, path))
+        p = posixpath.normpath(posixpath.join(self._working_directory, path))
+        if "~" in p:
+            p = self._expand_remote_tilde(p)
+        return p
 
     def _expand_remote_tilde(self, path: str) -> str:
         """Expand ~ in path on the remote (SFTP doesn't expand it). Returns path unchanged on failure.
@@ -566,7 +569,7 @@ class SSHBackend(Backend):
             try:
                 attr = self._sftp.stat(self._remote_path(path))
                 return stat_mod.S_ISDIR(attr.st_mode or 0)
-            except FileNotFoundError:
+            except (FileNotFoundError, OSError):
                 return False
 
     def is_file(self, path: str) -> bool:
@@ -576,7 +579,7 @@ class SSHBackend(Backend):
             try:
                 attr = self._sftp.stat(self._remote_path(path))
                 return stat_mod.S_ISREG(attr.st_mode or 0)
-            except FileNotFoundError:
+            except (FileNotFoundError, OSError):
                 return False
 
     def file_size(self, path: str) -> int:

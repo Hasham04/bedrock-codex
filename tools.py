@@ -635,7 +635,57 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "required": ["path"],
         },
     },
+    {
+        "name": "semantic_retrieve",
+        "description": "Enterprise semantic codebase search. Returns the most relevant code chunks (functions, classes) for a natural-language query without reading whole files. Use this first when exploring a large codebase or finding where to implement something. Then use read_file with offset/limit to open only the returned locations.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural-language description of what you are looking for, e.g. 'where is user authentication validated' or 'handler for POST /api/orders'"},
+                "top_k": {"type": "integer", "description": "Number of chunks to return (default 10, max 20)"},
+            },
+            "required": ["query"],
+        },
+    },
 ]
+
+def semantic_retrieve(
+    query: str,
+    top_k: int = 10,
+    backend: Optional[Backend] = None,
+    working_directory: str = ".",
+) -> ToolResult:
+    """Semantic search over the codebase index. Returns relevant code chunks with path and line range."""
+    try:
+        from config import app_config
+        if not getattr(app_config, "codebase_index_enabled", True):
+            return ToolResult(success=False, output="", error="Codebase index is disabled.")
+        from codebase_index import get_index, get_embed_fn
+        wd = os.path.abspath(working_directory)
+        embed_fn = get_embed_fn()
+        index = get_index(wd, embed_fn=embed_fn)
+        if not index.chunks and embed_fn and backend:
+            index.build(backend, force_reindex=False)
+        if not index.chunks:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Index empty. Ensure CODEBASE_INDEX_ENABLED=true and the project has been indexed (e.g. run a task once to trigger index build).",
+            )
+        k = max(1, min(20, top_k))
+        chunks = index.retrieve(query.strip(), top_k=k)
+        if not chunks:
+            return ToolResult(success=True, output="No relevant chunks found for this query. Try a different query or use search/read_file.")
+        lines = [f"Semantic retrieval (top {len(chunks)}):", ""]
+        for i, c in enumerate(chunks, 1):
+            lines.append(f"--- Result {i}: {c.path}:{c.start_line}-{c.end_line} [{c.kind}] {c.name} ---")
+            lines.append(c.to_search_snippet())
+            lines.append("")
+        return ToolResult(success=True, output="\n".join(lines))
+    except Exception as e:
+        logger.exception("semantic_retrieve failed")
+        return ToolResult(success=False, output="", error=str(e))
+
 
 TOOL_IMPLEMENTATIONS = {
     "read_file": read_file,
@@ -648,10 +698,11 @@ TOOL_IMPLEMENTATIONS = {
     "list_directory": list_directory,
     "glob_find": glob_find,
     "lint_file": lint_file,
+    "semantic_retrieve": semantic_retrieve,
 }
 
 TOOLS_REQUIRING_APPROVAL = {"write_file", "edit_file", "symbol_edit", "run_command"}
-SAFE_TOOLS = {"read_file", "search", "find_symbol", "list_directory", "glob_find", "lint_file"}
+SAFE_TOOLS = {"read_file", "search", "find_symbol", "list_directory", "glob_find", "lint_file", "semantic_retrieve"}
 SCOUT_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     t for t in TOOL_DEFINITIONS if t["name"] in SAFE_TOOLS
 ]

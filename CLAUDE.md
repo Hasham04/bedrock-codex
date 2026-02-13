@@ -2,6 +2,34 @@
 
 These standards are the default behavior for all agent work in this repository.
 
+## Meta-Patterns (System-Wide Habits)
+
+The system and all agent work in this repository abide by these patterns.
+
+**1. Systematic skepticism**  
+Do not modify (or add) any control mechanism or behavior until you can explain what it controls, how it works, and what happens when you change it. Prove by tracing execution — e.g. "this seems redundant" → trace the flow and prove it before removing; "I'll add a check" → trace where the flow comes from first. Applies to all code, not just cleanup.
+
+**2. Minimal necessary change**  
+Change the smallest set of things that achieves the goal. Do not refactor unrelated code, "clean up while you're here," or add features in the same edit. If the task is "add a null check," add the null check; do not rewrite the function.
+
+**3. State made visible**  
+Do not hide important state. Surfaces, logs, or APIs should make outcomes and current state obvious so the next step (agent or human) can reason about them. "What did that call actually do?" should be answerable without digging.
+
+**4. Fail fast, fail loud**  
+Prefer explicit failure with a clear signal over silent wrong behavior or undefined state. In agentic systems: errors the agent can see and fix, rather than proceeding with bad or inconsistent state.
+
+**5. Reversibility**  
+Prefer changes that can be undone or rolled back: one logical change per step, snapshots before risky batches, clear revert semantics. Supports "try this, then revert if it's wrong" without losing the baseline.
+
+**6. Contract before implementation**  
+For interfaces, APIs, or "what this code is responsible for": define the contract (inputs, outputs, errors, invariants) before writing the implementation. Reduces rework and makes "done" and "correct" testable.
+
+**7. Read the room**  
+Before acting, confirm context: right repo, branch, file, process, and current state. Agentic version: "Where am I and what is the state?" before "What do I do next?"
+
+**8. One level of indirection**  
+Abstract when you see the same pattern at least twice, not on the first occurrence. Do not abstract speculatively; add indirection when the repetition is real and the abstraction pays for itself.
+
 ## Workflow
 - For non-trivial requests, follow: Explore -> Plan -> Implement -> Verify.
 - For simple one-file changes, implement directly, but still verify.

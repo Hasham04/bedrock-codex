@@ -372,6 +372,7 @@
         }
         let html = "";
         for (const [path, status] of entries) {
+            if (path.endsWith("/")) continue;
             const statusCls = status === "M" ? "modified" : status === "A" ? "added" : status === "D" ? "deleted" : "untracked";
             const label = status === "M" ? "M" : status === "A" ? "A" : status === "D" ? "D" : "U";
             html += `<div class="source-control-item" data-path="${escapeHtml(path)}" data-status="${statusCls}">
@@ -381,7 +382,11 @@
         }
         $sourceControlList.innerHTML = html;
         $sourceControlList.querySelectorAll(".source-control-item").forEach(el => {
-            el.addEventListener("click", () => openFile(el.dataset.path));
+            el.addEventListener("click", () => {
+                const p = (el.dataset.path || "").replace(/\\/g, "/");
+                if (p.endsWith("/")) return;
+                openFile(p);
+            });
         });
     }
 
@@ -556,6 +561,8 @@
     }
 
     async function openFile(path) {
+        path = (path || "").replace(/\\/g, "/").trim();
+        if (!path || path.endsWith("/")) return;
         await initMonaco();
         const m = await window.monacoReady;
 
@@ -574,7 +581,15 @@
         // Fetch file content
         try {
             const res = await fetch(`/api/file?path=${encodeURIComponent(path)}`);
-            if (!res.ok) { showToast("Failed to open file"); return; }
+            if (!res.ok) {
+                let msg = "Failed to open file";
+                try {
+                    const errBody = await res.json();
+                    if (errBody && errBody.error) msg = errBody.error;
+                } catch (_) {}
+                showToast(msg);
+                return;
+            }
             const content = await res.text();
             const ext = path.split(".").pop();
             const lang = langFromExt(ext);
@@ -1535,6 +1550,8 @@
             retry: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m1 4 4 4 4-4M23 20l-4-4-4 4M20 8a8 8 0 0 0-13-3M4 16a8 8 0 0 0 13 3" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
             copy: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" stroke="currentColor" stroke-width="2" fill="none"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>`,
             stop: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.5" ry="1.5" stroke="currentColor" stroke-width="2" fill="none"/></svg>`,
+            pause: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1" stroke="currentColor" stroke-width="2" fill="none"/><rect x="14" y="5" width="4" height="14" rx="1" stroke="currentColor" stroke-width="2" fill="none"/></svg>`,
+            play: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>`,
         };
         return icons[kind] || "";
     }
@@ -1828,6 +1845,7 @@
             }
         } else {
             const desc = toolDesc(name, input);
+            const headerDesc = toolDescForHeader(name);
             const icon = toolIcon(name, input);
             group = document.createElement("div");
             group.className = isCmd ? "tool-block tool-block-command" : "tool-block collapsed";
@@ -1848,7 +1866,7 @@
                         <span class="tool-icon-wrap"><span class="tool-icon">${icon}</span></span>
                         <div class="tool-meta">
                             <div class="tool-title-row"><span class="tool-title">${escapeHtml(toolTitle(name))}</span></div>
-                            <span class="tool-desc ${isCmd ? "tool-desc-cmd" : ""}">${escapeHtml(desc)}</span>
+                            <span class="tool-desc ${isCmd ? "tool-desc-cmd" : ""}">${escapeHtml(headerDesc)}</span>
                         </div>
                     </div>
                     <div class="tool-right">
@@ -1861,7 +1879,7 @@
                                 <span class="tool-action-slot"><button type="button" class="tool-action-btn tool-icon-btn tool-action-copy hidden" title="Copy output" aria-label="Copy output">${toolActionIcon("copy")}</button></span>
                                 <span class="tool-action-slot"><button type="button" class="tool-stop-btn tool-icon-btn ${isCmd ? "" : "hidden"}" title="Stop command" aria-label="Stop command">${toolActionIcon("stop")}</button></span>
                             </div>
-                            ${isCmd ? `<button type="button" class="tool-action-btn tool-follow-btn">Pause follow</button>` : ""}
+                            ${isCmd ? `<button type="button" class="tool-action-btn tool-icon-btn tool-follow-btn" title="Pause follow" aria-label="Pause follow">${toolActionIcon("pause")}</button>` : ""}
                         </div>
                         <span class="tool-chevron">\u25BC</span>
                     </div>
@@ -1886,7 +1904,9 @@
                     e.stopPropagation();
                     const enabled = group.dataset.follow === "1";
                     group.dataset.follow = enabled ? "0" : "1";
-                    followBtn.textContent = enabled ? "Resume follow" : "Pause follow";
+                    followBtn.innerHTML = toolActionIcon(enabled ? "play" : "pause");
+                    followBtn.title = enabled ? "Resume follow" : "Pause follow";
+                    followBtn.setAttribute("aria-label", followBtn.title);
                     followBtn.classList.toggle("paused", enabled);
                     if (!enabled) {
                         const contentEl = group.querySelector(".tool-content");
@@ -2047,20 +2067,25 @@
         return titles[n] || toolLabel(n);
     }
     function toolDesc(n, i) {
+        /* Used for grouping; keep so distinct calls (e.g. different paths) stay in separate groups. */
         switch(n) {
             case "read_file": return i?.path || "";
             case "write_file": return i?.path || "";
             case "edit_file": return i?.path || "";
-            case "symbol_edit": return `${i?.path || ""} :: ${i?.symbol || ""}`;
+            case "symbol_edit": return `${i?.path || ""}::${i?.symbol || ""}`;
             case "lint_file": return i?.path || "";
             case "run_command": return i?.command || "";
-            case "search": return `"${i?.pattern || ""}" in ${i?.path || "."}`;
+            case "search": return `${i?.pattern || ""}@${i?.path || "."}`;
             case "list_directory": return i?.path || ".";
             case "glob_find": return i?.pattern || "";
-            case "find_symbol": return `${i?.symbol || ""} (${i?.kind || "all"}) in ${i?.path || "."}`;
+            case "find_symbol": return `${i?.symbol || ""}@${i?.path || "."}`;
             case "scout": return i?.task || "";
             default: return "";
         }
+    }
+    function toolDescForHeader(n) {
+        /* Compact headers: don't show long desc in header; full input is in expanded body. */
+        return "";
     }
     function toolIcon(n, input) {
         // File-based tools → show the file type icon
@@ -2599,7 +2624,7 @@
                 break;
             case "checkpoint_created":
                 if (evt.data?.checkpoint_id) {
-                    showInfo(`Checkpoint created: ${evt.data.checkpoint_id}`);
+                    showInfo("Checkpoint");
                 }
                 break;
             case "checkpoint_error":
@@ -2644,7 +2669,18 @@
                 if (evt.data) updateTokenDisplay(evt.data);
                 break;
             case "kept": showInfo("\u2713 Changes kept."); break;
-            case "reverted": showInfo("\u21A9 Reverted " + (evt.files||[]).length + " file(s)."); refreshTree(); break;
+            case "reverted":
+                hideActionBar();
+                clearAllDiffDecorations();
+                modifiedFiles.clear();
+                showInfo("\u21A9 Reverted " + (evt.files || []).length + " file(s).");
+                refreshTree();
+                reloadAllModifiedFiles();
+                break;
+            case "clear_keep_revert":
+                hideActionBar();
+                clearAllDiffDecorations();
+                break;
             case "reverted_to_step": showInfo("\u21A9 Reverted to step " + evt.step + " (" + (evt.files||[]).length + " file(s))"); refreshTree(); break;
             case "plan_rejected": showInfo("Plan rejected."); break;
             case "cancelled":
@@ -2727,9 +2763,13 @@
                 scrollChat();
                 break;
             case "replay_state":
-                // Restore interactive UI state after reconnect
+                // Restore interactive UI state after reconnect (plan block with "Open in Editor")
                 if (evt.awaiting_build && evt.pending_plan) {
-                    showPlan(evt.pending_plan, null, "");
+                    showPlan(
+                        evt.pending_plan,
+                        evt.plan_file || null,
+                        evt.plan_text || ""
+                    );
                     // Don't setRunning(false) — we want the user to click Build
                 }
                 if (evt.awaiting_keep_revert && evt.has_diffs) {
@@ -3208,8 +3248,19 @@
                         <span class="welcome-project-time">${timeAgo(p.updated_at)}</span>
                         <span class="welcome-project-stats">${p.message_count} msgs</span>
                     </div>
+                    <button type="button" class="welcome-project-remove" title="Remove from recents" aria-label="Remove from recents">\u2715</button>
                 `;
-                el.addEventListener("click", () => openProject(p));
+                el.addEventListener("click", (e) => { if (!e.target.closest(".welcome-project-remove")) openProject(p); });
+                const removeBtn = el.querySelector(".welcome-project-remove");
+                removeBtn.addEventListener("click", async (e) => {
+                    e.stopPropagation();
+                    try {
+                        const res = await fetch("/api/projects/remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: p.path }) });
+                        const data = await res.json();
+                        if (data.ok) { el.remove(); if ($projectList.children.length === 0) $projectList.innerHTML = '<div class="welcome-no-projects">No recent projects. Open a local folder or connect via SSH to get started.</div>'; }
+                        else showToast(data.error || "Failed to remove");
+                    } catch (err) { showToast("Failed to remove from recents"); }
+                });
                 $projectList.appendChild(el);
             }
         } catch (e) {
