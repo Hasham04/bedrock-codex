@@ -49,10 +49,15 @@
     const $cancelBtn     = document.getElementById("cancel-btn");
     const $actionBar     = document.getElementById("action-bar");
     const $actionBtns    = document.getElementById("action-buttons");
+    const $modifiedFilesBar = document.getElementById("modified-files-bar");
+    const $modifiedFilesToggle = document.getElementById("modified-files-toggle");
+    const $modifiedFilesDropdown = document.getElementById("modified-files-dropdown");
+    const $modifiedFilesList = document.getElementById("modified-files-list");
+    const $modifiedFilesTotalsTop = document.getElementById("modified-files-totals-top");
     const $modelName     = document.getElementById("model-name");
     const $tokenCount    = document.getElementById("token-count");
     const $connStatus    = document.getElementById("connection-status");
-    const $sessionName   = document.getElementById("session-name");
+    const $conversationTitle = document.getElementById("conversation-title");
     const $agentSelect   = document.getElementById("agent-select");
     const $newAgentBtn   = document.getElementById("new-agent-btn");
     const $workingDir    = document.getElementById("working-dir");
@@ -525,6 +530,108 @@
         await fetchGitStatus();
         $fileTree.innerHTML = "";
         loadTree();
+        updateModifiedFilesBar();
+    }
+
+    async function updateModifiedFilesBar() {
+        if (!$modifiedFilesBar || !$modifiedFilesToggle || !$modifiedFilesList || !$modifiedFilesDropdown) return;
+        try {
+            const res = await fetch("/api/git-diff-stats?t=" + Date.now());
+            if (!res.ok) {
+                $modifiedFilesBar.classList.add("hidden");
+                if ($modifiedFilesTotalsTop) $modifiedFilesTotalsTop.classList.add("hidden");
+                return;
+            }
+            const data = await res.json();
+            const files = data.files || [];
+            const totalAdd = data.total_additions || 0;
+            const totalDel = data.total_deletions || 0;
+            if (files.length === 0) {
+                $modifiedFilesBar.classList.add("hidden");
+                if ($modifiedFilesTotalsTop) $modifiedFilesTotalsTop.classList.add("hidden");
+                return;
+            }
+            $modifiedFilesBar.classList.remove("hidden");
+            if ($modifiedFilesTotalsTop) {
+                $modifiedFilesTotalsTop.classList.remove("hidden");
+                const topAdd = $modifiedFilesTotalsTop.querySelector(".modified-files-totals-top-add");
+                const topDel = $modifiedFilesTotalsTop.querySelector(".modified-files-totals-top-del");
+                const topCount = $modifiedFilesTotalsTop.querySelector(".modified-files-totals-top-count");
+                if (topAdd) topAdd.textContent = "+" + totalAdd;
+                if (topDel) topDel.textContent = "\u2212" + totalDel;
+                if (topCount) topCount.textContent = files.length + " file" + (files.length !== 1 ? "s" : "");
+            }
+            const addEl = $modifiedFilesToggle.querySelector(".modified-files-add");
+            const delEl = $modifiedFilesToggle.querySelector(".modified-files-del");
+            const countEl = $modifiedFilesToggle.querySelector(".modified-files-count");
+            if (addEl) addEl.textContent = "+" + totalAdd;
+            if (delEl) delEl.textContent = "\u2212" + totalDel;
+            if (countEl) countEl.textContent = files.length + " file" + (files.length !== 1 ? "s" : "");
+            $modifiedFilesList.innerHTML = files.map((f) => {
+                const path = (f.path || "").replace(/\\/g, "/");
+                const add = f.additions != null ? f.additions : 0;
+                const del = f.deletions != null ? f.deletions : 0;
+                const icon = fileTypeIcon(path, 14);
+                return `<div class="modified-files-item" data-path="${escapeHtml(path)}" title="Open ${escapeHtml(path)}">
+                    <span class="file-icon">${icon}</span>
+                    <span class="file-path">${escapeHtml(path)}</span>
+                    <span class="file-stats"><span class="add">+${add}</span><span class="del">−${del}</span></span>
+                </div>`;
+            }).join("");
+            $modifiedFilesList.querySelectorAll(".modified-files-item").forEach((el) => {
+                el.addEventListener("click", () => {
+                    const p = el.dataset.path || "";
+                    if (p) openFile(p);
+                    $modifiedFilesDropdown.classList.add("hidden");
+                    $modifiedFilesBar.setAttribute("aria-expanded", "false");
+                });
+            });
+        } catch (e) {
+            $modifiedFilesBar.classList.add("hidden");
+            if ($modifiedFilesTotalsTop) $modifiedFilesTotalsTop.classList.add("hidden");
+        }
+    }
+    const MODIFIED_FILES_POLL_MS = 8000;
+    let modifiedFilesPollTimer = null;
+    function startModifiedFilesPolling() {
+        if (modifiedFilesPollTimer) return;
+        modifiedFilesPollTimer = setInterval(updateModifiedFilesBar, MODIFIED_FILES_POLL_MS);
+    }
+    function stopModifiedFilesPolling() {
+        if (modifiedFilesPollTimer) {
+            clearInterval(modifiedFilesPollTimer);
+            modifiedFilesPollTimer = null;
+        }
+    }
+    const GIT_STATUS_POLL_MS = 10000;
+    let gitStatusPollTimer = null;
+    function startGitStatusPolling() {
+        if (gitStatusPollTimer) return;
+        gitStatusPollTimer = setInterval(() => {
+            fetchGitStatus();
+        }, GIT_STATUS_POLL_MS);
+    }
+    function stopGitStatusPolling() {
+        if (gitStatusPollTimer) {
+            clearInterval(gitStatusPollTimer);
+            gitStatusPollTimer = null;
+        }
+    }
+    startGitStatusPolling();
+    if ($modifiedFilesToggle && $modifiedFilesDropdown) {
+        $modifiedFilesToggle.addEventListener("click", () => {
+            const expanded = $modifiedFilesBar.getAttribute("aria-expanded") === "true";
+            $modifiedFilesBar.setAttribute("aria-expanded", expanded ? "false" : "true");
+            $modifiedFilesDropdown.classList.toggle("hidden", expanded);
+        });
+    }
+    startModifiedFilesPolling();
+    if ($modifiedFilesTotalsTop && $modifiedFilesBar && $modifiedFilesDropdown) {
+        $modifiedFilesTotalsTop.addEventListener("click", () => {
+            $modifiedFilesBar.setAttribute("aria-expanded", "true");
+            $modifiedFilesDropdown.classList.remove("hidden");
+            $modifiedFilesBar.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        });
     }
     $refreshTree.addEventListener("click", refreshTree);
     if ($sourceControlRefreshBtn) {
@@ -1461,6 +1568,10 @@
         bubble.appendChild(makeCopyBtn(copyPayload));
         div.appendChild(bubble);
         $chatMessages.appendChild(div);
+        if ($conversationTitle && $chatMessages.querySelectorAll(".message.user").length === 1) {
+            const truncated = safeText.trim().slice(0, 50);
+            $conversationTitle.textContent = truncated ? (truncated + (safeText.length > 50 ? "\u2026" : "")) : "New conversation";
+        }
         scrollChat();
     }
 
@@ -1552,15 +1663,16 @@
             stop: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.5" ry="1.5" stroke="currentColor" stroke-width="2" fill="none"/></svg>`,
             pause: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1" stroke="currentColor" stroke-width="2" fill="none"/><rect x="14" y="5" width="4" height="14" rx="1" stroke="currentColor" stroke-width="2" fill="none"/></svg>`,
             play: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>`,
+            more: `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="6" r="1.5" fill="currentColor"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/><circle cx="12" cy="18" r="1.5" fill="currentColor"/></svg>`,
         };
         return icons[kind] || "";
     }
     function toolCanOpenFile(name, input) {
-        return Boolean((name === "read_file" || name === "write_file" || name === "edit_file" || name === "symbol_edit" || name === "lint_file") && input?.path);
+        return Boolean((name === "Read" || name === "Write" || name === "Edit" || name === "symbol_edit" || name === "lint_file") && input?.path);
     }
     function toolFollowupPrompt(name, input, failedOnly = false) {
         const title = toolTitle(name);
-        if (name === "run_command" && input?.command) {
+        if (name === "Bash" && input?.command) {
             return failedOnly
                 ? `The command failed. Please rerun this command and fix the issue:\n\n${input.command}`
                 : `Please rerun this exact command and summarize the result:\n\n${input.command}`;
@@ -1594,13 +1706,13 @@
     }
     function buildEditPreviewDiff(name, input) {
         const path = input?.path || "(unknown)";
-        if (name === "write_file") {
+        if (name === "Write") {
             const lines = String(input?.content || "").split("\n");
             const added = lines.slice(0, 16).map(l => `+${l}`);
             if (lines.length > 16) added.push(`+... (${lines.length - 16} more lines)`);
             return `+++ ${path}\n@@ new content preview @@\n${added.join("\n")}`;
         }
-        if (name === "edit_file") {
+        if (name === "Edit") {
             const oldLines = String(input?.old_string || "").split("\n");
             const newLines = String(input?.new_string || "").split("\n");
             const removed = oldLines.slice(0, 8).map(l => `-${l}`);
@@ -1750,8 +1862,8 @@
     }
     function renderToolOutput(runEl, name, input, content, success, extraData) {
         const out = document.createElement("div");
-        out.className = `tool-result ${success ? "tool-result-success" : "tool-result-error"} ${name === "run_command" ? "tool-result-terminal" : ""}`;
-        out.innerHTML = `<div class="tool-section-label">${name === "run_command" ? "Output" : "Result"}</div>`;
+        out.className = `tool-result ${success ? "tool-result-success" : "tool-result-error"} ${name === "Bash" ? "tool-result-terminal" : ""}`;
+        out.innerHTML = `<div class="tool-section-label">${name === "Bash" ? "Output" : "Result"}</div>`;
 
         if (!success) {
             const summary = failureSummary(name, content || extraData?.error || "");
@@ -1767,11 +1879,11 @@
             const list = makeLocationList(content);
             if (list) out.appendChild(list);
         }
-        if (name === "read_file") {
+        if (name === "Read") {
             const preview = makeReadFilePreview(content, input);
             if (preview) out.appendChild(preview);
         }
-        if (name === "write_file" || name === "edit_file" || name === "symbol_edit") {
+        if (name === "Write" || name === "Edit" || name === "symbol_edit") {
             const diff = buildEditPreviewDiff(name, input);
             if (diff) {
                 const mini = document.createElement("div");
@@ -1781,13 +1893,13 @@
             }
         }
 
-        out.appendChild(makeProgressiveBody(content || "(no output)", name === "run_command" ? "tool-terminal-body" : "", name === "run_command" ? 6000 : 2400));
+        out.appendChild(makeProgressiveBody(content || "(no output)", name === "Bash" ? "tool-terminal-body" : "", name === "Bash" ? 6000 : 2400));
         runEl.appendChild(out);
         return out;
     }
     function updateToolGroupHeader(_groupEl) {}
     function maybeAutoFollow(groupEl, runEl) {
-        if (!groupEl || groupEl.dataset.toolName !== "run_command") return;
+        if (!groupEl || groupEl.dataset.toolName !== "Bash") return;
         if (groupEl.dataset.follow !== "1") return;
         const contentEl = groupEl.querySelector(".tool-content");
         if (contentEl) contentEl.scrollTop = contentEl.scrollHeight;
@@ -1796,8 +1908,9 @@
         scrollChat();
     }
     function addToolCall(name, input, toolUseId = null) {
+        name = normalizedToolName(name);
         const bubble = getOrCreateBubble();
-        const isCmd = name === "run_command";
+        const isCmd = name === "Bash";
         const now = Date.now();
         const key = toolGroupKey(name, input);
 
@@ -1820,35 +1933,14 @@
                     ? `<span class="tool-status tool-status-running" title="Running"><span class="tool-spinner"></span></span>`
                     : `<span class="tool-status tool-status-pending" title="Pending">${toolActionIcon("pending")}</span>`;
             }
-            if (isCmd && !group.querySelector(".tool-stop-btn")) {
-                const actions = group.querySelector(".tool-actions");
-                if (actions) {
-                    const iconRow = actions.querySelector(".tool-action-icons") || actions;
-                    const slot = document.createElement("span");
-                    slot.className = "tool-action-slot";
-                    const stopBtn = document.createElement("button");
-                    stopBtn.className = "tool-stop-btn tool-icon-btn";
-                    stopBtn.setAttribute("aria-label", "Stop command");
-                    stopBtn.title = "Stop command";
-                    stopBtn.innerHTML = toolActionIcon("stop");
-                    stopBtn.addEventListener("click", (e) => {
-                        e.stopPropagation();
-                        send({ type: "cancel" });
-                        stopBtn.disabled = true;
-                        stopBtn.classList.add("is-stopping");
-                        stopBtn.innerHTML = `<span class="tool-stop-spinner"></span>`;
-                        stopBtn.title = "Stopping\u2026";
-                    });
-                    slot.appendChild(stopBtn);
-                    iconRow.appendChild(slot);
-                }
-            }
+            /* Stop button lives in .tool-content-actions; no need to inject into options panel */
         } else {
             const desc = toolDesc(name, input);
-            const headerDesc = toolDescForHeader(name);
+            const headerDesc = (name === "Read" && input?.path) ? readFileDisplayString(input) : toolDescForHeader(name);
+            const linkHtml = webToolLinkHtml(name, input);
             const icon = toolIcon(name, input);
             group = document.createElement("div");
-            group.className = isCmd ? "tool-block tool-block-command" : "tool-block collapsed";
+            group.className = isCmd ? "tool-block tool-block-command" : "tool-block tool-block-loading";
             group.dataset.toolName = name;
             group.dataset.groupKey = key;
             group.dataset.count = "1";
@@ -1866,47 +1958,76 @@
                         <span class="tool-icon-wrap"><span class="tool-icon">${icon}</span></span>
                         <div class="tool-meta">
                             <div class="tool-title-row"><span class="tool-title">${escapeHtml(toolTitle(name))}</span></div>
-                            <span class="tool-desc ${isCmd ? "tool-desc-cmd" : ""}">${escapeHtml(headerDesc)}</span>
+                            <span class="tool-desc ${isCmd ? "tool-desc-cmd" : ""}">${escapeHtml(headerDesc)}</span>${linkHtml}
                         </div>
                     </div>
                     <div class="tool-right">
                         ${statusHtml}
-                        <div class="tool-actions">
-                            <div class="tool-action-icons">
-                                <span class="tool-action-slot"><button type="button" class="tool-action-btn tool-icon-btn tool-action-open ${toolCanOpenFile(name, input) ? "" : "hidden"}" title="Open file" aria-label="Open file">${toolActionIcon("open")}</button></span>
-                                <span class="tool-action-slot"><button type="button" class="tool-action-btn tool-icon-btn tool-action-rerun" title="Rerun" aria-label="Rerun">${toolActionIcon("rerun")}</button></span>
-                                <span class="tool-action-slot"><button type="button" class="tool-action-btn tool-icon-btn tool-action-retry hidden" title="Retry failed" aria-label="Retry failed">${toolActionIcon("retry")}</button></span>
-                                <span class="tool-action-slot"><button type="button" class="tool-action-btn tool-icon-btn tool-action-copy hidden" title="Copy output" aria-label="Copy output">${toolActionIcon("copy")}</button></span>
-                                <span class="tool-action-slot"><button type="button" class="tool-stop-btn tool-icon-btn ${isCmd ? "" : "hidden"}" title="Stop command" aria-label="Stop command">${toolActionIcon("stop")}</button></span>
-                            </div>
-                            ${isCmd ? `<button type="button" class="tool-action-btn tool-icon-btn tool-follow-btn" title="Pause follow" aria-label="Pause follow">${toolActionIcon("pause")}</button>` : ""}
+                        <div class="tool-options-wrap tool-options-wrap-empty">
+                            <button type="button" class="tool-options-trigger" aria-label="Options" aria-expanded="false" title="Options">${toolActionIcon("more")}</button>
+                            <div class="tool-options-panel" role="menu" aria-hidden="true"></div>
                         </div>
                         <span class="tool-chevron">\u25BC</span>
                     </div>
                 </div>
                 <div class="tool-content ${isCmd ? "tool-content-cmd" : ""}">
+                    <div class="tool-content-actions">
+                        <button type="button" class="tool-content-btn tool-action-open ${toolCanOpenFile(name, input) ? "" : "hidden"}" title="Open file" data-action="open"><span class="tool-content-btn-icon">${toolActionIcon("open")}</span><span class="tool-content-btn-label">Open file</span></button>
+                        <button type="button" class="tool-content-btn tool-action-rerun" title="Rerun" data-action="rerun"><span class="tool-content-btn-icon">${toolActionIcon("rerun")}</span><span class="tool-content-btn-label">Rerun</span></button>
+                        <button type="button" class="tool-content-btn tool-action-retry hidden" title="Retry failed" data-action="retry"><span class="tool-content-btn-icon">${toolActionIcon("retry")}</span><span class="tool-content-btn-label">Retry</span></button>
+                        <button type="button" class="tool-content-btn tool-action-copy hidden" title="Copy output" data-action="copy"><span class="tool-content-btn-icon">${toolActionIcon("copy")}</span><span class="tool-content-btn-label">Copy output</span></button>
+                        <button type="button" class="tool-content-btn tool-stop-btn ${isCmd ? "" : "hidden"}" title="Stop command" data-action="stop"><span class="tool-content-btn-icon">${toolActionIcon("stop")}</span><span class="tool-content-btn-label">Stop</span></button>
+                        ${isCmd ? `<button type="button" class="tool-content-btn tool-follow-btn" title="Pause follow" data-action="follow"><span class="tool-content-btn-icon">${toolActionIcon("pause")}</span><span class="tool-content-btn-label">Pause follow</span></button>` : ""}
+                    </div>
                     <div class="tool-run-list"></div>
                 </div>`;
             group.querySelector(".tool-header").addEventListener("click", () => group.classList.toggle("collapsed"));
 
+            const optionsWrap = group.querySelector(".tool-options-wrap");
+            const optionsTrigger = group.querySelector(".tool-options-trigger");
+            const optionsPanel = group.querySelector(".tool-options-panel");
+            function closeOptionsPanel() {
+                if (!optionsPanel || !optionsTrigger) return;
+                optionsPanel.classList.remove("is-open");
+                optionsTrigger.setAttribute("aria-expanded", "false");
+                optionsPanel.setAttribute("aria-hidden", "true");
+                document.removeEventListener("click", closeOptionsPanel);
+            }
+            if (optionsTrigger && optionsPanel) {
+                optionsTrigger.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    const open = optionsPanel.classList.toggle("is-open");
+                    optionsTrigger.setAttribute("aria-expanded", String(open));
+                    optionsPanel.setAttribute("aria-hidden", String(!open));
+                    if (open) {
+                        requestAnimationFrame(() => document.addEventListener("click", closeOptionsPanel));
+                    } else {
+                        document.removeEventListener("click", closeOptionsPanel);
+                    }
+                });
+                optionsPanel.addEventListener("click", (e) => e.stopPropagation());
+            }
+
             const path = input?.path;
             const openBtn = group.querySelector(".tool-action-open");
-            if (openBtn && path) openBtn.addEventListener("click", (e) => { e.stopPropagation(); openFile(path); });
+            if (openBtn && path) openBtn.addEventListener("click", (e) => { e.stopPropagation(); closeOptionsPanel(); openFile(path); });
             const rerunBtn = group.querySelector(".tool-action-rerun");
-            if (rerunBtn) rerunBtn.addEventListener("click", (e) => { e.stopPropagation(); runFollowupPrompt(toolFollowupPrompt(name, input, false)); });
+            if (rerunBtn) rerunBtn.addEventListener("click", (e) => { e.stopPropagation(); closeOptionsPanel(); runFollowupPrompt(toolFollowupPrompt(name, input, false)); });
             const retryBtn = group.querySelector(".tool-action-retry");
-            if (retryBtn) retryBtn.addEventListener("click", (e) => { e.stopPropagation(); runFollowupPrompt(toolFollowupPrompt(name, input, true)); });
+            if (retryBtn) retryBtn.addEventListener("click", (e) => { e.stopPropagation(); closeOptionsPanel(); runFollowupPrompt(toolFollowupPrompt(name, input, true)); });
             const copyBtn = group.querySelector(".tool-action-copy");
-            if (copyBtn) copyBtn.addEventListener("click", (e) => { e.stopPropagation(); copyText(group.dataset.latestOutput || ""); });
+            if (copyBtn) copyBtn.addEventListener("click", (e) => { e.stopPropagation(); closeOptionsPanel(); copyText(group.dataset.latestOutput || ""); });
             const followBtn = group.querySelector(".tool-follow-btn");
             if (followBtn) {
+                const followIcon = followBtn.querySelector(".tool-content-btn-icon");
                 followBtn.addEventListener("click", (e) => {
                     e.stopPropagation();
                     const enabled = group.dataset.follow === "1";
                     group.dataset.follow = enabled ? "0" : "1";
-                    followBtn.innerHTML = toolActionIcon(enabled ? "play" : "pause");
+                    if (followIcon) followIcon.innerHTML = toolActionIcon(enabled ? "play" : "pause");
+                    const labelEl = followBtn.querySelector(".tool-content-btn-label");
+                    if (labelEl) labelEl.textContent = enabled ? "Resume follow" : "Pause follow";
                     followBtn.title = enabled ? "Resume follow" : "Pause follow";
-                    followBtn.setAttribute("aria-label", followBtn.title);
                     followBtn.classList.toggle("paused", enabled);
                     if (!enabled) {
                         const contentEl = group.querySelector(".tool-content");
@@ -1916,16 +2037,18 @@
             }
             const stopBtn = group.querySelector(".tool-stop-btn");
             if (stopBtn) {
+                const stopIcon = stopBtn.querySelector(".tool-content-btn-icon");
                 stopBtn.addEventListener("click", (e) => {
                     e.stopPropagation();
+                    closeOptionsPanel();
                     send({ type: "cancel" });
                     stopBtn.disabled = true;
                     stopBtn.classList.add("is-stopping");
-                    stopBtn.innerHTML = `<span class="tool-stop-spinner"></span>`;
+                    if (stopIcon) stopIcon.innerHTML = `<span class="tool-stop-spinner"></span>`;
                     stopBtn.title = "Stopping\u2026";
                 });
             }
-            group.querySelectorAll(".tool-action-btn").forEach(btn => btn.addEventListener("click", e => e.stopPropagation()));
+            group.querySelectorAll(".tool-content-btn").forEach(btn => btn.addEventListener("click", e => e.stopPropagation()));
 
             bubble.appendChild(group);
             lastToolGroup = group;
@@ -1959,7 +2082,7 @@
         if (!state) return;
         const group = runEl.closest(".tool-block");
         if (!group) return;
-        const isCmd = state.name === "run_command";
+        const isCmd = state.name === "Bash";
 
         const baseOutput = String(content || extraData?.error || "");
         const rawOutput = baseOutput || "(no output)";
@@ -1969,6 +2092,16 @@
             : (rawOutput || prior || "(no output)");
         state.output = merged;
         toolRunState.set(runEl, state);
+
+        let searchStats = null;
+        if (state.name === "search" && group.dataset.toolName === "search") {
+            searchStats = countFilesAndMatchesInSearchOutput(merged);
+            if (searchStats.fileCount === 0) {
+                group.remove();
+                scrollChat();
+                return;
+            }
+        }
 
         runEl.querySelector(".tool-result")?.remove();
         renderToolOutput(runEl, state.name, state.input, merged, success, extraData);
@@ -1996,8 +2129,21 @@
             }
         }
 
+        group.classList.remove("tool-block-loading");
+
         const stopBtn = group.querySelector(".tool-stop-btn");
         if (stopBtn && success !== undefined) stopBtn.remove();
+        if (searchStats) {
+            const descEl = group.querySelector(".tool-desc");
+            if (descEl) {
+                const fileStr = searchStats.fileCount === 1 ? "1 file" : searchStats.fileCount + " files";
+                const searchStr = searchStats.matchCount === 1 ? "1 search" : searchStats.matchCount + " searches";
+                descEl.textContent = fileStr + " " + searchStr;
+            }
+        }
+        if (state.name === "Write" || state.name === "Edit" || state.name === "symbol_edit") {
+            setTimeout(updateModifiedFilesBar, 600);
+        }
         maybeAutoFollow(group, runEl);
         scrollChat();
     }
@@ -2034,52 +2180,111 @@
         maybeAutoFollow(group, runEl);
         scrollChat();
     }
+    function readFileDisplayString(input) {
+        if (!input?.path) return "Read";
+        const path = String(input.path).replace(/\\/g, "/");
+        const base = path.split("/").pop() || path;
+        const offset = input.offset != null ? Number(input.offset) : null;
+        const limit = input.limit != null ? Number(input.limit) : null;
+        if (offset != null && limit != null && limit > 0) {
+            const end = offset + limit - 1;
+            return base + " L" + offset + "\u2013" + end;
+        }
+        if (offset != null) return base + " L" + offset;
+        return base;
+    }
+    function countFilesAndMatchesInSearchOutput(output) {
+        if (!output || typeof output !== "string") return { fileCount: 0, matchCount: 0 };
+        const seen = new Set();
+        let matchCount = 0;
+        const lineRe = /^([^:]+):\d+:/;
+        output.split("\n").forEach((line) => {
+            const match = line.match(lineRe);
+            if (match) {
+                seen.add(match[1].trim());
+                matchCount += 1;
+            }
+        });
+        return { fileCount: seen.size, matchCount };
+    }
     function toolLabel(n) {
         const labels = {
-            read_file: "Read",
-            write_file: "Write",
-            edit_file: "Edit",
+            Read: "Read",
+            Write: "Write",
+            Edit: "Edit",
             symbol_edit: "Symbol",
             lint_file: "Lint",
-            run_command: "Run",
-            search: "Search",
+            Bash: "Run",
+            search: "Explored",
             list_directory: "List",
-            glob_find: "Glob",
+            Glob: "Glob",
             find_symbol: "Symbols",
             scout: "Scout",
+            TodoWrite: "Planning next steps",
+            TodoRead: "Read todos",
+            MemoryWrite: "Store",
+            MemoryRead: "Recall",
+            WebFetch: "Fetch",
+            WebSearch: "Search web",
+            semantic_retrieve: "Code search",
         };
         return labels[n] || n;
     }
-    function toolTitle(n) {
-        const titles = {
+    /** Map API/implementation tool names to canonical display names (e.g. read_file → Read). */
+    function normalizedToolName(n) {
+        const map = {
             read_file: "Read",
             write_file: "Write",
             edit_file: "Edit",
+            glob_find: "Glob",
+            run_command: "Bash",
+        };
+        return map[n] || n;
+    }
+    function toolTitle(n) {
+        const titles = {
+            Read: "Read",
+            Write: "Write",
+            Edit: "Edit",
             symbol_edit: "Symbol",
             lint_file: "Lint",
-            run_command: "Run",
-            search: "Search",
+            Bash: "Run",
+            search: "Explored",
             list_directory: "List",
-            glob_find: "Glob",
+            Glob: "Glob",
             find_symbol: "Symbols",
             scout: "Scout",
+            TodoWrite: "Planning next steps",
+            TodoRead: "Read todos",
+            MemoryWrite: "Store",
+            MemoryRead: "Recall",
+            WebFetch: "Fetch",
+            WebSearch: "Search web",
+            semantic_retrieve: "Code search",
         };
         return titles[n] || toolLabel(n);
     }
     function toolDesc(n, i) {
         /* Used for grouping; keep so distinct calls (e.g. different paths) stay in separate groups. */
         switch(n) {
-            case "read_file": return i?.path || "";
-            case "write_file": return i?.path || "";
-            case "edit_file": return i?.path || "";
+            case "Read": return i?.path || "";
+            case "Write": return i?.path || "";
+            case "Edit": return i?.path || "";
             case "symbol_edit": return `${i?.path || ""}::${i?.symbol || ""}`;
             case "lint_file": return i?.path || "";
-            case "run_command": return i?.command || "";
+            case "Bash": return i?.command || "";
             case "search": return `${i?.pattern || ""}@${i?.path || "."}`;
             case "list_directory": return i?.path || ".";
-            case "glob_find": return i?.pattern || "";
+            case "Glob": return i?.pattern || "";
             case "find_symbol": return `${i?.symbol || ""}@${i?.path || "."}`;
             case "scout": return i?.task || "";
+            case "TodoWrite": return (i?.todos?.length ? `${i.todos.length} items` : "") || "";
+            case "TodoRead": return "";
+            case "MemoryWrite": return i?.key || "";
+            case "MemoryRead": return i?.key ? i.key : "all";
+            case "WebFetch": return i?.url || "";
+            case "WebSearch": return i?.query || "";
+            case "semantic_retrieve": return i?.query || "";
             default: return "";
         }
     }
@@ -2087,18 +2292,40 @@
         /* Compact headers: don't show long desc in header; full input is in expanded body. */
         return "";
     }
+    /** Understated link/query for WebFetch/WebSearch in tool header. Returns safe HTML or "". */
+    function webToolLinkHtml(name, input) {
+        if (!input) return "";
+        if (name === "WebFetch" && input.url) {
+            const url = String(input.url).trim();
+            const short = url.length > 52 ? url.slice(0, 49) + "\u2026" : url;
+            return `<span class="tool-link-wrap"><a href="${escapeHtml(url)}" class="tool-link-subtle" target="_blank" rel="noopener noreferrer">${escapeHtml(short)}</a></span>`;
+        }
+        if (name === "WebSearch" && input.query) {
+            const q = String(input.query).trim();
+            const short = q.length > 48 ? q.slice(0, 45) + "\u2026" : q;
+            return `<span class="tool-link-wrap tool-link-query">${escapeHtml(short)}</span>`;
+        }
+        return "";
+    }
     function toolIcon(n, input) {
         // File-based tools → show the file type icon
-        if ((n === "read_file" || n === "write_file" || n === "edit_file" || n === "symbol_edit" || n === "lint_file") && input?.path) {
+        if ((n === "Read" || n === "Write" || n === "Edit" || n === "symbol_edit" || n === "lint_file") && input?.path) {
             return fileTypeIcon(input.path, 14);
         }
         const svgs = {
-            run_command: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`,
+            Bash: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`,
             search: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`,
+            semantic_retrieve: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="10" cy="10" r="7"/><line x1="19" y1="19" x2="15.5" y2="15.5"/><line x1="6" y1="14" x2="14" y2="14"/><line x1="6" y1="17" x2="12" y2="17"/><line x1="6" y1="20" x2="13" y2="20"/></svg>`,
             find_symbol: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16"/><path d="M7 4v3a5 5 0 0 0 10 0V4"/><line x1="12" y1="17" x2="12" y2="21"/><line x1="8" y1="21" x2="16" y2="21"/></svg>`,
             list_directory: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`,
-            glob_find: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><path d="M11 8v6"/><path d="M8 11h6"/></svg>`,
+            Glob: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><path d="M11 8v6"/><path d="M8 11h6"/></svg>`,
             scout: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`,
+            TodoWrite: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2h6v4H9V2z"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M9 10l2 2 4-4"/><path d="M9 14h6M9 18h6"/></svg>`,
+            TodoRead: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`,
+            MemoryWrite: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
+            MemoryRead: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>`,
+            WebFetch: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`,
+            WebSearch: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><path d="M8 11h6"/></svg>`,
         };
         return svgs[n] || `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/></svg>`;
     }
@@ -2113,31 +2340,20 @@
     function showPlan(steps, planFile, planText, skipChecklist) {
         currentPlanSteps = [...steps];
         const bubble = getOrCreateBubble();
-        const block = document.createElement("div"); block.className = "plan-block"; block.id = "active-plan";
+        const block = document.createElement("div"); block.className = "plan-block plan-block--tab"; block.id = "active-plan";
 
-        let html = `<div class="plan-title">\uD83D\uDCCB Plan`;
+        // Compact tab: open plan in editor (no full plan text in panel)
+        let html = `<div class="plan-tab-row">`;
         if (planFile) {
-            html += ` <button class="plan-open-file" title="Open plan file in editor" data-path="${escapeHtml(planFile)}">\uD83D\uDCC4 Open in Editor</button>`;
+            html += `<button type="button" class="plan-open-tab" title="Open plan in editor (injected back for editing)" data-path="${escapeHtml(planFile)}">\uD83D\uDCC4 Open in Editor</button>`;
         }
         html += `</div>`;
-
-        // Show the full plan document if available (rendered as markdown)
-        if (planText && planText.length > 0) {
-            html += `<div class="plan-document">`;
-            html += `<div class="plan-document-content">${renderMarkdown(planText)}</div>`;
-            html += `</div>`;
-        }
 
         block.innerHTML = html;
         block.appendChild(makeCopyBtn(planText || steps.join("\n")));
         bubble.appendChild(block);
 
-        // Highlight code blocks in the plan document
-        block.querySelectorAll(".plan-document pre code").forEach(b => {
-            if (typeof hljs !== "undefined") hljs.highlightElement(b);
-        });
-
-        const openBtn = block.querySelector(".plan-open-file");
+        const openBtn = block.querySelector(".plan-open-tab");
         if (openBtn) {
             openBtn.addEventListener("click", () => {
                 const path = openBtn.dataset.path;
@@ -2210,13 +2426,7 @@
 
     // ── Plan step progress during build ────────────────────────
     function showAgentChecklist(todos, progress) {
-        if (!todos || !Array.isArray(todos) || todos.length === 0) {
-            const el = document.getElementById("agent-checklist");
-            if (el) el.remove();
-            currentChecklistItems = [];
-            return;
-        }
-        currentChecklistItems = [...todos];
+        currentChecklistItems = Array.isArray(todos) ? [...todos] : [];
         const bubble = getOrCreateBubble();
         let block = document.getElementById("agent-checklist");
         if (!block) {
@@ -2230,25 +2440,60 @@
             title += ` \u2014 Step ${progress.stepNum} of ${progress.totalSteps}`;
         }
         let html = `<div class="agent-checklist-title">${title}</div><div class="agent-checklist-list">`;
-        todos.forEach((t) => {
-            const status = (t.status || "pending").toLowerCase();
-            const content = (t.content || "").trim() || "\u2014";
-            const statusCls = status === "completed" ? "done" : status === "in_progress" ? "active" : "pending";
-            const stepNum = t.id != null && /^\d+$/.test(String(t.id)) ? t.id : "";
-            let revertBtn = "";
-            if (status === "completed" && stepNum) {
-                revertBtn = ` <button class="agent-checklist-revert" data-step="${escapeHtml(stepNum)}" title="Revert to after step ${stepNum}">Revert to here</button>`;
-            }
-            html += `<div class="agent-checklist-item agent-checklist-${statusCls}"><span class="agent-checklist-status">${status === "completed" ? "\u2713" : status === "in_progress" ? "\u25B6" : "\u25CB"}</span><span class="agent-checklist-content">${escapeHtml(content)}</span>${revertBtn}</div>`;
-        });
-        html += `</div>`;
+        if (currentChecklistItems.length > 0) {
+            currentChecklistItems.forEach((t) => {
+                const status = (t.status || "pending").toLowerCase();
+                const content = (t.content || "").trim() || "\u2014";
+                const statusCls = status === "completed" ? "done" : status === "in_progress" ? "active" : "pending";
+                const stepNum = t.id != null && /^\d+$/.test(String(t.id)) ? t.id : "";
+                const todoId = t.id != null ? String(t.id) : "";
+                let revertBtn = "";
+                if (status === "completed" && stepNum) {
+                    revertBtn = ` <button class="agent-checklist-revert" data-step="${escapeHtml(stepNum)}" title="Revert to after step ${stepNum}">Revert to here</button>`;
+                }
+                const removeBtn = `<button type="button" class="agent-checklist-remove" data-todo-id="${escapeHtml(todoId)}" title="Remove task" aria-label="Remove">\u00D7</button>`;
+                html += `<div class="agent-checklist-item agent-checklist-${statusCls}"><span class="agent-checklist-status">${status === "completed" ? "\u2713" : status === "in_progress" ? "\u25B6" : "\u25CB"}</span><span class="agent-checklist-content">${escapeHtml(content)}</span>${revertBtn}${removeBtn}</div>`;
+            });
+        } else {
+            html += `<div class="agent-checklist-empty-hint">No tasks yet. Add one below or let the agent create the list.</div>`;
+        }
+        html += `</div>
+            <div class="agent-checklist-add-row">
+                <input type="text" class="agent-checklist-add-input" placeholder="Add a task..." maxlength="500" />
+                <button type="button" class="agent-checklist-add-btn" title="Add task">Add</button>
+            </div>`;
         block.innerHTML = html;
         block.querySelectorAll(".agent-checklist-revert").forEach(btn => {
             const step = parseInt(btn.getAttribute("data-step"), 10);
-            if (!isNaN(step)) btn.addEventListener("click", () => {
-                if (confirm(`Revert all changes back to the end of step ${step}?`)) send({ type: "revert_to_step", step });
-            });
+            if (!isNaN(step) && step >= 1) {
+                btn.addEventListener("click", () => {
+                    if (confirm(`Revert all changes back to the end of step ${step}?`)) {
+                        send({ type: "revert_to_step", step });
+                    }
+                });
+            }
         });
+        block.querySelectorAll(".agent-checklist-remove").forEach(btn => {
+            const id = btn.getAttribute("data-todo-id");
+            if (id != null) {
+                btn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    send({ type: "remove_todo", id });
+                });
+            }
+        });
+        const addInput = block.querySelector(".agent-checklist-add-input");
+        const addBtn = block.querySelector(".agent-checklist-add-btn");
+        function submitAddTask() {
+            const content = (addInput && addInput.value || "").trim();
+            if (!content) return;
+            send({ type: "add_todo", content });
+            if (addInput) addInput.value = "";
+        }
+        if (addBtn) addBtn.addEventListener("click", submitAddTask);
+        if (addInput) {
+            addInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitAddTask(); } });
+        }
         scrollChat();
     }
 
@@ -2289,8 +2534,8 @@
         });
 
         showActionBar([
-            { label: "\u2713 Keep All Changes", cls: "success", onClick: () => { hideActionBar(); send({type:"keep"}); showInfo("\u2713 Changes kept."); clearAllDiffDecorations(); modifiedFiles.clear(); refreshTree(); }},
-            { label: "\u2715 Revert All", cls: "danger", onClick: () => { hideActionBar(); send({type:"revert"}); showInfo("\u21A9 Reverted."); clearAllDiffDecorations(); modifiedFiles.clear(); refreshTree(); reloadAllModifiedFiles(); }},
+            { label: "\u2713 Keep All Changes", cls: "success", onClick: async () => { hideActionBar(); send({type:"keep"}); showInfo("\u2713 Changes kept."); clearAllDiffDecorations(); modifiedFiles.clear(); await refreshTree(); await fetchGitStatus(); if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); }},
+            { label: "\u2715 Revert All", cls: "danger", onClick: async () => { hideActionBar(); send({type:"revert"}); showInfo("\u21A9 Reverted."); clearAllDiffDecorations(); modifiedFiles.clear(); await refreshTree(); await fetchGitStatus(); if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); reloadAllModifiedFiles(); }},
         ]);
         scrollChat();
     }
@@ -2322,22 +2567,31 @@
         $chatMessages.appendChild(div); scrollChat();
     }
 
-    function showClarifyingQuestion(question, context, tool_use_id) {
+    function showClarifyingQuestion(question, context, tool_use_id, options) {
         const wrap = document.createElement("div");
         wrap.className = "clarifying-question-box";
-        wrap.innerHTML = `<div class="clarifying-question-label">\u2753 Agent is asking:</div><div class="clarifying-question-text">${escapeHtml(question)}</div>${context ? `<div class="clarifying-question-context">${escapeHtml(context)}</div>` : ""}<textarea class="clarifying-question-input" rows="2" placeholder="Type your answer..."></textarea><button type="button" class="clarifying-question-send">Send answer</button>`;
+        const optionsHtml = (options && options.length)
+            ? `<div class="clarifying-question-options">${options.map((opt) => `<button type="button" class="clarifying-question-option" data-answer="${escapeHtml(opt)}">${escapeHtml(opt)}</button>`).join("")}</div>`
+            : "";
+        wrap.innerHTML = `<div class="clarifying-question-label">\u2753 Agent is asking:</div><div class="clarifying-question-text">${escapeHtml(question)}</div>${context ? `<div class="clarifying-question-context">${escapeHtml(context)}</div>` : ""}${optionsHtml}<textarea class="clarifying-question-input" rows="2" placeholder="Type your answer..."></textarea><button type="button" class="clarifying-question-send">Send answer</button>`;
         const ta = wrap.querySelector(".clarifying-question-input");
         const btn = wrap.querySelector(".clarifying-question-send");
-        btn.addEventListener("click", () => {
-            const answer = ta.value.trim();
+
+        function submitAnswer(answer) {
             if (!answer) return;
             send({ type: "user_answer", answer: answer, tool_use_id: tool_use_id });
             wrap.classList.add("answered");
-            wrap.querySelector(".clarifying-question-input").style.display = "none";
-            wrap.querySelector(".clarifying-question-send").style.display = "none";
+            wrap.querySelectorAll(".clarifying-question-input, .clarifying-question-send, .clarifying-question-option").forEach((el) => { if (el) el.style.display = "none"; });
+            const optsEl = wrap.querySelector(".clarifying-question-options");
+            if (optsEl) optsEl.style.display = "none";
             const done = document.createElement("div"); done.className = "clarifying-question-done"; done.textContent = "\u2713 Sent: " + (answer.length > 60 ? answer.slice(0, 60) + "..." : answer); wrap.appendChild(done);
+        }
+
+        wrap.querySelectorAll(".clarifying-question-option").forEach((optBtn) => {
+            optBtn.addEventListener("click", () => submitAnswer(optBtn.getAttribute("data-answer") || optBtn.textContent));
         });
-        ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); btn.click(); } });
+        btn.addEventListener("click", () => submitAnswer(ta.value.trim()));
+        ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitAnswer(ta.value.trim()); } });
         $chatMessages.appendChild(wrap);
         scrollChat();
         ta.focus();
@@ -2453,7 +2707,7 @@
             case "init":
                 $modelName.textContent = evt.model_name || "?";
                 currentSessionId = evt.session_id || currentSessionId;
-                $sessionName.textContent = evt.session_name || "default";
+                if ($conversationTitle) $conversationTitle.textContent = evt.session_name || "New conversation";
                 $tokenCount.textContent = formatTokens(evt.total_tokens || 0) + " tokens";
                 $workingDir.textContent = evt.working_directory || "";
                 loadAgentSessions();
@@ -2461,11 +2715,13 @@
                 if (_isFirstConnect) {
                     // First connect: clear chat, load tree fresh
                     $chatMessages.innerHTML = "";
+                    if ($conversationTitle) $conversationTitle.textContent = "New conversation";
                     loadTree();
                 } else {
                     // Reconnect: clear chat before replay rebuilds it,
                     // but don't flash — the reconnect banner covers the gap
                     $chatMessages.innerHTML = "";
+                    if ($conversationTitle) $conversationTitle.textContent = "New conversation";
                     loadTree();
                 }
                 _isFirstConnect = false;
@@ -2566,7 +2822,7 @@
             case "scout_progress": showScoutProgress(evt.content); break;
             case "scout_end": endScout(); break;
             case "phase_start": showPhase(evt.content); break;
-            case "user_question": showClarifyingQuestion(evt.question || "", evt.context || "", evt.tool_use_id || ""); break;
+            case "user_question": showClarifyingQuestion(evt.question || "", evt.context || "", evt.tool_use_id || "", evt.options); break;
             case "phase_end":
                 endPhase(evt.content, evt.elapsed || 0);
                 if (evt.content === "build") markPlanComplete();
@@ -2599,20 +2855,36 @@
                 setRunning(false);
                 if (evt.data) updateTokenDisplay(evt.data);
                 break;
-            case "kept": showInfo("\u2713 Changes kept."); break;
+            case "kept":
+                showInfo("\u2713 Changes kept.");
+                refreshTree();
+                fetchGitStatus().then(() => { if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); });
+                break;
             case "reverted":
                 hideActionBar();
                 clearAllDiffDecorations();
                 modifiedFiles.clear();
                 showInfo("\u21A9 Reverted " + (evt.files || []).length + " file(s).");
                 refreshTree();
+                fetchGitStatus().then(() => { if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); });
                 reloadAllModifiedFiles();
                 break;
             case "clear_keep_revert":
                 hideActionBar();
                 clearAllDiffDecorations();
                 break;
-            case "reverted_to_step": showInfo("\u21A9 Reverted to step " + evt.step + " (" + (evt.files||[]).length + " file(s))"); refreshTree(); break;
+            case "reverted_to_step": {
+                const files = evt.files || [];
+                if (evt.no_checkpoint || (files.length === 0 && evt.step != null)) {
+                    showInfo("No checkpoint for step " + evt.step + " (e.g. after reconnect or step not yet completed).");
+                } else {
+                    showInfo("\u21A9 Reverted to step " + evt.step + " (" + files.length + " file(s))");
+                    reloadAllModifiedFiles(); // refresh open tabs so editor shows reverted content
+                }
+                refreshTree();
+                fetchGitStatus().then(() => { if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); });
+                break;
+            }
             case "plan_rejected": showInfo("Plan rejected."); break;
             case "cancelled":
                 showInfo("Cancelled.");
@@ -2640,7 +2912,7 @@
             case "reset_done":
                 $chatMessages.innerHTML = "";
                 currentSessionId = evt.session_id || currentSessionId;
-                $sessionName.textContent = evt.session_name || "default";
+                if ($conversationTitle) $conversationTitle.textContent = evt.session_name || "New conversation";
                 $tokenCount.textContent = "0 tokens";
                 loadAgentSessions();
                 toolRunById.clear();
@@ -2694,9 +2966,10 @@
                 scrollChat();
                 break;
             case "replay_state":
-                if (evt.todos && evt.todos.length > 0) {
+                if (evt.todos && Array.isArray(evt.todos)) {
                     showAgentChecklist(evt.todos);
-                } else if (evt.pending_plan && evt.pending_plan.length > 0) {
+                }
+                if (evt.pending_plan && evt.pending_plan.length > 0) {
                     currentChecklistItems = evt.pending_plan.map((s, i) => ({ id: String(i + 1), content: s, status: "pending" }));
                     showAgentChecklist(currentChecklistItems);
                 }

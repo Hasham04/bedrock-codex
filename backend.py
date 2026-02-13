@@ -395,18 +395,32 @@ class SSHBackend(Backend):
             "port": port,
             "username": user,
             "timeout": 15,
+            "banner_timeout": 15,
+            "auth_timeout": 20,
+            "compress": True,
         }
         if key_path:
             connect_kwargs["key_filename"] = os.path.expanduser(key_path)
+            connect_kwargs["look_for_keys"] = False
+            connect_kwargs["allow_agent"] = False
+        else:
+            connect_kwargs["look_for_keys"] = True
+            connect_kwargs["allow_agent"] = True
 
         logger.info(f"SSH connecting to {user}@{host}:{port}...")
         self._client.connect(**connect_kwargs)
         self._sftp = self._client.open_sftp()
 
-        # Set keepalive
+        # Keepalive and window/buffer tuning for better throughput
         transport = self._client.get_transport()
         if transport:
             transport.set_keepalive(30)
+            try:
+                transport.window_size = 16 * 1024 * 1024
+                transport.packetizer.REKEY_BYTES = 4 * 1024 * 1024
+                transport.packetizer.REKEY_PACKETS = 4 * 1024 * 1024
+            except Exception:
+                pass
 
         self._active_channel = None  # track running command for cancel
 
@@ -490,15 +504,26 @@ class SSHBackend(Backend):
         logger.warning("SSH connection lost, reconnecting...")
         connect_kwargs: Dict[str, Any] = {
             "hostname": self._host, "port": self._port, "username": self._user,
-            "timeout": 15,
+            "timeout": 15, "banner_timeout": 15, "auth_timeout": 20, "compress": True,
         }
         if self._key_path:
             connect_kwargs["key_filename"] = os.path.expanduser(self._key_path)
+            connect_kwargs["look_for_keys"] = False
+            connect_kwargs["allow_agent"] = False
+        else:
+            connect_kwargs["look_for_keys"] = True
+            connect_kwargs["allow_agent"] = True
         self._client.connect(**connect_kwargs)
         self._sftp = self._client.open_sftp()
         transport = self._client.get_transport()
         if transport:
             transport.set_keepalive(30)
+            try:
+                transport.window_size = 16 * 1024 * 1024
+                transport.packetizer.REKEY_BYTES = 4 * 1024 * 1024
+                transport.packetizer.REKEY_PACKETS = 4 * 1024 * 1024
+            except Exception:
+                pass
         logger.info("SSH reconnected.")
 
     def _exec(self, cmd: str, timeout: int = 30) -> Tuple[str, str, int]:

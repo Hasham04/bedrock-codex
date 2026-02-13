@@ -534,12 +534,18 @@ def _format_size(size: int) -> str:
 
 
 # ============================================================
-# Tool Schemas (Anthropic-compatible)
+# Tool Schemas (Bedrock/Anthropic Messages API)
 # ============================================================
+# Custom tools use type "custom" per Bedrock docs. Bedrock also supports
+# built-in tools (bash_20241022, text_editor_20241022, computer_20241022)
+# with anthropic_beta "computer-use-2024-10-22"; we use custom tools
+# for full control (read_file, edit_file, run_command, etc.).
 
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
+    # SDK name: Read (implementation: read_file)
     {
-        "name": "read_file",
+        "type": "custom",
+        "name": "Read",
         "description": "Read the contents of a file with line numbers. ALWAYS read a file before editing it — understand existing code before suggesting modifications. For large files (>500 lines), returns a structural overview (imports, classes, functions) plus head/tail. Use offset and limit to read specific sections of large files. When you need to read multiple files, request them all in a single turn — they run in parallel.",
         "input_schema": {
             "type": "object",
@@ -551,9 +557,11 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "required": ["path"],
         },
     },
+    # SDK name: Write (implementation: write_file)
     {
-        "name": "write_file",
-        "description": "Create a new file or completely overwrite an existing file. Only use for NEW files or when more than 50% of the file changes. For partial modifications, ALWAYS prefer edit_file instead. After writing, use lint_file to verify no syntax errors were introduced.",
+        "type": "custom",
+        "name": "Write",
+        "description": "Create a new file or completely overwrite an existing file. Only use for NEW files or when more than 50% of the file changes. For partial modifications, ALWAYS prefer Edit instead. After writing, use lint_file to verify no syntax errors were introduced.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -563,8 +571,10 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "required": ["path", "content"],
         },
     },
+    # SDK name: Edit (implementation: edit_file)
     {
-        "name": "edit_file",
+        "type": "custom",
+        "name": "Edit",
         "description": "Make a targeted edit by replacing an exact string in a file. The old_string must match EXACTLY one location, including all whitespace and indentation. Include 3-5 lines of surrounding context to ensure uniqueness. If it fails with 'multiple occurrences', add more context lines. If it fails with 'not found', re-read the file first to see the current content — it may have changed. After editing, use lint_file to verify no errors were introduced.",
         "input_schema": {
             "type": "object",
@@ -577,6 +587,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         },
     },
     {
+        "type": "custom",
         "name": "symbol_edit",
         "description": "Perform a symbol-aware edit of a function/class/type definition block using AST/tree-sitter when available, with regex fallback. Safer than plain string replacement for refactors. Use kind=function|class|all and occurrence to disambiguate.",
         "input_schema": {
@@ -591,8 +602,10 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "required": ["path", "symbol", "new_string"],
         },
     },
+    # SDK name: Bash (implementation: run_command)
     {
-        "name": "run_command",
+        "type": "custom",
+        "name": "Bash",
         "description": "Execute a shell command in the working directory. Use for running tests, installing packages, git operations, builds, linters, and type checkers. Always check both stdout and stderr in the output. Non-zero exit codes indicate failure — diagnose the error rather than retrying blindly. Use timeout for long-running processes.",
         "input_schema": {
             "type": "object",
@@ -603,9 +616,11 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "required": ["command"],
         },
     },
+    # Claude Agent SDK built-in: TodoWrite — same tool name and schema as the SDK.
     {
-        "name": "update_todos",
-        "description": "Create or update the task checklist for this session. Use at the start of multi-step tasks: list items with status pending, then set in_progress when working on one and completed when done. Keeps progress visible and ensures nothing is dropped. Update the list whenever you add or finish items.",
+        "type": "custom",
+        "name": "TodoWrite",
+        "description": "Create or update the task checklist for this session. Use at the start of multi-step tasks: list items with status pending, then set in_progress when working on one and completed when done. Only one task should be in_progress at a time. Replaces the previous list each time. Keeps progress visible and ensures nothing is dropped.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -614,11 +629,11 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Short stable id (e.g. 1, 2, or task-1)"},
                             "content": {"type": "string", "description": "One-line description of the task"},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Current status"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"], "description": "Current status"},
+                            "id": {"type": "string", "description": "Optional stable id (e.g. 1, 2); omit to use index."},
                         },
-                        "required": ["id", "content", "status"],
+                        "required": ["content", "status"],
                     },
                     "description": "Full list of todos; replaces previous list.",
                 },
@@ -626,7 +641,45 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "required": ["todos"],
         },
     },
+    # Claude Agent SDK: TodoRead — get current todo list (handled in agent, not execute_tool).
     {
+        "type": "custom",
+        "name": "TodoRead",
+        "description": "Get the current task checklist for this session. Call at the start of work, before planning next steps, or when unsure what remains. Returns the same list maintained by TodoWrite (id, content, status).",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    # Memory: store and retrieve facts across the conversation (handled in agent).
+    {
+        "type": "custom",
+        "name": "MemoryWrite",
+        "description": "Store a fact or preference for the rest of this session (e.g. 'user prefers TypeScript', 'API base URL is https://api.example.com'). Key should be a short identifier; value can be a string or brief structured fact. Overwrites existing key. Use for user preferences, decisions, or context you want to reuse.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Short identifier for the fact (e.g. 'preferred_language', 'api_base')"},
+                "value": {"type": "string", "description": "The fact or value to store (keep concise; very long values may be truncated)"},
+            },
+            "required": ["key", "value"],
+        },
+    },
+    {
+        "type": "custom",
+        "name": "MemoryRead",
+        "description": "Retrieve one or all stored facts. Call with no key (or key omitted) to get all stored facts; call with key to get a single value. Returns empty or the value(s).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Optional: specific key to read. Omit to return all stored facts."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "type": "custom",
         "name": "semantic_retrieve",
         "description": "Semantic codebase search. Returns the most relevant code chunks (functions, classes) for a natural-language query. Prefer this over search when exploring the codebase or finding where something is implemented (use search for exact string/regex matches). Then use read_file with offset/limit to open only the returned locations.",
         "input_schema": {
@@ -639,6 +692,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         },
     },
     {
+        "type": "custom",
         "name": "search",
         "description": "Regex search (ripgrep) across files. Use when you have an exact string or pattern; for exploring or finding by meaning use semantic_retrieve instead. Returns matching lines with paths and line numbers. Use `include` to filter by file type.",
         "input_schema": {
@@ -652,6 +706,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         },
     },
     {
+        "type": "custom",
         "name": "find_symbol",
         "description": "Symbol-aware navigation helper. Finds symbol definitions and/or references using language-aware patterns across Python/JS/TS and common typed languages. Use this before editing ambiguous symbols with many occurrences.",
         "input_schema": {
@@ -666,6 +721,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         },
     },
     {
+        "type": "custom",
         "name": "list_directory",
         "description": "List files and directories at a given path with file sizes. Good first step to understand project structure before diving into specific files.",
         "input_schema": {
@@ -676,8 +732,10 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "required": [],
         },
     },
+    # SDK name: Glob (implementation: glob_find)
     {
-        "name": "glob_find",
+        "type": "custom",
+        "name": "Glob",
         "description": "Find files matching a glob pattern recursively. Example: '**/*.py' finds all Python files. Useful for discovering files before reading them.",
         "input_schema": {
             "type": "object",
@@ -688,6 +746,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         },
     },
     {
+        "type": "custom",
         "name": "lint_file",
         "description": "Auto-detect the project's linter or type checker and run it on a specific file. Use this after every edit to catch syntax errors, type errors, and style issues before moving on. Returns lint output or confirms no issues found.",
         "input_schema": {
@@ -696,6 +755,32 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "path": {"type": "string", "description": "File path to lint (relative to working directory)"},
             },
             "required": ["path"],
+        },
+    },
+    {
+        "type": "custom",
+        "name": "WebFetch",
+        "description": "Fetch content from a URL (HTTP GET). Use when you need to verify information (e.g. confirm API shape, check docs, validate an error or version) or when the user asks for latest info. Returns plain text; large responses are truncated. Do not use for sensitive or authenticated endpoints.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Full URL to fetch (e.g. https://example.com/docs)"},
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default: 15, max 60)"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "type": "custom",
+        "name": "WebSearch",
+        "description": "Search the web for current information. Use when you need up-to-date docs, error messages, or general lookup. Returns a short list of relevant snippets and links. Prefer WebFetch for a specific known URL.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query (e.g. 'python asyncio timeout best practice')"},
+                "max_results": {"type": "integer", "description": "Max results to return (default 5, max 10)"},
+            },
+            "required": ["query"],
         },
     },
 ]
@@ -728,7 +813,7 @@ def semantic_retrieve(
         k = max(1, min(20, top_k))
         chunks = index.retrieve(query.strip(), top_k=k)
         if not chunks:
-            return ToolResult(success=True, output="No relevant chunks found for this query. Try a different query or use search/read_file.")
+            return ToolResult(success=True, output="No relevant chunks found for this query. Try a different query or use search/Read.")
         lines = [f"Semantic retrieval (top {len(chunks)}):", ""]
         for i, c in enumerate(chunks, 1):
             lines.append(f"--- Result {i}: {c.path}:{c.start_line}-{c.end_line} [{c.kind}] {c.name} ---")
@@ -740,35 +825,127 @@ def semantic_retrieve(
         return ToolResult(success=False, output="", error=str(e))
 
 
+# --- WebFetch: fetch URL content (no backend/working_directory needed) ---
+_WEB_FETCH_MAX_BYTES = 500_000  # ~500KB cap to avoid token explosion
+_WEB_FETCH_DEFAULT_TIMEOUT = 15
+
+
+def web_fetch(url: str, timeout: Optional[int] = None, **kwargs: Any) -> ToolResult:
+    """Fetch content from a URL via HTTP GET. Returns plain text; HTML is stripped roughly."""
+    url = (url or "").strip()
+    if not url:
+        return ToolResult(success=False, output="", error="url is required")
+    if not url.startswith(("http://", "https://")):
+        return ToolResult(success=False, output="", error="url must start with http:// or https://")
+    try:
+        import urllib.request
+        import urllib.error
+        req = urllib.request.Request(url, headers={"User-Agent": "BedrockAgent/1.0"})
+        to = min(60, max(1, timeout or _WEB_FETCH_DEFAULT_TIMEOUT))
+        with urllib.request.urlopen(req, timeout=to) as resp:
+            body = resp.read(_WEB_FETCH_MAX_BYTES + 1)
+            if len(body) > _WEB_FETCH_MAX_BYTES:
+                body = body[:_WEB_FETCH_MAX_BYTES]
+                truncated = True
+            else:
+                truncated = False
+            try:
+                text = body.decode("utf-8", errors="replace")
+            except Exception:
+                text = body.decode("latin-1", errors="replace")
+        # Rough strip of HTML tags for readability
+        text = re.sub(r"<script[^>]*>[\s\S]*?</script>", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"<style[^>]*>[\s\S]*?</style>", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if truncated:
+            text += "\n\n[Content truncated — response was larger than 500KB.]"
+        return ToolResult(success=True, output=text[:100_000], error=None)  # cap output chars too
+    except urllib.error.HTTPError as e:
+        return ToolResult(success=False, output="", error=f"HTTP {e.code}: {e.reason}")
+    except urllib.error.URLError as e:
+        return ToolResult(success=False, output="", error=f"URL error: {e.reason}")
+    except Exception as e:
+        logger.exception("web_fetch failed")
+        return ToolResult(success=False, output="", error=str(e))
+
+
+# --- WebSearch: optional duckduckgo-search ---
+def web_search(query: str, max_results: int = 5, **kwargs: Any) -> ToolResult:
+    """Search the web; uses duckduckgo_search if installed."""
+    query = (query or "").strip()
+    if not query:
+        return ToolResult(success=False, output="", error="query is required")
+    max_results = max(1, min(10, max_results or 5))
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if not results:
+            return ToolResult(success=True, output="No results found for that query.", error=None)
+        lines = [f"Web search: \"{query}\"\n"]
+        for i, r in enumerate(results, 1):
+            title = (r.get("title") or "").strip()
+            href = (r.get("href") or r.get("link") or "").strip()
+            body = (r.get("body") or "").strip()[:400]
+            lines.append(f"{i}. {title}\n   {href}\n   {body}\n")
+        return ToolResult(success=True, output="\n".join(lines), error=None)
+    except ImportError:
+        return ToolResult(
+            success=False,
+            output="",
+            error="Web search requires the duckduckgo-search package. Install with: pip install duckduckgo-search",
+        )
+    except Exception as e:
+        logger.exception("web_search failed")
+        return ToolResult(success=False, output="", error=str(e))
+
+
+# Map API/implementation names to canonical tool names (e.g. read_file → Read)
+TOOL_NAME_NORMALIZE = {
+    "read_file": "Read",
+    "write_file": "Write",
+    "edit_file": "Edit",
+    "glob_find": "Glob",
+    "run_command": "Bash",
+}
+
+
 TOOL_IMPLEMENTATIONS = {
-    "read_file": read_file,
-    "write_file": write_file,
-    "edit_file": edit_file,
+    # SDK names (model calls these)
+    "Read": read_file,
+    "Write": write_file,
+    "Edit": edit_file,
+    "Bash": run_command,
+    "Glob": glob_find,
     "symbol_edit": symbol_edit,
-    "run_command": run_command,
     "search": search,
     "find_symbol": find_symbol,
     "list_directory": list_directory,
-    "glob_find": glob_find,
     "lint_file": lint_file,
     "semantic_retrieve": semantic_retrieve,
+    "WebFetch": web_fetch,
+    "WebSearch": web_search,
 }
 
-TOOLS_REQUIRING_APPROVAL = {"write_file", "edit_file", "symbol_edit", "run_command"}
-SAFE_TOOLS = {"read_file", "search", "find_symbol", "list_directory", "glob_find", "lint_file", "semantic_retrieve"}
+TOOLS_REQUIRING_APPROVAL = {"Write", "Edit", "symbol_edit", "Bash"}
+SAFE_TOOLS = {"Read", "search", "find_symbol", "list_directory", "Glob", "lint_file", "semantic_retrieve", "WebFetch", "WebSearch"}
 SCOUT_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     t for t in TOOL_DEFINITIONS if t["name"] in SAFE_TOOLS
 ]
 
-# Plan-phase only: ask the user a clarifying question (handled by agent via callback, not execute_tool)
+# Claude Agent SDK built-in: AskUserQuestion (we use this name so the model uses the same tool as in the SDK).
+# Handled via callback, not execute_tool; we add options and UI.
 ASK_USER_QUESTION_DEFINITION: Dict[str, Any] = {
-    "name": "ask_user_question",
-    "description": "Ask the user a clarifying question before finalizing the plan. Use when the task is ambiguous: API version, sync vs async, scope, or design choice. The user's answer will be included in context. Do not over-use; only when the answer would materially change the plan.",
+    "type": "custom",
+    "name": "AskUserQuestion",
+    "description": "Ask the user a clarifying question. Use when the task is ambiguous or when verification fails due to something the user explicitly asked for — do not silently override their request; ask them. Optionally provide an 'options' array of short choices so the user can select or type their answer.",
     "input_schema": {
         "type": "object",
         "properties": {
             "question": {"type": "string", "description": "The question to ask the user (clear and concise)"},
             "context": {"type": "string", "description": "Optional: brief context so the user knows why you're asking"},
+            "options": {"type": "array", "items": {"type": "string"}, "description": "Optional: list of choices the user can select (Cursor-style). User can still type a custom answer."},
         },
         "required": ["question"],
     },
@@ -778,6 +955,7 @@ ASK_USER_QUESTION_DEFINITION: Dict[str, Any] = {
 def execute_tool(name: str, inputs: Dict[str, Any], working_directory: str = ".",
                  backend: Optional[Backend] = None) -> ToolResult:
     """Execute a tool by name with the given inputs."""
+    name = TOOL_NAME_NORMALIZE.get(name, name)
     impl = TOOL_IMPLEMENTATIONS.get(name)
     if not impl:
         return ToolResult(success=False, output="", error=f"Unknown tool: {name}")
@@ -792,4 +970,5 @@ def execute_tool(name: str, inputs: Dict[str, Any], working_directory: str = "."
 
 def needs_approval(tool_name: str) -> bool:
     """Check if a tool requires user approval."""
+    tool_name = TOOL_NAME_NORMALIZE.get(tool_name, tool_name)
     return tool_name in TOOLS_REQUIRING_APPROVAL

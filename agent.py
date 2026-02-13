@@ -19,7 +19,10 @@ from dataclasses import dataclass, field
 
 from bedrock_service import BedrockService, GenerationConfig, BedrockError
 from tools import TOOL_DEFINITIONS, SCOUT_TOOL_DEFINITIONS, SAFE_TOOLS, execute_tool, needs_approval, ToolResult, ASK_USER_QUESTION_DEFINITION
-from backend import Backend, LocalBackend
+
+# Tool names for system prompt so the agent always knows what it can call
+AVAILABLE_TOOL_NAMES = ", ".join(t["name"] for t in TOOL_DEFINITIONS)
+SCOUT_TOOL_NAMES = ", ".join(t["name"] for t in SCOUT_TOOL_DEFINITIONS)
 from config import (
     model_config,
     supports_thinking,
@@ -48,7 +51,7 @@ You are not skimming. You are building a mental model of this codebase — how i
 
 <strategy>
 1. **Start smart**: List root. Read manifest files (package.json, pyproject.toml, Cargo.toml, go.mod, requirements.txt, Makefile). Know the stack.
-2. **Use semantic_retrieve for discovery**: To answer "where is X?" or "how does Y work?", call semantic_retrieve with a short natural-language query first; then read_file only the returned chunks. Use search only for exact strings (e.g. known symbol names).
+2. **Use semantic_retrieve for discovery**: To answer "where is X?" or "how does Y work?", call semantic_retrieve with a short natural-language query first; then Read only the returned chunks. Use search only for exact strings (e.g. known symbol names).
 3. **Read with purpose**: Every batch of file reads should answer a specific question. Don't read files just because they exist.
 4. **Batch aggressively**: Read 5-12 files per turn. They execute in parallel. Don't read files one by one.
 5. **Follow the relevant path**: Read the files that will be touched, their imports, and related tests. Understand the data flow end-to-end for THIS task. Don't map the entire codebase.
@@ -87,6 +90,10 @@ After every batch of reads, pause and reflect:
 4. **Am I deep enough?** — Have I just seen the surface, or do I understand the actual implementation? Can I predict how a change in file A would affect file B?
 </how_you_think>
 
+<tools_available>
+Read-only tools in this phase: {scout_tools}. Use only these; names and parameters are in the tool list attached to each request.
+</tools_available>
+
 <working_directory>{working_directory}</working_directory>
 
 Use relative paths. Be thorough — the implementation depends entirely on your understanding."""
@@ -97,6 +104,10 @@ Your plan will be handed to an implementation agent. If your plan is vague, the 
 
 You have READ-ONLY tools. Use them to understand the codebase before writing the plan.
 
+<tools_available>
+Read-only tools in this phase: {scout_tools}. Use only these; names and parameters are in the tool list attached to each request.
+</tools_available>
+
 <planning_process>
 Phase 1 — UNDERSTAND: Read the source files relevant to this task. Be smart about what you read — batch multiple reads per turn, follow imports, read related tests. Read as many files as you need to fully understand the problem. But read with purpose — each batch of reads should answer a specific question, not just "let me see what's in this directory."
 Phase 2 — THINK: What are the constraints? What patterns does this codebase use? What existing code can be reused? What could go wrong? What's the simplest approach that fully solves the problem?
@@ -104,7 +115,7 @@ Phase 3 — WRITE: Once you have enough understanding, produce the complete plan
 
 IMPORTANT: When you feel you've gathered sufficient context, STOP calling tools and write the plan. Don't read "one more file just in case." The key signal is: could you write a precise, actionable plan right now? If yes, stop reading and write it.
 
-If the task is ambiguous (e.g. which API version, sync vs async, scope of the feature), use the ask_user_question tool to ask the user before finalizing the plan. Incorporate their answer into your plan. Ask only when the answer would materially change the plan.
+If the task is ambiguous (e.g. which API version, sync vs async, scope of the feature), use the AskUserQuestion tool to ask the user before finalizing the plan. Incorporate their answer into your plan. Ask only when the answer would materially change the plan.
 </planning_process>
 
 <plan_document_format>
@@ -178,8 +189,8 @@ Your code will be read by other engineers. It will run in production. Write it a
 
 <checklist_workflow>
 When the user or plan gives multiple distinct tasks (e.g. "do X. Also do Y. Then check Z" or bullet points or "in A inject B; now check C at line N"), treat it as a checklist:
-1. **Call update_todos first**: At the start, use the update_todos tool with a full list of items (status pending). Then set the current item to in_progress and the rest to pending. This keeps progress visible and ensures nothing is dropped.
-2. **Work through each in order**: Before tackling each item, set it to in_progress via update_todos. Do the work (read, edit, verify). Then set it to completed and the next to in_progress. Do not skip or merge items unless the user explicitly said to.
+1. **Call TodoWrite first**: At the start, use the TodoWrite tool with a full list of items (status pending). Then set the current item to in_progress and the rest to pending. This keeps progress visible and ensures nothing is dropped.
+2. **Work through each in order**: Before tackling each item, set it to in_progress via TodoWrite. Do the work (read, edit, verify). Then set it to completed and the next to in_progress. Do not skip or merge items unless the user explicitly said to.
 </checklist_workflow>
 
 <execution_principles>
@@ -187,7 +198,7 @@ When the user or plan gives multiple distinct tasks (e.g. "do X. Also do Y. Then
 
 **Meta-patterns (abide by all; see CLAUDE.md § Meta-Patterns for detail):** Systematic skepticism (prove by tracing). Minimal necessary change. State made visible. Fail fast, fail loud. Reversibility. Contract before implementation. Read the room. One level of indirection.
 
-**Actionable:** Follow the plan; adapt when you see a real gap and state why. Read before write — never edit a file you haven't read this session. Surgical precision: symbol_edit for refactors, edit_file with 3–5 lines context, write_file only for new/whole-file. After every edit: re-read changed section, run linter, run tests if present. When a tool or test fails, diagnose root cause before retrying. Match existing conventions; no new patterns/abstractions unless the plan says so. Security: no injection, no path traversal; sanitize user input. Final pass: re-read all modified files, full lint/test, bar = reviewer would approve.
+**Actionable:** Follow the plan; adapt when you see a real gap and state why. Read before write — never edit a file you haven't read this session. Surgical precision: symbol_edit for refactors, Edit with 3–5 lines context, Write only for new/whole-file. After every edit: re-read changed section, run linter, run tests if present. When a tool or test fails, diagnose root cause before retrying. Match existing conventions; no new patterns/abstractions unless the plan says so. Security: no injection, no path traversal; sanitize user input. Final pass: re-read all modified files, full lint/test, bar = reviewer would approve.
 </execution_principles>
 
 <how_you_think>
@@ -207,32 +218,66 @@ Before every batch of tool calls, output 1-2 sentences stating what you will do 
 </plan_next_move>
 
 <tool_strategy>
-**Prefer semantic_retrieve over search when exploring.** Use `semantic_retrieve` (natural-language query) to find where something is implemented or how something works; then `read_file` with offset/limit on the returned chunks. Use `search` when you have an exact string or regex to match (e.g. function name, error message).
+**Choose the tool that best fits the situation.** You have many tools; use context to decide. Don't default to the same tool every time.
 
-- To find where to make a change: `semantic_retrieve` with a short query, or `search` for a known symbol; then targeted `read_file`
-- To check all usages of something you changed: `search` with `include` filter
-- To verify an edit: `read_file` with offset/limit on just the changed section
-- **Batch tool calls**: request multiple reads/searches in one turn — they run in parallel
+**When to use which:**
+- **Multiple steps or discovered work**: TodoWrite. At the start of multi-step work (plan items, checklist, "also do X"), create a full list with TodoWrite and set status as you go. When you discover a bug, a mistake, or a follow-up item during the task, add or update the todo so it's tracked — nothing gets dropped silently.
+- **Information to remember**: MemoryWrite when you learn something critical that should persist (user preferences, key decisions, project facts). MemoryRead when the user asks what you know or when you need stored context before acting.
+- **Uncertainty that changes the approach**: AskUserQuestion when the request is ambiguous and the answer would materially change what you build. Ask once, then proceed with the answer.
+- **Verify or latest info**: WebFetch (known URL) or WebSearch (query) when you need to confirm API behavior, check docs, or resolve ambiguity. Be proactive when the plan or code references external sources.
+- **Finding code**: Prefer semantic_retrieve (natural-language) when exploring or finding "where X is" / "how Y works"; then Read(offset, limit) on returned chunks. Use search only for an exact string or regex (e.g. known symbol, error message). find_symbol for definitions/references before editing ambiguous symbols.
+
+**Tactics:** Batch reads and searches in one turn (they run in parallel). Verify edits with Read on the changed section and lint_file after every edit.
 </tool_strategy>
 
 <tool_usage>
-- `update_todos`: Task checklist. For multi-step work, call at the start with a full list (status pending/in_progress/completed); update as you progress so the list stays visible in context.
-- `semantic_retrieve`: Natural-language codebase search. Use first when exploring or finding "where X is" / "how Y works". Returns relevant chunks with path and line range; then read_file(offset, limit) only those spots.
-- `read_file`: Reads with line numbers. Use `offset` + `limit` to read specific sections of large files instead of the whole file.
-- `edit_file`: old_string must match EXACTLY one location, including all whitespace. Include surrounding lines for uniqueness. If it fails, re-read the file — the content may have changed.
-- `symbol_edit`: Prefer for safer symbol-level refactors. Target symbol name + kind (+ occurrence when needed) instead of brittle regex/string heuristics.
-- `write_file`: Overwrites entirely. Only for new files or when >50% changes. Prefer edit_file.
-- `run_command`: Runs in working directory. Check stdout AND stderr. Non-zero exit = failure.
-- `search`: Regex search (ripgrep). Use when you have an exact string or pattern; do not use for exploration (use semantic_retrieve).
-- `find_symbol`: Symbol-aware search for definitions/references. Use before editing ambiguous symbols or large codebases.
-- `glob_find`: Find files matching a pattern. Use to discover files before reading.
-- `lint_file`: Auto-detects the project linter. Use after every edit.
+- TodoWrite: Multi-step checklist. Create list at start; set in_progress/completed as you go. Add items when you discover bugs or follow-up work so nothing is dropped.
+- MemoryWrite / MemoryRead: Store and recall facts across the conversation. Write when you learn something critical to remember; Read when you need that context.
+- AskUserQuestion: When available, use when ambiguity would materially change your approach. Ask once, then proceed.
+- semantic_retrieve: Natural-language code search. Use first for exploration; then Read(offset, limit) on chunks. Prefer over search when you don't have an exact string.
+- Read: Line-numbered reads. Use offset+limit for large files. Re-read after edits to verify.
+- Edit: old_string must match exactly one location (include 3–5 lines context). If it fails, re-read the file.
+- symbol_edit: Prefer for symbol-level refactors (name + kind). Safer than broad regex.
+- Write: Overwrites entire file. Only for new files or >50% changes. Prefer Edit.
+- Bash: Runs in working directory. Check stdout and stderr; non-zero exit = failure.
+- search: Regex (ripgrep). Use for exact string/pattern only; not for exploration.
+- find_symbol: Definitions/references. Use before editing ambiguous symbols.
+- list_directory: List directory contents. Use to discover structure before reading.
+- Glob: Find files by pattern. Use to discover files before reading.
+- lint_file: After every edit. Auto-detects project linter.
+- WebFetch: Fetch URL content. Use to verify APIs, docs, versions, or when user wants latest info. Prefer when you have the exact URL.
+- WebSearch: Web search for current info. Use when you don't have a URL. Prefer WebFetch when you do.
 </tool_usage>
 
+<tools_available>
+You have the following tools in this session: {available_tools}. Use only these tools; call them by the exact names and parameters defined in the tool list attached to each request. If you need a capability (e.g. web search, run a command), check the tool list — you have it; use it.
+</tools_available>
+
+<grounding>
+**1. Verification & evidence:** Don't claim something is in a file or output unless you just observed it; don't say a command succeeded without checking exit code and stderr. Re-read the changed region (or run lint/tests) after every edit. After each consequential action, check the result before building the next step — the source of truth is the tool's result, not your expectation. When you quote code or output, match what you actually saw; don't paraphrase in a way that changes meaning. If you're not sure you have the latest version of a file, re-read before editing again. Exit code 0 doesn't always mean success; check stderr and the actual outcome. Don't say "it should work" without saying what you're basing that on (e.g. "syntax valid" vs "tests pass").
+**2. Observation vs inference:** When you're not sure, say so; when inferring, say "based on X, I infer Y"; when assuming, say "assuming Z, then …" — don't state assumptions as facts. Only reason from what you have (conversation, file reads, tool results); you don't know the user's screen, local state, or "what they probably meant" unless they said it. "I didn't see X" is not "X is absent" — if you didn't search or read for it, say "I haven't checked for X." State assumptions explicitly (e.g. "assuming you're on Linux"). Don't diagnose "the bug is X" without evidence; say "one possibility is X; we'd need to see Y to confirm." Don't assume standard layout or convention; check this project first.
+**3. Errors & debugging:** When something fails, read the full error (message, file, line, stack). Match the fix to the actual error; don't fix based on one line or a guess. The error message is the primary evidence — start from what it says. Same message can have different causes in different contexts; use file, line, and stack to narrow. The stack line may be the symptom, not the root cause; trace back when needed. Consider multiple plausible causes; don't fix only the first guess.
+**4. Attribution & sources:** Don't attribute "the user said X" unless it's in the conversation; don't attribute "the code does Y" unless you read it. Describe actions in terms of what actually happened; if unsure it applied, say "I applied an edit; please confirm" or re-read and report. Don't say "we added" if the user didn't — say "I added" or "I suggested an edit; you'd need to run it." Don't say "you want X" unless they said it. Don't use past tense for something that only exists in your message — use "I've suggested" or "after you apply this."
+**5. Task & scope:** Done = the user's actual request is satisfied. Match the response to the question (location vs explanation vs fix). If they said "do A and B," do both; don't drop the second part. If the question is vague or could be a symptom, briefly clarify. Don't invent steps (e.g. "then restart the server") unless they're actually required for the change you made.
+**6. Files, paths, locations:** Don't conflate similar names, files, or code — confirm you're in the right file, symbol, branch. Before citing a line number or path, sanity-check it's plausible (file length, path exists). Paths are literal; re-use paths from tool output; don't guess. When a name appears in multiple places, specify which one. "Found at line 10" might not be the definition or the one to change — use context. In large repos, confirm path and purpose before editing. Current directory depends on where the command runs; if it matters, specify. Don't assume encoding or line endings.
+**7. Code & edits:** Before a fix or refactor, mentally run the chain: "If I do A, then B — so I need C"; consider callers, tests, imports. Prefer the smallest change that fixes the issue. When suggesting code, ensure it's self-contained (imports, indentation, no "…" that drops critical logic). Indentation is syntax; get block boundaries correct. Before changing a function or API, consider callers and dependents. After a change, think about related behavior. If you add a new dependency in code, say so and ask before installing. "Rest of function unchanged" only if the rest doesn't depend on what you changed.
+**8. Search & discovery:** The first search result might not be the right one — verify (path, name, quick read) before editing. Empty search doesn't mean "doesn't exist"; note when you're inferring from absence. If a tool returns truncated or "first 10" output, don't conclude "there are only 10." If you only saw one match, don't refer to "the tests" or "all the places." Semantic search is ranked by relevance; verify before editing. Grep/regex: special characters need escaping; if in doubt, test or use a simpler pattern.
+**9. Time, state, sequence:** After you edit, "current" means "after my change" — don't reason using reads from before your last edit. "I wrote it in the last message" doesn't mean it's on disk — distinguish "I suggested an edit" vs "the edit is saved," "I gave a command" vs "you ran it." Don't run or suggest step N before the step that creates what N needs. If something was deferred, note it (todo or "we still need to …"). If something "should have changed" but doesn't, consider cache or refresh.
+**10. Environment & execution:** Don't assume OS, Python version, or env; if it matters, ask or read (config, lockfile, CI). "pip install" might go to different places depending on which Python is active; say "in your active env" or "ensure venv is activated." If the fix is version-sensitive, say so. When debugging config, consider default vs override (env, config file, CLI flag). When you say "run this," give directory and env; when you say "it works," say on what OS/version if it matters. Don't suggest ignoring or regenerating lock files without saying so.
+**11. Names and meaning:** Names can lie — read the code before relying on a name. Re-use the same words the codebase or user uses; don't rename in a way that could refer to something else. "Same" in what way? Don't treat "same" as interchangeable without specifying. One example isn't the pattern — don't claim "all tests look like this" without more evidence.
+**12. Empty, null, missing:** A command with no stdout might have failed or still be running — don't treat absence of output as proof of success or "nothing there." Empty string, empty list, null, and key missing are not the same; match the actual case when reasoning or suggesting checks.
+**13. Communication & clarity:** If they asked yes/no, answer yes/no first. If they asked for a list, give a list. "It" can be ambiguous; prefer repeating the noun. In long messages, be specific ("in the edit above" or "see step 3"). Match the user's level or define terms. When you skip a step (e.g. didn't run tests), say so. If you only fixed one of several places, say "I fixed X; you may also need Y and Z."
+**14. Boundaries:** You don't see their cursor — refer to locations by name, path, or line number you know. Use prior messages: what was already tried, what the user said. You can only suggest; don't say "I've started the server" if you suggested a command they run; don't assume they ran it. You don't know their file tree, process, or clipboard unless they paste it. If the user said "if X, do A; otherwise B," preserve both branches.
+**15. Safety & confirmation:** Before suggesting "run this," consider what it changes. Don't suggest destructive or irreversible actions without flagging them. For delete, overwrite, force push, drop DB: name them and get confirmation. Don't suggest piping curl to bash without warning. Don't put real API keys or passwords in examples; use placeholders. Don't treat "user didn't object" as "user said yes" — for consequential steps, prefer explicit confirmation.
+**16. Parsing instructions:** Read the full instruction and object — don't latch onto one word ("delete") and act ("delete the backup files" ≠ "delete the files"). When the user says "we need to X," clarify who acts or assume you do it and say so.
+**17. Options and choices:** When you have more than one way to proceed and the choice affects the user (environment, workflow), ask what they prefer instead of choosing for them. Use AskUserQuestion when the answer would materially change what you do.
+**18. Persistence:** Your job is to complete the task. When a step fails, read the error, fix what you can, try another approach, retry. Don't stop or report failure because one attempt failed; keep trying until you have no plausible way left.
+</grounding>
+
 <examples>
-**edit_file — Do:** Include 3-5 lines of surrounding context so old_string matches exactly one place.
+**Edit — Do:** Include 3-5 lines of surrounding context so old_string matches exactly one place.
   Do: old_string = "    def handle(self):\\n        return None" with exact indentation and newline.
-**edit_file — Don't:** Don't use a single line or a generic pattern that could match multiple spots.
+**Edit — Don't:** Don't use a single line or a generic pattern that could match multiple spots.
   Don't: old_string = "return None" (multiple occurrences).
 **Code style — Do:** Match the file's existing style: same quotes, same naming, same error-handling pattern.
 **Code style — Don't:** Don't introduce a new pattern (e.g. f-strings) if the file uses .format(); don't add a new dependency the project doesn't use.
@@ -252,12 +297,21 @@ When citing code locations use path:line or path:start-end (e.g. backend.py:165)
 
 <risk_controls>
 Prefer reversible local actions. Before hard-to-reverse/shared-impact actions (e.g. destructive file ops, force push, dropping data), ask for confirmation.
+When you have more than one way to proceed (e.g. use one tool vs another, or install something to enable a different approach), and the choice affects the user's environment or how they work, ask which they prefer instead of assuming.
 Do not bypass safety checks as a shortcut.
 </risk_controls>
+
+<when_tools_fail>
+Your job is to complete the task. Persist until you have exhausted all reasonable ways to do that. When a tool or step fails, read the error, fix what you can (e.g. install a missing dependency, fix a path, correct a command), try a different approach or tool if needed, then retry. Do not stop or report failure because one attempt failed — keep trying alternatives until you have no plausible way left to finish the task.
+</when_tools_fail>
 
 <working_directory>{working_directory}</working_directory>
 
 No preambles. No filler. Implement with precision and care."""
+
+# Format args for build prompt (needs working_directory + available_tools)
+def _format_build_system_prompt(working_directory: str) -> str:
+    return BUILD_SYSTEM_PROMPT.format(working_directory=working_directory, available_tools=AVAILABLE_TOOL_NAMES)
 
 # System prompt used in direct mode (no plan phase)
 AGENT_SYSTEM_PROMPT = """You are an expert software engineer and a thoughtful problem solver. You combine deep technical skill with good judgment about what to build and how to build it.
@@ -283,8 +337,13 @@ You care about quality. Not gold-plating — but genuine quality. Code that work
 - **Minimal, complete changes**: Do exactly what's needed — no more, no less. Don't refactor unrelated code. Don't add unnecessary abstractions. But DO handle the edge cases that matter.
 - **Security matters**: No injection vulnerabilities. Sanitize user input at boundaries. Don't log secrets.
 - **When things break, diagnose**: If a tool call fails, understand why. Don't retry blindly. Read the error, think about the cause, fix the root problem.
+- **Recognize when you have options**: You have tools; from them you can see different ways to complete a task (e.g. use web search vs install a package that does the same). When the choice affects the user — e.g. changes their environment or commits them to a path — ask what they prefer instead of choosing for them.
 - **Batch when possible**: When you need multiple files, read them all in one turn.
 </principles>
+
+<when_tools_fail>
+Your job is to complete the task. Persist until you have exhausted all reasonable ways to do that. When a tool or step fails, read the error, fix what you can (e.g. install a missing dependency, fix a path, correct a command), try a different approach or tool if needed, then retry. Do not stop or report failure because one attempt failed — keep trying alternatives until you have no plausible way left to finish the task.
+</when_tools_fail>
 
 <how_you_think>
 After every action (reading a file, running a command, making an edit), pause and reflect before your next move:
@@ -303,31 +362,65 @@ Before every batch of tool calls, output 1-2 sentences stating your next move(s)
 </plan_next_move>
 
 <tool_strategy>
-**Prefer semantic_retrieve over search when exploring.** Semantic search finds code by meaning (e.g. "where is auth validated"); use it first, then `read_file` with offset/limit on the returned chunks. Use `search` only when you have an exact string or regex (e.g. known symbol, error message). Don't read whole large files to find one function.
+**Choose the tool that best fits the situation.** You have many tools; use context to decide. Don't default to the same tool every time.
 
-- To find where something is implemented or how it works: `semantic_retrieve` with a short natural-language query, then `read_file` on the chunks
-- To find a known symbol name or exact string: `search` (or `find_symbol` for definitions/references), then targeted `read_file`
-- To find all usages of something you changed: `search` with `include` filter
-- Small file (<200 lines): `read_file` with no offset. Large file: structural overview then targeted reads.
-- **Batch reads**: request multiple files/sections in one turn — they run in parallel
+**When to use which:**
+- **Multiple steps or discovered work**: TodoWrite. For multi-step tasks, create a full list at the start and set status as you go. When you discover a bug, a mistake, or a follow-up item, add or update the todo so it's tracked — nothing gets dropped silently.
+- **Information to remember**: MemoryWrite when you learn something critical that should persist (user preferences, key decisions, project facts). MemoryRead when the user asks what you know or when you need stored context before acting.
+- **Uncertainty that changes the approach**: AskUserQuestion (when available) when the request is ambiguous and the answer would materially change what you build. Ask once, then proceed with the answer.
+- **Verify or latest info**: WebFetch (known URL) or WebSearch (query) when you need to confirm API behavior, check docs, or resolve ambiguity. Be proactive when the task references external sources.
+- **Finding code**: Prefer semantic_retrieve (natural-language) when exploring or finding "where X" / "how Y works"; then Read(offset, limit) on returned chunks. Use search only for an exact string or regex. find_symbol for definitions/references before editing ambiguous symbols.
+
+**Tactics:** Batch reads and searches in one turn (they run in parallel). Small files: Read with no offset. Large files: structural overview then targeted reads. lint_file after every edit.
 </tool_strategy>
 
 <tool_usage>
-- `update_todos`: Task checklist. For multi-step tasks, call at the start with a full list; set status to in_progress/completed as you go. Keeps progress visible.
-- `semantic_retrieve`: Semantic codebase search by meaning. Use first when exploring or finding "where X" / "how Y"; then read_file(offset, limit) on returned chunks. Prefer over search when you don't have an exact string.
-- `read_file`: Reads with line numbers. For large files (>500 lines), returns structural overview. Use `offset` + `limit` to read specific sections.
-- `edit_file`: old_string must match exactly one location, including whitespace. Include 3-5 surrounding lines. If "not found", re-read the file.
-- `write_file`: Overwrites entirely. Use only for new files or major rewrites. Prefer edit_file.
-- `run_command`: Runs in working directory. Check stdout and stderr. Non-zero exit = failure.
-- `search`: Regex (ripgrep). Use only for exact string/regex; do not use for exploration (use semantic_retrieve).
-- `find_symbol`: Symbol-aware definitions/references. Use before editing ambiguous symbols.
-- `glob_find`: Find files by pattern (e.g. `**/*.test.ts`).
-- `lint_file`: Auto-detects project linter. Use after every edit.
+- TodoWrite: Multi-step checklist. Create list at start; set in_progress/completed as you go. Add items when you discover bugs or follow-up work so nothing is dropped.
+- MemoryWrite / MemoryRead: Store and recall facts across the conversation. Write when you learn something critical to remember; Read when you need that context.
+- AskUserQuestion: When available, use when ambiguity would materially change your approach. Ask once, then proceed.
+- semantic_retrieve: Natural-language code search. Use first for exploration; then Read(offset, limit) on chunks. Prefer over search when you don't have an exact string.
+- Read: Line-numbered reads. offset+limit for large files. Re-read after edits to verify.
+- Edit: old_string must match exactly one location (include 3–5 lines context). If "not found", re-read the file.
+- symbol_edit: Prefer for symbol-level refactors (name + kind). Safer than broad regex.
+- Write: Overwrites entire file. Only for new files or major rewrites. Prefer Edit.
+- Bash: Runs in working directory. Check stdout and stderr; non-zero exit = failure.
+- search: Regex (ripgrep). Use for exact string/pattern only; not for exploration.
+- find_symbol: Definitions/references. Use before editing ambiguous symbols.
+- list_directory: List directory contents. Use to discover structure before reading.
+- Glob: Find files by pattern (e.g. **/*.test.ts).
+- lint_file: After every edit. Auto-detects project linter.
+- WebFetch: Fetch URL content. Use to verify APIs, docs, versions, or when user wants latest info. Prefer when you have the exact URL.
+- WebSearch: Web search for current info. Use when you don't have a URL. Prefer WebFetch when you do.
 </tool_usage>
 
+<tools_available>
+You have the following tools in this session: {available_tools}. Use only these tools; call them by the exact names and parameters defined in the tool list attached to each request. If you need a capability (e.g. web search, run a command), check the tool list — you have it; use it.
+</tools_available>
+
+<grounding>
+**1. Verification & evidence:** Don't claim something is in a file or output unless you just observed it; don't say a command succeeded without checking exit code and stderr. Re-read the changed region (or run lint/tests) after every edit. After each consequential action, check the result before building the next step — the source of truth is the tool's result, not your expectation. When you quote code or output, match what you actually saw; don't paraphrase in a way that changes meaning. If you're not sure you have the latest version of a file, re-read before editing again. Exit code 0 doesn't always mean success; check stderr and the actual outcome. Don't say "it should work" without saying what you're basing that on (e.g. "syntax valid" vs "tests pass").
+**2. Observation vs inference:** When you're not sure, say so; when inferring, say "based on X, I infer Y"; when assuming, say "assuming Z, then …" — don't state assumptions as facts. Only reason from what you have (conversation, file reads, tool results); you don't know the user's screen, local state, or "what they probably meant" unless they said it. "I didn't see X" is not "X is absent" — if you didn't search or read for it, say "I haven't checked for X." State assumptions explicitly (e.g. "assuming you're on Linux"). Don't diagnose "the bug is X" without evidence; say "one possibility is X; we'd need to see Y to confirm." Don't assume standard layout or convention; check this project first.
+**3. Errors & debugging:** When something fails, read the full error (message, file, line, stack). Match the fix to the actual error; don't fix based on one line or a guess. The error message is the primary evidence — start from what it says. Same message can have different causes in different contexts; use file, line, and stack to narrow. The stack line may be the symptom, not the root cause; trace back when needed. Consider multiple plausible causes; don't fix only the first guess.
+**4. Attribution & sources:** Don't attribute "the user said X" unless it's in the conversation; don't attribute "the code does Y" unless you read it. Describe actions in terms of what actually happened; if unsure it applied, say "I applied an edit; please confirm" or re-read and report. Don't say "we added" if the user didn't — say "I added" or "I suggested an edit; you'd need to run it." Don't say "you want X" unless they said it. Don't use past tense for something that only exists in your message — use "I've suggested" or "after you apply this."
+**5. Task & scope:** Done = the user's actual request is satisfied. Match the response to the question (location vs explanation vs fix). If they said "do A and B," do both; don't drop the second part. If the question is vague or could be a symptom, briefly clarify. Don't invent steps (e.g. "then restart the server") unless they're actually required for the change you made.
+**6. Files, paths, locations:** Don't conflate similar names, files, or code — confirm you're in the right file, symbol, branch. Before citing a line number or path, sanity-check it's plausible (file length, path exists). Paths are literal; re-use paths from tool output; don't guess. When a name appears in multiple places, specify which one. "Found at line 10" might not be the definition or the one to change — use context. In large repos, confirm path and purpose before editing. Current directory depends on where the command runs; if it matters, specify. Don't assume encoding or line endings.
+**7. Code & edits:** Before a fix or refactor, mentally run the chain: "If I do A, then B — so I need C"; consider callers, tests, imports. Prefer the smallest change that fixes the issue. When suggesting code, ensure it's self-contained (imports, indentation, no "…" that drops critical logic). Indentation is syntax; get block boundaries correct. Before changing a function or API, consider callers and dependents. After a change, think about related behavior. If you add a new dependency in code, say so and ask before installing. "Rest of function unchanged" only if the rest doesn't depend on what you changed.
+**8. Search & discovery:** The first search result might not be the right one — verify (path, name, quick read) before editing. Empty search doesn't mean "doesn't exist"; note when you're inferring from absence. If a tool returns truncated or "first 10" output, don't conclude "there are only 10." If you only saw one match, don't refer to "the tests" or "all the places." Semantic search is ranked by relevance; verify before editing. Grep/regex: special characters need escaping; if in doubt, test or use a simpler pattern.
+**9. Time, state, sequence:** After you edit, "current" means "after my change" — don't reason using reads from before your last edit. "I wrote it in the last message" doesn't mean it's on disk — distinguish "I suggested an edit" vs "the edit is saved," "I gave a command" vs "you ran it." Don't run or suggest step N before the step that creates what N needs. If something was deferred, note it (todo or "we still need to …"). If something "should have changed" but doesn't, consider cache or refresh.
+**10. Environment & execution:** Don't assume OS, Python version, or env; if it matters, ask or read (config, lockfile, CI). "pip install" might go to different places depending on which Python is active; say "in your active env" or "ensure venv is activated." If the fix is version-sensitive, say so. When debugging config, consider default vs override (env, config file, CLI flag). When you say "run this," give directory and env; when you say "it works," say on what OS/version if it matters. Don't suggest ignoring or regenerating lock files without saying so.
+**11. Names and meaning:** Names can lie — read the code before relying on a name. Re-use the same words the codebase or user uses; don't rename in a way that could refer to something else. "Same" in what way? Don't treat "same" as interchangeable without specifying. One example isn't the pattern — don't claim "all tests look like this" without more evidence.
+**12. Empty, null, missing:** A command with no stdout might have failed or still be running — don't treat absence of output as proof of success or "nothing there." Empty string, empty list, null, and key missing are not the same; match the actual case when reasoning or suggesting checks.
+**13. Communication & clarity:** If they asked yes/no, answer yes/no first. If they asked for a list, give a list. "It" can be ambiguous; prefer repeating the noun. In long messages, be specific ("in the edit above" or "see step 3"). Match the user's level or define terms. When you skip a step (e.g. didn't run tests), say so. If you only fixed one of several places, say "I fixed X; you may also need Y and Z."
+**14. Boundaries:** You don't see their cursor — refer to locations by name, path, or line number you know. Use prior messages: what was already tried, what the user said. You can only suggest; don't say "I've started the server" if you suggested a command they run; don't assume they ran it. You don't know their file tree, process, or clipboard unless they paste it. If the user said "if X, do A; otherwise B," preserve both branches.
+**15. Safety & confirmation:** Before suggesting "run this," consider what it changes. Don't suggest destructive or irreversible actions without flagging them. For delete, overwrite, force push, drop DB: name them and get confirmation. Don't suggest piping curl to bash without warning. Don't put real API keys or passwords in examples; use placeholders. Don't treat "user didn't object" as "user said yes" — for consequential steps, prefer explicit confirmation.
+**16. Parsing instructions:** Read the full instruction and object — don't latch onto one word ("delete") and act ("delete the backup files" ≠ "delete the files"). When the user says "we need to X," clarify who acts or assume you do it and say so.
+**17. Options and choices:** When you have more than one way to proceed and the choice affects the user (environment, workflow), ask what they prefer instead of choosing for them. Use AskUserQuestion when the answer would materially change what you do.
+**18. Persistence:** Your job is to complete the task. When a step fails, read the error, fix what you can, try another approach, retry. Don't stop or report failure because one attempt failed; keep trying until you have no plausible way left.
+</grounding>
+
 <examples>
-**edit_file — Do:** Include 3-5 lines of context so old_string matches exactly one location. Copy indentation and newlines from the file.
-**edit_file — Don't:** Don't use a single line that could match multiple places; don't guess whitespace — re-read the file first.
+**Edit — Do:** Include 3-5 lines of context so old_string matches exactly one location. Copy indentation and newlines from the file.
+**Edit — Don't:** Don't use a single line that could match multiple places; don't guess whitespace — re-read the file first.
 **Code — Do:** Match existing style (naming, error handling, imports). Your change should look like the same author wrote it.
 **Code — Don't:** Don't refactor unrelated code; don't add new dependencies or patterns the codebase doesn't use.
 </examples>
@@ -540,7 +633,7 @@ class CodingAgent:
         self._backend_id = (f"ssh:{getattr(self.backend, '_host', '')}:{self.working_directory}" if is_ssh else "local")
         self.max_iterations = max_iterations
         self.history: List[Dict[str, Any]] = []
-        self.system_prompt = AGENT_SYSTEM_PROMPT.format(working_directory=self.working_directory)
+        self.system_prompt = AGENT_SYSTEM_PROMPT.format(working_directory=self.working_directory, available_tools=AVAILABLE_TOOL_NAMES)
         self._cancelled = False
         self._current_plan: Optional[List[str]] = None  # plan steps from last plan phase
         self._scout_context: Optional[str] = None  # cached scout context for reuse across phases
@@ -575,6 +668,7 @@ class CodingAgent:
         # In-memory cache of learned failure patterns
         self._failure_pattern_cache: Optional[List[Dict[str, Any]]] = None
         self._todos: List[Dict[str, Any]] = []
+        self._memory: Dict[str, str] = {}  # key -> value for MemoryWrite/MemoryRead
 
     @property
     def total_tokens(self) -> int:
@@ -620,6 +714,7 @@ class CodingAgent:
         self._plan_text = ""
         self._failure_pattern_cache = None
         self._todos = []
+        self._memory = {}
 
     def _file_cache_key(self, path: str) -> str:
         """Return cache key for path (backend_id + resolved path so SSH and local never collide)."""
@@ -679,7 +774,8 @@ class CodingAgent:
 
     def revert_to_step(self, step_num: int) -> List[str]:
         """Revert all files to the state captured at a given plan step checkpoint.
-        Returns list of reverted file paths."""
+        Returns list of reverted file paths. If checkpoint content is None (file
+        was missing or unreadable at capture), removes the file if it exists now."""
         if step_num not in self._step_checkpoints:
             return []
         checkpoint = self._step_checkpoints[step_num]
@@ -689,6 +785,11 @@ class CodingAgent:
                 if content is not None:
                     self.backend.write_file(abs_path, content)
                     reverted.append(abs_path)
+                else:
+                    # File was missing/unreadable at capture — remove if present (restore "did not exist")
+                    if self.backend.file_exists(abs_path):
+                        self.backend.remove_file(abs_path)
+                        reverted.append(abs_path)
             except Exception as e:
                 logger.warning(f"Failed to revert {abs_path} to step {step_num}: {e}")
         # Remove checkpoints after this step
@@ -900,7 +1001,7 @@ class CodingAgent:
         if learned:
             prompt += "\n\n<known_failure_patterns>\n" + learned + "\n</known_failure_patterns>"
         if self._todos:
-            lines = ["<current_todos>", "Your task checklist (update with update_todos as you progress):"]
+            lines = ["<current_todos>", "Your task checklist (update with TodoWrite as you progress):"]
             for t in self._todos:
                 s = t.get("status", "pending")
                 c = (t.get("content") or "").strip()
@@ -999,14 +1100,14 @@ class CodingAgent:
             return PolicyDecision()
 
         # File path protections
-        if tool_name in ("write_file", "edit_file", "symbol_edit"):
+        if tool_name in ("Write", "Edit", "symbol_edit"):
             path = (tool_input.get("path", "") or "").lower()
             protected = (".env", "credentials", "secret", "id_rsa", ".pem", "token")
             if any(tok in path for tok in protected):
                 return PolicyDecision(require_approval=True, reason="Sensitive file path requires explicit approval.")
 
         # Command protections
-        if tool_name == "run_command":
+        if tool_name == "Bash":
             cmd = (tool_input.get("command", "") or "").strip().lower()
             destructive_patterns = [
                 "rm -rf",
@@ -1225,7 +1326,7 @@ class CodingAgent:
     def _snapshot_file(self, tool_name: str, tool_input: Dict[str, Any]) -> None:
         """Capture the original content of a file before it's modified.
         Only snapshots once per file per build run — first write wins."""
-        if tool_name not in ("write_file", "edit_file", "symbol_edit"):
+        if tool_name not in ("Write", "Edit", "symbol_edit"):
             return
 
         rel_path = tool_input.get("path", "")
@@ -1271,9 +1372,9 @@ class CodingAgent:
 
     def _approval_key(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
         """Return a hashable key that uniquely identifies an operation for approval purposes."""
-        if tool_name == "run_command":
+        if tool_name == "Bash":
             return f"cmd:{tool_input.get('command', '')}"
-        elif tool_name in ("write_file", "edit_file", "symbol_edit"):
+        elif tool_name in ("Write", "Edit", "symbol_edit"):
             path = tool_input.get("path", "")
             resolved = self.backend.resolve_path(path)
             return f"{tool_name}:{self._backend_id}:{resolved}"
@@ -1322,6 +1423,21 @@ class CodingAgent:
                 "files": files,
             })
 
+        # Step checkpoints for "Revert to here" — same size rules, cap to last 15 steps
+        step_checkpoints_ser: Dict[str, Dict[str, Optional[str]]] = {}
+        for step_num, cp_files in sorted(self._step_checkpoints.items(), reverse=True)[:15]:
+            files_ser: Dict[str, Optional[str]] = {}
+            for path, content in (cp_files or {}).items():
+                if content is None:
+                    files_ser[path] = None
+                elif len(content) < 1_000_000:
+                    try:
+                        content.encode("utf-8")
+                        files_ser[path] = content
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        pass
+            step_checkpoints_ser[str(step_num)] = files_ser
+
         return {
             "history": self.history,
             "token_usage": {
@@ -1340,9 +1456,11 @@ class CodingAgent:
             "file_snapshots": snapshots,
             "session_checkpoints": checkpoints,
             "checkpoint_counter": self._checkpoint_counter,
+            "step_checkpoints": step_checkpoints_ser,
             "plan_step_index": self._plan_step_index,
             "deterministic_verification_done": self._deterministic_verification_done,
             "todos": list(self._todos),
+            "memory": dict(self._memory),
         }
 
     def from_dict(self, data: Dict[str, Any]) -> None:
@@ -1350,8 +1468,8 @@ class CodingAgent:
         known = {
             "history", "token_usage", "approved_commands", "running_summary", "current_plan",
             "current_plan_decomposition", "plan_file_path", "plan_text", "scout_context",
-            "file_snapshots", "session_checkpoints", "checkpoint_counter", "plan_step_index",
-            "deterministic_verification_done", "todos",
+            "file_snapshots", "session_checkpoints", "checkpoint_counter", "step_checkpoints",
+            "plan_step_index", "deterministic_verification_done", "todos", "memory",
         }
         unknown = set(data) - known
         if unknown:
@@ -1372,6 +1490,8 @@ class CodingAgent:
         self._plan_step_index = data.get("plan_step_index", 0)
         self._deterministic_verification_done = data.get("deterministic_verification_done", False)
         self._todos = list(data.get("todos", []))
+        raw_memory = data.get("memory", {})
+        self._memory = dict(raw_memory) if isinstance(raw_memory, dict) else {}
         self._cancelled = False
         # Restore file snapshots
         raw_snapshots = data.get("file_snapshots", {})
@@ -1398,6 +1518,19 @@ class CodingAgent:
         else:
             self._session_checkpoints = []
         self._checkpoint_counter = int(data.get("checkpoint_counter", 0) or 0)
+        # Restore step checkpoints for "Revert to here" after reconnect
+        raw_step_cps = data.get("step_checkpoints", {})
+        if isinstance(raw_step_cps, dict):
+            self._step_checkpoints = {}
+            for k, v in raw_step_cps.items():
+                try:
+                    step_num = int(k)
+                    if step_num >= 1 and isinstance(v, dict):
+                        self._step_checkpoints[step_num] = dict(v)
+                except (ValueError, TypeError):
+                    pass
+        else:
+            self._step_checkpoints = {}
 
     def _default_config(self) -> GenerationConfig:
         """Create default generation config. Use at least the model's default max_tokens so we never hit 'ran out of tokens'."""
@@ -1473,7 +1606,7 @@ class CodingAgent:
 
         lines = text.split("\n")
 
-        if tool_name == "read_file":
+        if tool_name == "Read":
             if is_hot:
                 # Hot file (recently edited) — keep generous context
                 if len(lines) > 60:
@@ -1519,7 +1652,7 @@ class CodingAgent:
                 return "\n".join(lines[:15] + [f"  ... ({len(lines) - 15} more matches) ..."])
 
         # For command output: keep first + last
-        if tool_name == "run_command":
+        if tool_name == "Bash":
             if len(lines) > 30:
                 return "\n".join(
                     lines[:12]
@@ -1528,7 +1661,7 @@ class CodingAgent:
                 )
 
         # For directory listings: keep entries
-        if tool_name in ("list_directory", "glob_find"):
+        if tool_name in ("list_directory", "Glob"):
             if len(lines) > 40:
                 return "\n".join(lines[:30] + [f"  ... ({len(lines) - 30} more entries) ..."])
 
@@ -1616,11 +1749,11 @@ class CodingAgent:
                 if btype == "tool_use":
                     name = block.get("name", "")
                     inp = block.get("input", {})
-                    if name == "read_file":
+                    if name == "Read":
                         files_read.append(inp.get("path", "?"))
-                    elif name in ("write_file", "edit_file", "symbol_edit"):
+                    elif name in ("Write", "Edit", "symbol_edit"):
                         files_edited.append(inp.get("path", "?"))
-                    elif name == "run_command":
+                    elif name == "Bash":
                         commands_run.append(inp.get("command", "?")[:80])
                     elif name == "search":
                         actions.append(f"searched for '{inp.get('pattern', '?')}'")
@@ -1972,7 +2105,7 @@ class CodingAgent:
 
     def _cap_tool_results(self, tool_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Microcompaction: cap tool result content at ingestion so context stays manageable.
-        Enterprise-grade: large outputs are head/tail + explicit instruction to use read_file with offset/limit for full content."""
+        Enterprise-grade: large outputs are head/tail + explicit instruction to use Read with offset/limit for full content."""
         cap = self._adaptive_result_cap()
         capped = []
         for result in tool_results:
@@ -1985,13 +2118,13 @@ class CodingAgent:
                     head = "\n".join(lines[:head_n])
                     tail = "\n".join(lines[-tail_n:])
                     text = (
-                        "[Large output — excerpt below. Use read_file with offset/limit for full content.]\n\n"
+                        "[Large output — excerpt below. Use Read with offset/limit for full content.]\n\n"
                         + head
                         + f"\n\n... ({len(lines) - head_n - tail_n} lines omitted) ...\n\n"
                         + tail
                     )
                 else:
-                    text = text[:cap - 200] + "\n... (truncated; use read_file with offset/limit for full content) ..."
+                    text = text[:cap - 200] + "\n... (truncated; use Read with offset/limit for full content) ..."
                 if len(text) > cap:
                     text = text[:cap] + "\n... (excerpt capped) ..."
                 capped.append({**result, "content": text})
@@ -2018,7 +2151,7 @@ class CodingAgent:
 
         await on_event(AgentEvent(type="scout_start", content="Scouting codebase..."))
 
-        scout_system = SCOUT_SYSTEM_PROMPT.format(working_directory=self.working_directory)
+        scout_system = SCOUT_SYSTEM_PROMPT.format(working_directory=self.working_directory, scout_tools=SCOUT_TOOL_NAMES)
         scout_config = GenerationConfig(
             max_tokens=8192,
             enable_thinking=False,
@@ -2221,7 +2354,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                 task_for_plan = refined
 
         # Build the planning prompt
-        plan_system = PLAN_SYSTEM_PROMPT.format(working_directory=self.working_directory)
+        plan_system = PLAN_SYSTEM_PROMPT.format(working_directory=self.working_directory, scout_tools=SCOUT_TOOL_NAMES)
         plan_user = task_for_plan
         if scout_context:
             plan_user = (
@@ -2396,12 +2529,12 @@ Keep the whole response under 300 words. If the request is already very clear an
                     break
 
                 # Split into clarifying questions (need user) vs read-only tools
-                question_calls = [tu for tu in tool_uses if tu.get("name") == "ask_user_question"]
-                other_calls = [tu for tu in tool_uses if tu.get("name") != "ask_user_question"]
+                question_calls = [tu for tu in tool_uses if tu.get("name") == "AskUserQuestion"]
+                other_calls = [tu for tu in tool_uses if tu.get("name") != "AskUserQuestion"]
 
                 tool_results = []
 
-                # Handle ask_user_question via callback (Cursor-style clarifying questions)
+                # Handle AskUserQuestion via callback (Cursor-style clarifying questions)
                 for tu in question_calls:
                     inp = tu.get("input", {})
                     question = inp.get("question", "")
@@ -2416,15 +2549,15 @@ Keep the whole response under 300 words. If the request is already very clear an
                                 "content": text_r,
                                 "is_error": False,
                             })
-                            await on_event(AgentEvent(type="tool_result", content=text_r[:200], data={"id": tu["id"], "name": "ask_user_question", "success": True}))
+                            await on_event(AgentEvent(type="tool_result", content=text_r[:200], data={"id": tu["id"], "name": "AskUserQuestion", "success": True}))
                         except Exception as e:
                             text_r = f"Clarification failed or skipped: {e}"
                             tool_results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": text_r, "is_error": True})
-                            await on_event(AgentEvent(type="tool_result", content=text_r, data={"id": tu["id"], "name": "ask_user_question", "success": False}))
+                            await on_event(AgentEvent(type="tool_result", content=text_r, data={"id": tu["id"], "name": "AskUserQuestion", "success": False}))
                     else:
                         text_r = "Clarification not available; proceed with your best assumption."
                         tool_results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": text_r, "is_error": False})
-                        await on_event(AgentEvent(type="tool_result", content=text_r, data={"id": tu["id"], "name": "ask_user_question", "success": True}))
+                        await on_event(AgentEvent(type="tool_result", content=text_r, data={"id": tu["id"], "name": "AskUserQuestion", "success": True}))
 
                 # Execute read-only tools in parallel
                 async def _exec_plan_tool(tu):
@@ -2719,6 +2852,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         request_approval: Callable[[str, str, Dict], Awaitable[bool]],
         config: Optional[GenerationConfig] = None,
         user_images: Optional[List[Dict[str, Any]]] = None,
+        request_question_answer: Optional[Callable[..., Awaitable[str]]] = None,
     ):
         """
         Execute a previously approved plan. This is the build phase.
@@ -2734,7 +2868,7 @@ Keep the whole response under 300 words. If the request is already very clear an
 
         # Switch to the build-specific system prompt for plan execution
         saved_prompt = self.system_prompt
-        self.system_prompt = BUILD_SYSTEM_PROMPT.format(working_directory=self.working_directory)
+        self.system_prompt = _format_build_system_prompt(self.working_directory)
 
         # Build the user message with the approved plan and scout context
         plan_block = "\n".join(plan_steps)
@@ -2759,7 +2893,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         parts.append(task)
         parts.append(
             "Execute this plan step by step.\n\n"
-            "Before touching files, call update_todos with a full list of plan items (status pending), then set the first to in_progress.\n"
+            "Before touching files, call TodoWrite with a full list of plan items (status pending), then set the first to in_progress. You can call TodoRead anytime to see the current task list.\n"
             "Work through them in order; set each to completed and the next to in_progress as you go.\n\n"
             "For each step:\n"
             "1. State which step you are working on (e.g. 'Step 3: ...')\n"
@@ -2799,11 +2933,11 @@ Keep the whole response under 300 words. If the request is already very clear an
         # Add to history
         self.history.append({"role": "user", "content": user_content})
 
-        # Run the main agent loop
-        await self._agent_loop(on_event, request_approval, config)
+        # Run the main agent loop (build can ask user when verification conflicts with user request)
+        await self._agent_loop(on_event, request_approval, config, request_question_answer=request_question_answer)
 
         # Post-build verification pass
-        await self._run_post_build_verification(on_event, request_approval, config)
+        await self._run_post_build_verification(on_event, request_approval, config, request_question_answer=request_question_answer)
 
         # Restore the general-purpose system prompt
         self.system_prompt = saved_prompt
@@ -2815,6 +2949,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         on_event: Callable[[AgentEvent], Awaitable[None]],
         request_approval: Callable[[str, str, Dict], Awaitable[bool]],
         config: Optional[GenerationConfig] = None,
+        request_question_answer: Optional[Callable[..., Awaitable[str]]] = None,
     ):
         """Run a final verification pass after the build loop completes.
         Injects a verification reminder and runs one more loop iteration
@@ -2856,7 +2991,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         # Run one more iteration of the loop for verification
         saved_max = self.max_iterations
         self.max_iterations = saved_max + 20  # give headroom for verify loop
-        await self._agent_loop(on_event, request_approval, config)
+        await self._agent_loop(on_event, request_approval, config, request_question_answer=request_question_answer)
         self.max_iterations = saved_max
 
     # ------------------------------------------------------------------
@@ -3059,7 +3194,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                 test_result = await loop.run_in_executor(
                     None,
                     lambda: execute_tool(
-                        "run_command",
+                        "Bash",
                         {"command": cmd, "timeout": 180},
                         self.working_directory,
                         backend=self.backend,
@@ -3071,7 +3206,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                     type="tool_result",
                     content=test_text,
                     data={
-                        "tool_name": "run_command",
+                        "tool_name": "Bash",
                         "tool_use_id": "deterministic-tests",
                         "success": test_result.success,
                         "deterministic_gate": True,
@@ -3085,7 +3220,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                 full_result = await loop.run_in_executor(
                     None,
                     lambda: execute_tool(
-                        "run_command",
+                        "Bash",
                         {"command": full_cmd, "timeout": 300},
                         self.working_directory,
                         backend=self.backend,
@@ -3097,7 +3232,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                     type="tool_result",
                     content=full_text,
                     data={
-                        "tool_name": "run_command",
+                        "tool_name": "Bash",
                         "tool_use_id": "deterministic-tests-full",
                         "success": full_result.success,
                         "deterministic_gate": True,
@@ -3112,7 +3247,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                 run_result = await loop.run_in_executor(
                     None,
                     lambda c=cmd: execute_tool(
-                        "run_command",
+                        "Bash",
                         {"command": c, "timeout": 240},
                         self.working_directory,
                         backend=self.backend,
@@ -3124,7 +3259,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                     type="tool_result",
                     content=out,
                     data={
-                        "tool_name": "run_command",
+                        "tool_name": "Bash",
                         "tool_use_id": f"verification-orchestrator-{idx}",
                         "success": run_result.success,
                         "deterministic_gate": True,
@@ -3150,6 +3285,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         on_event: Callable[[AgentEvent], Awaitable[None]],
         request_approval: Callable[[str, str, Dict], Awaitable[bool]],
         config: Optional[GenerationConfig] = None,
+        request_question_answer: Optional[Callable[..., Awaitable[str]]] = None,
     ):
         """Core streaming agent loop with tool execution."""
         if app_config.codebase_index_enabled and hasattr(self.service, "embed_texts"):
@@ -3224,6 +3360,8 @@ Keep the whole response under 300 words. If the request is already very clear an
 
                     chunk_queue: queue.Queue = queue.Queue()
 
+                    build_tools = (TOOL_DEFINITIONS + [ASK_USER_QUESTION_DEFINITION]) if request_question_answer else TOOL_DEFINITIONS
+
                     def _stream_producer():
                         """Run the sync generator in a background thread, forwarding chunks to the queue."""
                         try:
@@ -3232,7 +3370,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                                 system_prompt=self._effective_system_prompt(self.system_prompt),
                                 model_id=None,
                                 config=gen_config,
-                                tools=TOOL_DEFINITIONS,
+                                tools=build_tools,
                             ):
                                 chunk_queue.put(c)
                             chunk_queue.put(None)  # sentinel: stream complete
@@ -3532,7 +3670,12 @@ Keep the whole response under 300 words. If the request is already very clear an
                             "role": "user",
                             "content": (
                                 "[SYSTEM] Deterministic verification gate failed. "
-                                "Fix all issues below before finishing:\n\n"
+                                "Fix all issues below before finishing.\n\n"
+                                "If the failure is due to something the user explicitly asked for (not your mistake), "
+                                "do not silently revert or override their request. Use AskUserQuestion to explain "
+                                "the conflict and offer the user clear choices via the 'options' array so they can "
+                                "select or type their preference. Only fix by changing code when the failure is due "
+                                "to your own error.\n\n"
                                 + gate_summary
                             ),
                         })
@@ -3568,7 +3711,7 @@ Keep the whole response under 300 words. If the request is already very clear an
 
             # Execute tools — parallel when possible
             tool_results = await self._execute_tools_parallel(
-                tool_uses, on_event, request_approval
+                tool_uses, on_event, request_approval, request_question_answer=request_question_answer
             )
             reasoning_trace_repairs = 0
 
@@ -3579,13 +3722,13 @@ Keep the whole response under 300 words. If the request is already very clear an
             # append a system hint reminding the model to verify its changes.
             write_tools_used = {
                 tu.get("name") for tu in tool_uses
-                if tu.get("name") in ("edit_file", "write_file", "symbol_edit")
+                if tu.get("name") in ("Edit", "Write", "symbol_edit")
             }
             if write_tools_used:
                 modified_files = [
                     tu.get("input", {}).get("path", "?")
                     for tu in tool_uses
-                    if tu.get("name") in ("edit_file", "write_file", "symbol_edit")
+                    if tu.get("name") in ("Edit", "Write", "symbol_edit")
                 ]
                 files_str = ", ".join(modified_files)
                 verify_hint = {
@@ -3612,6 +3755,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         tool_uses: List[Dict[str, Any]],
         on_event: Callable[[AgentEvent], Awaitable[None]],
         request_approval: Callable[[str, str, Dict], Awaitable[bool]],
+        request_question_answer: Optional[Callable[..., Awaitable[str]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Execute a batch of tool calls, running safe (read-only) tools in parallel
@@ -3623,11 +3767,21 @@ Keep the whole response under 300 words. If the request is already very clear an
         results_by_id: Dict[str, Dict[str, Any]] = {}
 
         original_tool_uses = tool_uses
-        todo_calls = [tu for tu in tool_uses if tu.get("name") == "update_todos"]
-        rest_calls = [tu for tu in tool_uses if tu.get("name") != "update_todos"]
+        _special_tools = ("TodoWrite", "TodoRead", "MemoryWrite", "MemoryRead", "AskUserQuestion")
+        todo_calls = [tu for tu in tool_uses if tu.get("name") == "TodoWrite"]
+        todo_read_calls = [tu for tu in tool_uses if tu.get("name") == "TodoRead"]
+        memory_calls = [tu for tu in tool_uses if tu.get("name") in ("MemoryWrite", "MemoryRead")]
+        ask_calls = [tu for tu in tool_uses if tu.get("name") == "AskUserQuestion"]
+        rest_calls = [tu for tu in tool_uses if tu.get("name") not in _special_tools]
+
         for tu in todo_calls:
             inp = tu.get("input") or {}
-            self._todos = list(inp.get("todos") or [])
+            raw = list(inp.get("todos") or [])
+            # Normalize to { id, content, status } for our UI/persistence (SDK schema uses content, status; id optional)
+            self._todos = [
+                {"id": t.get("id") or str(i), "content": t.get("content", ""), "status": t.get("status", "pending")}
+                for i, t in enumerate(raw, 1)
+            ]
             lines = [f"Todos updated ({len(self._todos)} items)."]
             for t in self._todos:
                 lines.append(f"  [{t.get('status', 'pending')}] {t.get('content', '')}")
@@ -3641,9 +3795,100 @@ Keep the whole response under 300 words. If the request is already very clear an
             await on_event(AgentEvent(
                 type="tool_result",
                 content=content,
-                data={"tool_name": "update_todos", "tool_use_id": tu["id"], "success": True},
+                data={"tool_name": "TodoWrite", "tool_use_id": tu["id"], "success": True},
             ))
             await on_event(AgentEvent(type="todos_updated", content="", data={"todos": list(self._todos)}))
+
+        for tu in todo_read_calls:
+            # Return current todos as JSON for the model (same shape as TodoWrite: id, content, status)
+            todos_list = list(self._todos)
+            if not todos_list:
+                content = "No todos yet. Use TodoWrite to create a task list."
+            else:
+                content = json.dumps(todos_list, indent=2)
+            results_by_id[tu["id"]] = {
+                "type": "tool_result",
+                "tool_use_id": tu["id"],
+                "content": content,
+                "is_error": False,
+            }
+            await on_event(AgentEvent(
+                type="tool_result",
+                content=content,
+                data={"tool_name": "TodoRead", "tool_use_id": tu["id"], "success": True},
+            ))
+
+        _MEMORY_VALUE_CAP = 10_000  # chars per value to avoid abuse
+
+        for tu in memory_calls:
+            inp = tu.get("input") or {}
+            name = tu.get("name", "")
+            if name == "MemoryWrite":
+                key = (inp.get("key") or "").strip()
+                if not key:
+                    content = "Error: key is required and cannot be empty."
+                    is_err = True
+                else:
+                    value = inp.get("value", "")
+                    if isinstance(value, str):
+                        pass
+                    else:
+                        value = json.dumps(value) if value is not None else ""
+                    value = (value or "")[: _MEMORY_VALUE_CAP]
+                    self._memory[key] = value
+                    content = f"Stored key '{key}'."
+                    is_err = False
+            else:
+                # MemoryRead
+                key = (inp.get("key") or "").strip()
+                if key:
+                    val = self._memory.get(key)
+                    if val is None:
+                        content = f"No value stored for key '{key}'."
+                    else:
+                        content = val
+                    is_err = False
+                else:
+                    if not self._memory:
+                        content = "No facts stored yet. Use MemoryWrite to store key-value facts."
+                    else:
+                        lines = [f"{k}: {v}" for k, v in sorted(self._memory.items())]
+                        content = "\n".join(lines)
+                    is_err = False
+            results_by_id[tu["id"]] = {
+                "type": "tool_result",
+                "tool_use_id": tu["id"],
+                "content": content,
+                "is_error": is_err,
+            }
+            await on_event(AgentEvent(
+                type="tool_result",
+                content=content,
+                data={"tool_name": name, "tool_use_id": tu["id"], "success": not is_err},
+            ))
+
+        for tu in ask_calls:
+            inp = tu.get("input") or {}
+            question = inp.get("question") or ""
+            context = inp.get("context") or ""
+            options = inp.get("options")
+            if isinstance(options, list):
+                options = [str(o) for o in options]
+            else:
+                options = None
+            if request_question_answer:
+                try:
+                    answer = await request_question_answer(question, context, tu["id"], options=options)
+                except Exception as e:
+                    answer = f"Error asking user: {e}"
+            else:
+                answer = "No question callback; proceeding with best assumption."
+            results_by_id[tu["id"]] = {
+                "type": "tool_result",
+                "tool_use_id": tu["id"],
+                "content": answer,
+                "is_error": False,
+            }
 
         tool_uses = rest_calls
 
@@ -3654,7 +3899,7 @@ Keep the whole response under 300 words. If the request is already very clear an
 
             if not app_config.live_command_streaming:
                 return await loop.run_in_executor(
-                    None, lambda: execute_tool("run_command", tool_input, self.working_directory, backend=self.backend)
+                    None, lambda: execute_tool("Bash", tool_input, self.working_directory, backend=self.backend)
                 )
 
             partial_sent = {"value": False}
@@ -3744,8 +3989,8 @@ Keep the whole response under 300 words. If the request is already very clear an
                 name = tu["name"]
                 inp = tu["input"]
 
-                # File cache: return cached content for read_file if file hasn't been modified
-                if name == "read_file" and not inp.get("offset") and not inp.get("limit"):
+                # File cache: return cached content for Read if file hasn't been modified
+                if name == "Read" and not inp.get("offset") and not inp.get("limit"):
                     path = inp.get("path", "")
                     cache_key = self._file_cache_key(path)
 
@@ -3766,7 +4011,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                 )
 
                 # Cache successful full-file reads
-                if name == "read_file" and result.success and not inp.get("offset") and not inp.get("limit"):
+                if name == "Read" and result.success and not inp.get("offset") and not inp.get("limit"):
                     path = inp.get("path", "")
                     cache_key = self._file_cache_key(path)
                     self._file_cache[cache_key] = (result.output, time.time())
@@ -3805,11 +4050,11 @@ Keep the whole response under 300 words. If the request is already very clear an
         if dangerous_calls:
             file_write_calls = [
                 tu for tu in dangerous_calls
-                if tu["name"] in ("write_file", "edit_file", "symbol_edit")
+                if tu["name"] in ("Write", "Edit", "symbol_edit")
             ]
             command_calls = [
                 tu for tu in dangerous_calls
-                if tu["name"] not in ("write_file", "edit_file", "symbol_edit")
+                if tu["name"] not in ("Write", "Edit", "symbol_edit")
             ]
 
             # Policy engine + explicit approvals for risky file writes
@@ -3898,16 +4143,16 @@ Keep the whole response under 300 words. If the request is already very clear an
                         )
 
                         # ── Auto-retry on edit failure ──
-                        # If edit_file failed with "not found" or "multiple occurrences",
+                        # If Edit failed with "not found" or "multiple occurrences",
                         # re-read the file and include content in the error for immediate retry
-                        if not result.success and tu["name"] == "edit_file":
+                        if not result.success and tu["name"] == "Edit":
                             err = result.error or ""
                             if "not found" in err.lower() or "occurrences" in err.lower():
                                 path = tu["input"].get("path", "")
                                 try:
                                     fresh = await loop.run_in_executor(
                                         None, lambda: execute_tool(
-                                            "read_file", {"path": path},
+                                            "Read", {"path": path},
                                             self.working_directory, backend=self.backend,
                                         )
                                     )
@@ -3930,7 +4175,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                                     pass  # fall through with original error
 
                         # ── Auto-lint after successful edit ──
-                        if result.success and tu["name"] in ("edit_file", "write_file", "symbol_edit"):
+                        if result.success and tu["name"] in ("Edit", "Write", "symbol_edit"):
                             path = tu["input"].get("path", "")
                             try:
                                 lint_result = await loop.run_in_executor(
@@ -4090,8 +4335,8 @@ Keep the whole response under 300 words. If the request is already very clear an
 
                     self.remember_approval(tool_name, tool_input)
 
-                # Emit command_start for run_command so the UI shows "running"
-                if tool_name == "run_command":
+                # Emit command_start for Bash so the UI shows "running"
+                if tool_name == "Bash":
                     await on_event(AgentEvent(
                         type="command_start",
                         content=tool_input.get("command", "?"),
@@ -4111,7 +4356,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                     ))
 
                 cmd_start = time.time()
-                if tool_name == "run_command":
+                if tool_name == "Bash":
                     result = await _run_command_with_streaming(tool_id, tool_input)
                 else:
                     result = await loop.run_in_executor(
@@ -4126,9 +4371,9 @@ Keep the whole response under 300 words. If the request is already very clear an
                     last_cp = self._session_checkpoints[-1].get("id", "latest")
                     result_text += f"\n\n[checkpoint] You can rewind with checkpoint id: {last_cp}"
 
-                # Extract exit code from run_command output
+                # Extract exit code from Bash output
                 exit_code = None
-                if tool_name == "run_command":
+                if tool_name == "Bash":
                     ec_match = re.search(r"\[exit code: (\d+)\]", result_text)
                     if ec_match:
                         exit_code = int(ec_match.group(1))
@@ -4166,18 +4411,18 @@ Keep the whole response under 300 words. If the request is already very clear an
 
     def _format_tool_description(self, name: str, inputs: Dict) -> str:
         """Format a human-readable description of a tool call for approval"""
-        if name == "write_file":
+        if name == "Write":
             content = inputs.get("content", "")
             line_count = content.count("\n") + 1
             return f"Write {line_count} lines to {inputs.get('path', '?')}"
-        elif name == "edit_file":
+        elif name == "Edit":
             return f"Edit {inputs.get('path', '?')}: replace string"
         elif name == "symbol_edit":
             return (
                 f"Symbol edit {inputs.get('path', '?')}: "
                 f"{inputs.get('symbol', '?')} ({inputs.get('kind', 'all')})"
             )
-        elif name == "run_command":
+        elif name == "Bash":
             return f"Run: {inputs.get('command', '?')}"
         elif name == "plan_review":
             step_count = len(inputs.get("plan_steps", []) or [])

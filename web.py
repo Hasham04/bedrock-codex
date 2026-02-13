@@ -986,6 +986,87 @@ async def api_git_file_diff(path: str = Query(...)):
     return {"path": path, "original": original, "current": current}
 
 
+def _parse_git_diff_numstat(stdout: str) -> List[Dict[str, Any]]:
+    """Parse 'git diff --numstat' output. Returns list of {path, additions, deletions}."""
+    rows = []
+    for line in (stdout or "").strip().splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 3:
+            continue
+        add_s, del_s, path = parts[0], parts[1], parts[2].strip()
+        path = path.replace("\\", "/").strip().rstrip("/")
+        if not path:
+            continue
+        try:
+            additions = int(add_s) if add_s != "-" else 0
+            deletions = int(del_s) if del_s != "-" else 0
+        except ValueError:
+            additions = deletions = 0
+        rows.append({"path": path, "additions": additions, "deletions": deletions})
+    return rows
+
+
+@app.get("/api/git-diff-stats")
+async def api_git_diff_stats():
+    """Return per-file and total diff stats (additions/deletions) for working tree vs HEAD.
+    Used by the Cursor-style modified files dropdown."""
+    global _backend
+    if _backend is None:
+        return {"files": [], "total_additions": 0, "total_deletions": 0}
+    wd = _backend.working_directory
+    files: List[Dict[str, Any]] = []
+    total_additions = 0
+    total_deletions = 0
+    try:
+        if getattr(_backend, "_host", None) is not None:
+            out, err, rc = await asyncio.to_thread(
+                _backend.run_command, "git diff --numstat", ".", 15
+            )
+            if rc != 0 or not out:
+                # Include untracked (e.g. new files) via status + diff
+                out2, _, _ = await asyncio.to_thread(
+                    _backend.run_command, "git status --porcelain", ".", 10
+                )
+                for line in (out2 or "").strip().splitlines():
+                    path = line[2:].lstrip().replace("\\", "/").strip()
+                    if path and " -> " not in path:
+                        files.append({"path": path, "additions": 0, "deletions": 0})
+            else:
+                files = _parse_git_diff_numstat(out)
+        else:
+            import subprocess
+            r = subprocess.run(
+                ["git", "diff", "--numstat"],
+                cwd=wd,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if r.returncode == 0 and r.stdout:
+                files = _parse_git_diff_numstat(r.stdout)
+            else:
+                # Fallback: list from status so we at least show modified paths
+                r2 = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=wd,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if r2.returncode == 0 and r2.stdout:
+                    for line in r2.stdout.strip().splitlines():
+                        if len(line) >= 3:
+                            path = line[2:].lstrip().split(" -> ")[-1].strip().replace("\\", "/")
+                            if path:
+                                files.append({"path": path, "additions": 0, "deletions": 0})
+        for f in files:
+            total_additions += f.get("additions", 0)
+            total_deletions += f.get("deletions", 0)
+    except Exception:
+        pass
+    return {"files": files[:100], "total_additions": total_additions, "total_deletions": total_deletions}
+
+
 # ------------------------------------------------------------------
 # File diff (agent snapshots)
 # ------------------------------------------------------------------
@@ -1206,6 +1287,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 "file_snapshots": state.get("file_snapshots", {}),
                 "plan_step_index": state.get("plan_step_index", 0),
                 "todos": state.get("todos", []),
+                "memory": state.get("memory", {}),
                 # UI state for reconnection
                 "awaiting_build": awaiting_build,
                 "awaiting_keep_revert": awaiting_keep_revert,
@@ -1227,9 +1309,11 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
     pending_plan: Optional[List[str]] = _restored_ui_state.get("pending_plan")
     pending_images: List[Dict[str, Any]] = list(_restored_ui_state.get("pending_images") or [])
     awaiting_build: bool = bool(_restored_ui_state.get("awaiting_build"))
-    awaiting_keep_revert: bool = bool(
-        _restored_ui_state.get("awaiting_keep_revert")
-        or agent._file_snapshots  # if snapshots exist, user hasn't kept/reverted
+    # Only show Keep/Revert if we have pending snapshots and user hasn't already resolved (Keep/Revert).
+    # If we saved awaiting_keep_revert=False (user clicked Keep/Revert), never show the bar again.
+    awaiting_keep_revert: bool = (
+        bool(agent._file_snapshots)
+        and _restored_ui_state.get("awaiting_keep_revert") is not False
     )
     task_start: Optional[float] = None
     _last_save_time: float = time.time()
@@ -1589,16 +1673,25 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         # State for Cursor-style clarifying questions (plan phase asks user, we wait for answer)
         _pending_question = {"future": None, "tool_use_id": None}
 
-        async def _request_question_answer(question: str, context: Optional[str], tool_use_id: str) -> str:
+        async def _request_question_answer(
+            question: str,
+            context: Optional[str],
+            tool_use_id: str,
+            *,
+            options: Optional[List[str]] = None,
+        ) -> str:
             _pending_question["future"] = asyncio.get_event_loop().create_future()
             _pending_question["tool_use_id"] = tool_use_id
             try:
-                await ws.send_json({
+                payload = {
                     "type": "user_question",
                     "question": question,
                     "context": context or "",
                     "tool_use_id": tool_use_id,
-                })
+                }
+                if options:
+                    payload["options"] = options
+                await ws.send_json(payload)
                 return await asyncio.wait_for(_pending_question["future"], timeout=300.0)  # 5 min max
             finally:
                 _pending_question["future"] = None
@@ -1688,6 +1781,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     on_event=on_event,
                     request_approval=dummy_approval,
                     user_images=task_images or [],
+                    request_question_answer=_request_question_answer,
                 )
                 if agent._cancelled:
                     return
@@ -1695,6 +1789,13 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 elapsed = round(time.time() - task_start, 1)
                 await ws.send_json({"type": "phase_end", "content": "build", "elapsed": elapsed})
                 await ws.send_json({"type": "done"})
+
+                # Show diff and Keep/Revert bar if build modified files
+                if agent.modified_files:
+                    awaiting_keep_revert = True
+                    diffs = generate_diffs()
+                    if diffs:
+                        await ws.send_json({"type": "diff", "files": diffs})
             except asyncio.CancelledError:
                 return
             except Exception as exc:
@@ -1825,7 +1926,17 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
             # ── Revert to specific plan step ──────────────────────
             if msg_type == "revert_to_step":
-                step = data.get("step", 0)
+                try:
+                    step = int(data.get("step", 0) or 0)
+                except (TypeError, ValueError):
+                    step = 0
+                if step < 1:
+                    await ws.send_json({
+                        "type": "error",
+                        "content": "Invalid step for revert (must be at least 1).",
+                    })
+                    continue
+                had_checkpoint = step in getattr(agent, "_step_checkpoints", {})
                 reverted = agent.revert_to_step(step)
                 reverted_rel = [os.path.relpath(p, wd) for p in reverted]
                 feedback = f"[System] The user reverted to step {step}. The following files were reverted: "
@@ -1838,7 +1949,36 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     "type": "reverted_to_step",
                     "step": step,
                     "files": reverted_rel,
+                    "no_checkpoint": not had_checkpoint and len(reverted_rel) == 0,
                 })
+                continue
+
+            # ── Add todo (user adds a task in real time; agent sees it on next TodoRead) ───
+            if msg_type == "add_todo":
+                content = (data.get("content") or "").strip()
+                if content:
+                    existing_ids = []
+                    for t in agent._todos:
+                        tid = t.get("id")
+                        if isinstance(tid, int):
+                            existing_ids.append(tid)
+                        elif isinstance(tid, str) and tid.isdigit():
+                            existing_ids.append(int(tid))
+                    next_id = str(max(existing_ids, default=0) + 1)
+                    agent._todos.append({"id": next_id, "content": content, "status": "pending"})
+                    save_session()
+                    await ws.send_json({"type": "todos_updated", "todos": list(agent._todos)})
+                continue
+
+            # ── Remove todo (user removes a task; agent sees updated list on next TodoRead) ───
+            if msg_type == "remove_todo":
+                todo_id = data.get("id")
+                if todo_id is not None:
+                    before = len(agent._todos)
+                    agent._todos = [t for t in agent._todos if str(t.get("id")) != str(todo_id)]
+                    if len(agent._todos) != before:
+                        save_session()
+                    await ws.send_json({"type": "todos_updated", "todos": list(agent._todos)})
                 continue
 
             # ── Build (approve plan) ───────────────────────────────
