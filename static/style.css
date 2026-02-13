@@ -1430,6 +1430,39 @@ body { display: flex; flex-direction: column; }
     border-radius: 999px;
 }
 
+/* ── Agent task checklist (from update_todos tool) ───────────── */
+.agent-checklist-block {
+    background: var(--bg-primary);
+    border: 1px solid rgba(100, 180, 255, 0.2);
+    border-radius: var(--radius);
+    padding: 10px;
+    margin: 4px 0;
+}
+.agent-checklist-title {
+    font-size: 13px; font-weight: 600; color: var(--accent);
+    margin-bottom: 8px;
+}
+.agent-checklist-list { display: flex; flex-direction: column; gap: 4px; }
+.agent-checklist-item {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; color: var(--text-secondary);
+    padding: 4px 0;
+}
+.agent-checklist-status {
+    flex-shrink: 0; width: 18px; text-align: center;
+    color: var(--text-muted);
+}
+.agent-checklist-item.agent-checklist-done .agent-checklist-status { color: var(--green); }
+.agent-checklist-item.agent-checklist-active .agent-checklist-status { color: var(--accent); font-weight: 600; }
+.agent-checklist-item.agent-checklist-active .agent-checklist-content { color: var(--text-primary); }
+.agent-checklist-content { flex: 1; }
+.agent-checklist-revert {
+    font-size: 10px; padding: 2px 6px; margin-left: 6px;
+    background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    color: var(--text-muted); cursor: pointer;
+}
+.agent-checklist-revert:hover { color: var(--text-primary); border-color: var(--accent); }
+
 /* ── Plan View (editable) ──────────────────────────────────── */
 .plan-block {
     background: var(--bg-primary);

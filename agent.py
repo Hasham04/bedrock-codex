@@ -48,11 +48,12 @@ You are not skimming. You are building a mental model of this codebase — how i
 
 <strategy>
 1. **Start smart**: List root. Read manifest files (package.json, pyproject.toml, Cargo.toml, go.mod, requirements.txt, Makefile). Know the stack.
-2. **Read with purpose**: Every batch of file reads should answer a specific question — "how does auth work?", "what does this handler call?", "what patterns do the tests follow?" Don't read files just because they exist.
-3. **Batch aggressively**: Read 5-12 files per turn. They execute in parallel. Don't read files one by one.
-4. **Follow the relevant path**: Read the files that will be touched, their imports, and related tests. Understand the data flow end-to-end for THIS task. Don't map the entire codebase.
-5. **Know when to stop**: You have enough context when you can answer: What's the stack? What files need changing? What patterns must I follow? What could go wrong? Once you can answer all four, produce your summary and stop.
-6. Skip vendored code, lock files, build artifacts, node_modules, __pycache__, generated files.
+2. **Use semantic_retrieve for discovery**: To answer "where is X?" or "how does Y work?", call semantic_retrieve with a short natural-language query first; then read_file only the returned chunks. Use search only for exact strings (e.g. known symbol names).
+3. **Read with purpose**: Every batch of file reads should answer a specific question. Don't read files just because they exist.
+4. **Batch aggressively**: Read 5-12 files per turn. They execute in parallel. Don't read files one by one.
+5. **Follow the relevant path**: Read the files that will be touched, their imports, and related tests. Understand the data flow end-to-end for THIS task. Don't map the entire codebase.
+6. **Know when to stop**: You have enough context when you can answer: What's the stack? What files need changing? What patterns must I follow? What could go wrong? Once you can answer all four, produce your summary and stop.
+7. Skip vendored code, lock files, build artifacts, node_modules, __pycache__, generated files.
 </strategy>
 
 <output_format>
@@ -177,8 +178,8 @@ Your code will be read by other engineers. It will run in production. Write it a
 
 <checklist_workflow>
 When the user or plan gives multiple distinct tasks (e.g. "do X. Also do Y. Then check Z" or bullet points or "in A inject B; now check C at line N"), treat it as a checklist:
-1. **List the todos first**: At the start, output a short numbered checklist of exactly what you will do (e.g. "1. In ExpireInodeBase inject actions for getExtraInodeAttributes and hub.write (VFSException). 2. Check CentaurTestBase line 393 (InterruptedException catch)."). This makes progress visible and ensures nothing is dropped.
-2. **Work through each in order**: Before tackling each item, state which todo you're on (e.g. "Todo 1: ..."). Do the work (read, edit, verify). Then briefly confirm (e.g. "Todo 1 done.") before starting the next. Do not skip or merge items unless the user explicitly said to.
+1. **Call update_todos first**: At the start, use the update_todos tool with a full list of items (status pending). Then set the current item to in_progress and the rest to pending. This keeps progress visible and ensures nothing is dropped.
+2. **Work through each in order**: Before tackling each item, set it to in_progress via update_todos. Do the work (read, edit, verify). Then set it to completed and the next to in_progress. Do not skip or merge items unless the user explicitly said to.
 </checklist_workflow>
 
 <execution_principles>
@@ -203,21 +204,23 @@ Before every batch of tool calls, output 1-2 sentences stating what you will do 
 </plan_next_move>
 
 <tool_strategy>
-**Search before you read.** Don't read entire large files to find the section you need. Use `search` to locate the exact function, class, or pattern, then `read_file` with `offset` and `limit` to read just that section.
+**Prefer semantic_retrieve over search when exploring.** Use `semantic_retrieve` (natural-language query) to find where something is implemented or how something works; then `read_file` with offset/limit on the returned chunks. Use `search` when you have an exact string or regex to match (e.g. function name, error message).
 
-- To find where to make a change: `search` for the function/class name, then targeted `read_file`
+- To find where to make a change: `semantic_retrieve` with a short query, or `search` for a known symbol; then targeted `read_file`
 - To check all usages of something you changed: `search` with `include` filter
 - To verify an edit: `read_file` with offset/limit on just the changed section
 - **Batch tool calls**: request multiple reads/searches in one turn — they run in parallel
 </tool_strategy>
 
 <tool_usage>
+- `update_todos`: Task checklist. For multi-step work, call at the start with a full list (status pending/in_progress/completed); update as you progress so the list stays visible in context.
+- `semantic_retrieve`: Natural-language codebase search. Use first when exploring or finding "where X is" / "how Y works". Returns relevant chunks with path and line range; then read_file(offset, limit) only those spots.
 - `read_file`: Reads with line numbers. Use `offset` + `limit` to read specific sections of large files instead of the whole file.
 - `edit_file`: old_string must match EXACTLY one location, including all whitespace. Include surrounding lines for uniqueness. If it fails, re-read the file — the content may have changed.
 - `symbol_edit`: Prefer for safer symbol-level refactors. Target symbol name + kind (+ occurrence when needed) instead of brittle regex/string heuristics.
 - `write_file`: Overwrites entirely. Only for new files or when >50% changes. Prefer edit_file.
 - `run_command`: Runs in working directory. Check stdout AND stderr. Non-zero exit = failure.
-- `search`: Regex search across files with ripgrep. Returns matching lines with paths and line numbers. Use `include` to filter by file type.
+- `search`: Regex search (ripgrep). Use when you have an exact string or pattern; do not use for exploration (use semantic_retrieve).
 - `find_symbol`: Symbol-aware search for definitions/references. Use before editing ambiguous symbols or large codebases.
 - `glob_find`: Find files matching a pattern. Use to discover files before reading.
 - `lint_file`: Auto-detects the project linter. Use after every edit.
@@ -241,6 +244,7 @@ After each meaningful action batch (reads, edits, command runs), provide a visib
 - Next actions
 - Verification status
 Keep this concrete and evidence-based (files, symbols, command outcomes), not vague narration.
+When citing code locations use path:line or path:start-end (e.g. backend.py:165).
 </reasoning_transparency>
 
 <risk_controls>
@@ -294,26 +298,25 @@ Before every batch of tool calls, output 1-2 sentences stating your next move(s)
 </plan_next_move>
 
 <tool_strategy>
-**Search before you read.** Don't read a 1000-line file to find one function. Use `search` to locate what you need, then `read_file` with `offset` and `limit` to read just that section. This is faster and keeps your context clean.
+**Prefer semantic_retrieve over search when exploring.** Semantic search finds code by meaning (e.g. "where is auth validated"); use it first, then `read_file` with offset/limit on the returned chunks. Use `search` only when you have an exact string or regex (e.g. known symbol, error message). Don't read whole large files to find one function.
 
-- To find where something is defined: `search` for the class/function name
-- To understand a specific function: `search` to find it, then `read_file` with offset/limit for ~50 lines around it
-- To read a whole small file (<200 lines): just `read_file` with no offset
-- To understand a large file: `read_file` with no offset (gets structural overview), then targeted reads of sections you care about
-- To find all usages of something: `search` with `include` to filter by file type
-- **Large codebases**: Use `semantic_retrieve` first (natural-language query) to get relevant code chunks; then `read_file` with offset/limit only those locations.
-- **Batch reads**: when you need multiple files or sections, request them all in one turn — they run in parallel
+- To find where something is implemented or how it works: `semantic_retrieve` with a short natural-language query, then `read_file` on the chunks
+- To find a known symbol name or exact string: `search` (or `find_symbol` for definitions/references), then targeted `read_file`
+- To find all usages of something you changed: `search` with `include` filter
+- Small file (<200 lines): `read_file` with no offset. Large file: structural overview then targeted reads.
+- **Batch reads**: request multiple files/sections in one turn — they run in parallel
 </tool_strategy>
 
 <tool_usage>
-- `semantic_retrieve`: Semantic codebase search. Query in natural language; returns relevant functions/classes with path and line range. Use first when exploring, then read_file(offset, limit) only those spots.
+- `update_todos`: Task checklist. For multi-step tasks, call at the start with a full list; set status to in_progress/completed as you go. Keeps progress visible.
+- `semantic_retrieve`: Semantic codebase search by meaning. Use first when exploring or finding "where X" / "how Y"; then read_file(offset, limit) on returned chunks. Prefer over search when you don't have an exact string.
 - `read_file`: Reads with line numbers. For large files (>500 lines), returns structural overview. Use `offset` + `limit` to read specific sections.
 - `edit_file`: old_string must match exactly one location, including whitespace. Include 3-5 surrounding lines. If "not found", re-read the file.
 - `write_file`: Overwrites entirely. Use only for new files or major rewrites. Prefer edit_file.
 - `run_command`: Runs in working directory. Check stdout and stderr. Non-zero exit = failure.
-- `search`: Regex search across files using ripgrep. Returns matching lines with file paths and line numbers. Use `include` to filter by file type (e.g. `*.py`).
-- `find_symbol`: Symbol-aware search for definitions/references across languages; useful before edits with many matches.
-- `glob_find`: Find files matching a pattern (e.g. `**/*.test.ts`). Use to discover files before reading.
+- `search`: Regex (ripgrep). Use only for exact string/regex; do not use for exploration (use semantic_retrieve).
+- `find_symbol`: Symbol-aware definitions/references. Use before editing ambiguous symbols.
+- `glob_find`: Find files by pattern (e.g. `**/*.test.ts`).
 - `lint_file`: Auto-detects project linter. Use after every edit.
 </tool_usage>
 
@@ -338,7 +341,7 @@ Make your process understandable to the user with concise reasoning traces after
 2) Why it matters
 3) What you will do next
 4) How you'll verify correctness
-Use concrete references (file paths, symbols, commands, outcomes).
+Use concrete references (file paths, symbols, commands, outcomes). When citing code use path:line or path:start-end (e.g. tools.py:329).
 </reasoning_transparency>
 
 <working_directory>{working_directory}</working_directory>
@@ -525,8 +528,11 @@ class CodingAgent:
         backend: Optional["Backend"] = None,
     ):
         self.service = bedrock_service
-        self.working_directory = os.path.abspath(working_directory)
-        self.backend: Backend = backend or LocalBackend(self.working_directory)
+        self.backend: Backend = backend or LocalBackend(os.path.abspath(working_directory))
+        is_ssh = getattr(self.backend, "_host", None) is not None
+        # For SSH, keep working_directory as the remote path (no local abspath to avoid cache collision).
+        self.working_directory = (working_directory if is_ssh else os.path.abspath(working_directory))
+        self._backend_id = (f"ssh:{getattr(self.backend, '_host', '')}:{self.working_directory}" if is_ssh else "local")
         self.max_iterations = max_iterations
         self.history: List[Dict[str, Any]] = []
         self.system_prompt = AGENT_SYSTEM_PROMPT.format(working_directory=self.working_directory)
@@ -563,6 +569,7 @@ class CodingAgent:
         self._plan_text: str = ""
         # In-memory cache of learned failure patterns
         self._failure_pattern_cache: Optional[List[Dict[str, Any]]] = None
+        self._todos: List[Dict[str, Any]] = []
 
     @property
     def total_tokens(self) -> int:
@@ -607,6 +614,18 @@ class CodingAgent:
         self._plan_file_path = None
         self._plan_text = ""
         self._failure_pattern_cache = None
+        self._todos = []
+
+    def _file_cache_key(self, path: str) -> str:
+        """Return cache key for path (backend_id + resolved path so SSH and local never collide)."""
+        resolved = self.backend.resolve_path(path)
+        return f"{self._backend_id}\x00{resolved}"
+
+    def _path_from_cache_key(self, key: str) -> str:
+        """Extract resolved path from a cache key for backend calls."""
+        if "\x00" in key:
+            return key.split("\x00", 1)[1]
+        return key
 
     # ------------------------------------------------------------------
     # Plan step progress tracking
@@ -689,7 +708,7 @@ class CodingAgent:
         if not paths:
             paths.extend(list(self._file_snapshots.keys()))
         if not paths:
-            paths.extend(list(self._file_cache.keys()))
+            paths.extend([self._path_from_cache_key(k) for k in self._file_cache.keys()])
         if not paths:
             return None
 
@@ -755,7 +774,7 @@ class CodingAgent:
                 else:
                     self.backend.write_file(abs_path, content)
                     reverted.append(abs_path)
-                self._file_cache.pop(abs_path, None)
+                self._file_cache.pop(f"{self._backend_id}\x00{abs_path}", None)
             except Exception as e:
                 logger.warning(f"Failed to rewind {abs_path} from checkpoint {checkpoint.get('id')}: {e}")
         return reverted
@@ -875,6 +894,14 @@ class CodingAgent:
         learned = self._failure_patterns_prompt()
         if learned:
             prompt += "\n\n<known_failure_patterns>\n" + learned + "\n</known_failure_patterns>"
+        if self._todos:
+            lines = ["<current_todos>", "Your task checklist (update with update_todos as you progress):"]
+            for t in self._todos:
+                s = t.get("status", "pending")
+                c = (t.get("content") or "").strip()
+                lines.append(f"  [{s}] {c}")
+            lines.append("</current_todos>")
+            prompt += "\n\n" + "\n".join(lines)
         return prompt
 
     # ------------------------------------------------------------------
@@ -1215,7 +1242,8 @@ class CodingAgent:
 
     def revert_all(self) -> List[str]:
         """Revert all modified files to their original content.
-        Returns a list of reverted file paths."""
+        Returns a list of reverted file paths.
+        Snapshot keys are in backend-resolved form (absolute path); backend methods accept them as-is."""
         reverted = []
         for abs_path, original in self._file_snapshots.items():
             try:
@@ -1239,12 +1267,11 @@ class CodingAgent:
     def _approval_key(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
         """Return a hashable key that uniquely identifies an operation for approval purposes."""
         if tool_name == "run_command":
-            # Match on the exact command string
             return f"cmd:{tool_input.get('command', '')}"
         elif tool_name in ("write_file", "edit_file", "symbol_edit"):
-            # Match on (operation, absolute path)
             path = tool_input.get("path", "")
-            return f"{tool_name}:{os.path.abspath(os.path.join(self.working_directory, path))}"
+            resolved = self.backend.resolve_path(path)
+            return f"{tool_name}:{self._backend_id}:{resolved}"
         return f"{tool_name}:{json.dumps(tool_input, sort_keys=True)}"
 
     def was_previously_approved(self, tool_name: str, tool_input: Dict[str, Any]) -> bool:
@@ -1310,10 +1337,20 @@ class CodingAgent:
             "checkpoint_counter": self._checkpoint_counter,
             "plan_step_index": self._plan_step_index,
             "deterministic_verification_done": self._deterministic_verification_done,
+            "todos": list(self._todos),
         }
 
     def from_dict(self, data: Dict[str, Any]) -> None:
-        """Restore agent state from a persisted session."""
+        """Restore agent state from a persisted session. Unknown keys are ignored."""
+        known = {
+            "history", "token_usage", "approved_commands", "running_summary", "current_plan",
+            "current_plan_decomposition", "plan_file_path", "plan_text", "scout_context",
+            "file_snapshots", "session_checkpoints", "checkpoint_counter", "plan_step_index",
+            "deterministic_verification_done", "todos",
+        }
+        unknown = set(data) - known
+        if unknown:
+            logger.debug("Agent from_dict: ignoring unknown keys %s", sorted(unknown))
         self.history = data.get("history", [])
         usage = data.get("token_usage", {})
         self._total_input_tokens = usage.get("input_tokens", 0)
@@ -1329,6 +1366,7 @@ class CodingAgent:
         self._scout_context = data.get("scout_context")
         self._plan_step_index = data.get("plan_step_index", 0)
         self._deterministic_verification_done = data.get("deterministic_verification_done", False)
+        self._todos = list(data.get("todos", []))
         self._cancelled = False
         # Restore file snapshots
         raw_snapshots = data.get("file_snapshots", {})
@@ -1949,6 +1987,8 @@ class CodingAgent:
                     )
                 else:
                     text = text[:cap - 200] + "\n... (truncated; use read_file with offset/limit for full content) ..."
+                if len(text) > cap:
+                    text = text[:cap] + "\n... (excerpt capped) ..."
                 capped.append({**result, "content": text})
             else:
                 capped.append(result)
@@ -2714,8 +2754,8 @@ Keep the whole response under 300 words. If the request is already very clear an
         parts.append(task)
         parts.append(
             "Execute this plan step by step.\n\n"
-            "Before touching files, first output a short numbered TODO checklist that covers all plan items.\n"
-            "Then execute them in order and clearly report progress like 'Todo i of N'.\n\n"
+            "Before touching files, call update_todos with a full list of plan items (status pending), then set the first to in_progress.\n"
+            "Work through them in order; set each to completed and the next to in_progress as you go.\n\n"
             "For each step:\n"
             "1. State which step you are working on (e.g. 'Step 3: ...')\n"
             "2. Read the target file(s) first — never edit blind\n"
@@ -3378,17 +3418,20 @@ Keep the whole response under 300 words. If the request is already very clear an
                             err_msg[:1200],
                             {"attempt": attempt, "max_retries": max_retries},
                         )
-                        # Never show "ran out of tokens" or raw token errors to the user
                         if any(phrase in err_str for phrase in ("token", "max_tokens", "length limit", "context")):
                             user_msg = (
-                                "Response hit a length limit. You can re-send your message "
-                                "(conversation will be compacted automatically), or break the task into smaller steps."
+                                "Response hit a length limit. Conversation was compacted. "
+                                "Re-send your message or break the task into smaller steps."
                             )
+                            try:
+                                self._trim_history()
+                            except Exception:
+                                pass
                         else:
                             user_msg = f"Streaming error: {err_msg}\n\nYour message was rolled back — you can re-send it."
                         await on_event(AgentEvent(type="stream_failed", content=user_msg))
                         stream_succeeded = False
-                        break  # exit retry loop
+                        break
 
                     # Retryable — wait and try again
                     wait_secs = retry_backoff * (2 ** (attempt - 1))  # exponential: 2s, 4s, 8s …
@@ -3572,6 +3615,32 @@ Keep the whole response under 300 words. If the request is already very clear an
         Returns a list of tool_result dicts ready for the conversation history.
         """
         loop = asyncio.get_event_loop()
+        results_by_id: Dict[str, Dict[str, Any]] = {}
+
+        original_tool_uses = tool_uses
+        todo_calls = [tu for tu in tool_uses if tu.get("name") == "update_todos"]
+        rest_calls = [tu for tu in tool_uses if tu.get("name") != "update_todos"]
+        for tu in todo_calls:
+            inp = tu.get("input") or {}
+            self._todos = list(inp.get("todos") or [])
+            lines = [f"Todos updated ({len(self._todos)} items)."]
+            for t in self._todos:
+                lines.append(f"  [{t.get('status', 'pending')}] {t.get('content', '')}")
+            content = "\n".join(lines)
+            results_by_id[tu["id"]] = {
+                "type": "tool_result",
+                "tool_use_id": tu["id"],
+                "content": content,
+                "is_error": False,
+            }
+            await on_event(AgentEvent(
+                type="tool_result",
+                content=content,
+                data={"tool_name": "update_todos", "tool_use_id": tu["id"], "success": True},
+            ))
+            await on_event(AgentEvent(type="todos_updated", content="", data={"todos": list(self._todos)}))
+
+        tool_uses = rest_calls
 
         async def _run_command_with_streaming(tool_id: str, tool_input: Dict[str, Any]) -> ToolResult:
             """Run command with live output events when enabled."""
@@ -3659,9 +3728,6 @@ Keep the whole response under 300 words. If the request is already very clear an
             else:
                 dangerous_calls.append(tu)
 
-        # Pre-allocate results keyed by tool_use id to maintain order
-        results_by_id: Dict[str, Dict[str, Any]] = {}
-
         # ---- 1. Run all safe tools concurrently ----
         # NOTE: tool_call events are already emitted by the streaming loop
         # in _agent_loop, so we skip emitting them here to avoid duplicates.
@@ -3676,18 +3742,18 @@ Keep the whole response under 300 words. If the request is already very clear an
                 # File cache: return cached content for read_file if file hasn't been modified
                 if name == "read_file" and not inp.get("offset") and not inp.get("limit"):
                     path = inp.get("path", "")
-                    abs_p = os.path.abspath(os.path.join(self.working_directory, path))
+                    cache_key = self._file_cache_key(path)
 
-                    # Dedup within the same batch
-                    if abs_p in _dedup_reads:
-                        cached_result = await _dedup_reads[abs_p]
+                    # Dedup within the same batch (by resolved path for backend consistency)
+                    resolved = self.backend.resolve_path(path)
+                    if resolved in _dedup_reads:
+                        cached_result = await _dedup_reads[resolved]
                         return tu, cached_result
 
                     # Check file cache
-                    if abs_p in self._file_cache:
-                        cached_content, _ = self._file_cache[abs_p]
-                        # Only use cache if file hasn't been modified by us
-                        if abs_p not in self._file_snapshots:
+                    if cache_key in self._file_cache:
+                        cached_content, _ = self._file_cache[cache_key]
+                        if resolved not in self._file_snapshots:
                             return tu, ToolResult(success=True, output=cached_content)
 
                 result = await loop.run_in_executor(
@@ -3697,8 +3763,8 @@ Keep the whole response under 300 words. If the request is already very clear an
                 # Cache successful full-file reads
                 if name == "read_file" and result.success and not inp.get("offset") and not inp.get("limit"):
                     path = inp.get("path", "")
-                    abs_p = os.path.abspath(os.path.join(self.working_directory, path))
-                    self._file_cache[abs_p] = (result.output, time.time())
+                    cache_key = self._file_cache_key(path)
+                    self._file_cache[cache_key] = (result.output, time.time())
 
                 return tu, result
 
@@ -3796,13 +3862,11 @@ Keep the whole response under 300 words. If the request is already very clear an
                 for tu in file_write_calls:
                     self._snapshot_file(tu["name"], tu["input"])
 
-                # Group by absolute path so same-file edits serialize
+                # Group by resolved path so same-file edits serialize (backend-agnostic)
                 file_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
                 for tu in file_write_calls:
                     path = tu["input"].get("path", "")
-                    abs_path = os.path.abspath(
-                        os.path.join(self.working_directory, path)
-                    )
+                    abs_path = self.backend.resolve_path(path)
                     file_groups[abs_path].append(tu)
 
                 # Session checkpoint before risky file batch
@@ -3886,8 +3950,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                                 pass  # lint failure is non-fatal
 
                             # Invalidate file cache after successful write
-                            abs_p = os.path.abspath(os.path.join(self.working_directory, path))
-                            self._file_cache.pop(abs_p, None)
+                            self._file_cache.pop(self._file_cache_key(path), None)
 
                         results.append((tu, result))
                         if not result.success:
@@ -4094,8 +4157,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                         {"tool_name": tool_name, "tool_input": tool_input},
                     )
 
-        # Return results in the original tool_use order
-        return [results_by_id[tu["id"]] for tu in tool_uses if tu["id"] in results_by_id]
+        return [results_by_id[tu["id"]] for tu in original_tool_uses if tu["id"] in results_by_id]
 
     def _format_tool_description(self, name: str, inputs: Dict) -> str:
         """Format a human-readable description of a tool call for approval"""

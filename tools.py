@@ -48,9 +48,19 @@ def _extract_structure(lines: List[str]) -> str:
 _MAX_FULL_READ_LINES = 500
 
 
+def _require_path(path: str, name: str = "path") -> Optional[ToolResult]:
+    """Return an error ToolResult if path is empty/whitespace; else None."""
+    if not (path or "").strip():
+        return ToolResult(success=False, output="", error=f"{name} is required")
+    return None
+
+
 def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = None,
               backend: Optional[Backend] = None, working_directory: str = ".") -> ToolResult:
     """Read the contents of a file. Returns line-numbered content."""
+    err = _require_path(path)
+    if err:
+        return err
     try:
         b = backend or LocalBackend(working_directory)
         full_path = b.resolve_path(path)
@@ -97,6 +107,9 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
 def write_file(path: str, content: str,
                backend: Optional[Backend] = None, working_directory: str = ".") -> ToolResult:
     """Create a new file or completely overwrite an existing file."""
+    err = _require_path(path)
+    if err:
+        return err
     try:
         b = backend or LocalBackend(working_directory)
         b.write_file(path, content)
@@ -109,6 +122,9 @@ def write_file(path: str, content: str,
 def edit_file(path: str, old_string: str, new_string: str,
               backend: Optional[Backend] = None, working_directory: str = ".") -> ToolResult:
     """Replace an exact string in a file (must match exactly one location)."""
+    err = _require_path(path)
+    if err:
+        return err
     try:
         b = backend or LocalBackend(working_directory)
         if not b.file_exists(path):
@@ -199,6 +215,9 @@ def _regex_symbol_spans(content: str, symbol: str, kind: str = "all") -> List[tu
 def symbol_edit(path: str, symbol: str, new_string: str, kind: str = "all", occurrence: int = 1,
                 backend: Optional[Backend] = None, working_directory: str = ".") -> ToolResult:
     """Edit a symbol definition block using AST/tree-sitter/regex boundaries."""
+    err = _require_path(path)
+    if err:
+        return err
     try:
         b = backend or LocalBackend(working_directory)
         if not b.file_exists(path):
@@ -270,6 +289,8 @@ def symbol_edit(path: str, symbol: str, new_string: str, kind: str = "all", occu
 def run_command(command: str, timeout: int = 30,
                 backend: Optional[Backend] = None, working_directory: str = ".") -> ToolResult:
     """Execute a shell command."""
+    if not (command or "").strip():
+        return ToolResult(success=False, output="", error="command is required")
     try:
         b = backend or LocalBackend(working_directory)
         stdout, stderr, rc = b.run_command(command, cwd=".", timeout=timeout)
@@ -295,6 +316,10 @@ def run_command(command: str, timeout: int = 30,
             success=rc == 0, output=output,
             error=None if rc == 0 else f"Command exited with code {rc}",
         )
+    except ValueError as e:
+        if "disallowed" in str(e).lower() or "metacharacters" in str(e).lower():
+            return ToolResult(success=False, output="", error=str(e))
+        return ToolResult(success=False, output="", error=str(e))
     except Exception as e:
         if "timed out" in str(e).lower() or "TimeoutExpired" in type(e).__name__:
             return ToolResult(success=False, output="", error=f"Command timed out after {timeout}s")
@@ -434,6 +459,9 @@ def glob_find(pattern: str,
 def lint_file(path: str,
               backend: Optional[Backend] = None, working_directory: str = ".") -> ToolResult:
     """Auto-detect the project linter and run it on a file."""
+    err = _require_path(path)
+    if err:
+        return err
     try:
         b = backend or LocalBackend(working_directory)
         if not b.file_exists(path):
@@ -576,8 +604,43 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "update_todos",
+        "description": "Create or update the task checklist for this session. Use at the start of multi-step tasks: list items with status pending, then set in_progress when working on one and completed when done. Keeps progress visible and ensures nothing is dropped. Update the list whenever you add or finish items.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "Short stable id (e.g. 1, 2, or task-1)"},
+                            "content": {"type": "string", "description": "One-line description of the task"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Current status"},
+                        },
+                        "required": ["id", "content", "status"],
+                    },
+                    "description": "Full list of todos; replaces previous list.",
+                },
+            },
+            "required": ["todos"],
+        },
+    },
+    {
+        "name": "semantic_retrieve",
+        "description": "Semantic codebase search. Returns the most relevant code chunks (functions, classes) for a natural-language query. Prefer this over search when exploring the codebase or finding where something is implemented (use search for exact string/regex matches). Then use read_file with offset/limit to open only the returned locations.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural-language description of what you are looking for, e.g. 'where is user authentication validated' or 'handler for POST /api/orders'"},
+                "top_k": {"type": "integer", "description": "Number of chunks to return (default 10, max 20)"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "search",
-        "description": "Search for a regex pattern across files using ripgrep. Returns matching lines with file paths and line numbers. Escape special regex characters (., *, +, etc.) when searching for literal strings. Use the `include` parameter to filter by file type for faster, more focused results.",
+        "description": "Regex search (ripgrep) across files. Use when you have an exact string or pattern; for exploring or finding by meaning use semantic_retrieve instead. Returns matching lines with paths and line numbers. Use `include` to filter by file type.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -635,18 +698,6 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "required": ["path"],
         },
     },
-    {
-        "name": "semantic_retrieve",
-        "description": "Enterprise semantic codebase search. Returns the most relevant code chunks (functions, classes) for a natural-language query without reading whole files. Use this first when exploring a large codebase or finding where to implement something. Then use read_file with offset/limit to open only the returned locations.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Natural-language description of what you are looking for, e.g. 'where is user authentication validated' or 'handler for POST /api/orders'"},
-                "top_k": {"type": "integer", "description": "Number of chunks to return (default 10, max 20)"},
-            },
-            "required": ["query"],
-        },
-    },
 ]
 
 def semantic_retrieve(
@@ -655,15 +706,17 @@ def semantic_retrieve(
     backend: Optional[Backend] = None,
     working_directory: str = ".",
 ) -> ToolResult:
-    """Semantic search over the codebase index. Returns relevant code chunks with path and line range."""
+    """Semantic search over the codebase index. Returns relevant code chunks with path and line range.
+    Works for both local and SSH projects (SSH index is cached locally)."""
     try:
         from config import app_config
         if not getattr(app_config, "codebase_index_enabled", True):
             return ToolResult(success=False, output="", error="Codebase index is disabled.")
         from codebase_index import get_index, get_embed_fn
-        wd = os.path.abspath(working_directory)
+        is_ssh = backend is not None and getattr(backend, "_host", None) is not None
+        wd = working_directory if is_ssh else os.path.abspath(working_directory)
         embed_fn = get_embed_fn()
-        index = get_index(wd, embed_fn=embed_fn)
+        index = get_index(wd, embed_fn=embed_fn, backend=backend)
         if not index.chunks and embed_fn and backend:
             index.build(backend, force_reindex=False)
         if not index.chunks:

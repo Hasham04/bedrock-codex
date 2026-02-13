@@ -99,6 +99,10 @@ class Backend(ABC):
             return path
         return os.path.normpath(os.path.join(self.working_directory, path))
 
+    def _ensure_under_working(self, resolved: str) -> None:
+        """Raise ValueError if resolved path escapes the working directory. Overridden by backends."""
+        pass  # Base: no check; LocalBackend and SSHBackend implement
+
 
 # ============================================================
 # Local Backend
@@ -118,6 +122,12 @@ def _has_ripgrep() -> bool:
     return _HAS_RIPGREP
 
 
+def _dangerous_shell_chars(command: str) -> bool:
+    """Return True if command contains disallowed shell metacharacters (injection risk)."""
+    dangerous = set("&|;$`\n\r<>")
+    return any(c in command for c in dangerous)
+
+
 class LocalBackend(Backend):
     """Backend that operates on the local filesystem."""
 
@@ -129,8 +139,15 @@ class LocalBackend(Backend):
     def working_directory(self) -> str:
         return self._working_directory
 
+    def _ensure_under_working(self, resolved: str) -> None:
+        real = os.path.abspath(resolved)
+        wd = os.path.abspath(self._working_directory)
+        if real != wd and not real.startswith(wd + os.sep):
+            raise ValueError(f"Path escapes working directory: {resolved!r}")
+
     def list_dir(self, path: str) -> List[Dict[str, Any]]:
         full = self.resolve_path(path) if path else self._working_directory
+        self._ensure_under_working(full)
         entries = []
         for name in sorted(os.listdir(full)):
             child = os.path.join(full, name)
@@ -147,31 +164,48 @@ class LocalBackend(Backend):
 
     def read_file(self, path: str) -> str:
         full = self.resolve_path(path)
+        self._ensure_under_working(full)
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             return f.read()
 
     def write_file(self, path: str, content: str) -> None:
         full = self.resolve_path(path)
+        self._ensure_under_working(full)
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "w", encoding="utf-8") as f:
             f.write(content)
 
     def file_exists(self, path: str) -> bool:
-        return os.path.exists(self.resolve_path(path))
+        full = self.resolve_path(path)
+        self._ensure_under_working(full)
+        return os.path.exists(full)
 
     def is_dir(self, path: str) -> bool:
-        return os.path.isdir(self.resolve_path(path))
+        full = self.resolve_path(path)
+        self._ensure_under_working(full)
+        return os.path.isdir(full)
 
     def is_file(self, path: str) -> bool:
-        return os.path.isfile(self.resolve_path(path))
+        full = self.resolve_path(path)
+        self._ensure_under_working(full)
+        return os.path.isfile(full)
 
     def file_size(self, path: str) -> int:
-        return os.path.getsize(self.resolve_path(path))
+        full = self.resolve_path(path)
+        self._ensure_under_working(full)
+        return os.path.getsize(full)
 
     def remove_file(self, path: str) -> None:
-        os.remove(self.resolve_path(path))
+        full = self.resolve_path(path)
+        self._ensure_under_working(full)
+        os.remove(full)
 
     def run_command(self, command: str, cwd: str, timeout: int = 30) -> Tuple[str, str, int]:
+        if _dangerous_shell_chars(command):
+            raise ValueError(
+                "Command contains disallowed shell metacharacters (e.g. & | ; $ `). "
+                "Use a single command with arguments only."
+            )
         full_cwd = self.resolve_path(cwd) if cwd != "." else self._working_directory
         proc = subprocess.Popen(
             command, shell=True, cwd=full_cwd,
@@ -197,6 +231,11 @@ class LocalBackend(Backend):
         timeout: int = 30,
         on_output: Optional[Any] = None,
     ) -> Tuple[str, str, int]:
+        if _dangerous_shell_chars(command):
+            raise ValueError(
+                "Command contains disallowed shell metacharacters (e.g. & | ; $ `). "
+                "Use a single command with arguments only."
+            )
         full_cwd = self.resolve_path(cwd) if cwd != "." else self._working_directory
         proc = subprocess.Popen(
             command,
@@ -393,6 +432,14 @@ class SSHBackend(Backend):
     def working_directory(self) -> str:
         return self._working_directory
 
+    def _ensure_under_working(self, resolved: str) -> None:
+        """Ensure resolved (remote) path is under working directory (POSIX)."""
+        import posixpath
+        norm_wd = (self._working_directory or "").rstrip("/") or "/"
+        norm_resolved = (resolved or "").rstrip("/") or "/"
+        if norm_resolved != norm_wd and not norm_resolved.startswith(norm_wd + "/"):
+            raise ValueError(f"Path escapes working directory: {resolved!r}")
+
     def _remote_path(self, path: str) -> str:
         """Resolve a relative path to absolute on the remote. Expands ~ so SFTP can open paths."""
         if os.path.isabs(path):
@@ -496,6 +543,7 @@ class SSHBackend(Backend):
     def list_dir(self, path: str) -> List[Dict[str, Any]]:
         import stat as stat_mod
         remote = self._remote_path(path) if path else self._working_directory
+        self._ensure_under_working(remote)
         if "~" in remote:
             remote = self._expand_remote_tilde(remote)
         entries = []
@@ -536,15 +584,17 @@ class SSHBackend(Backend):
         return entries
 
     def read_file(self, path: str) -> str:
+        remote = self._remote_path(path)
+        self._ensure_under_working(remote)
         with self._lock:
             self._reconnect_if_needed()
-            remote = self._remote_path(path)
             with self._sftp.open(remote, "r") as f:
                 return f.read().decode("utf-8", errors="replace")
 
     def write_file(self, path: str, content: str) -> None:
         import posixpath
         remote = self._remote_path(path)
+        self._ensure_under_working(remote)
         parent = posixpath.dirname(remote)
         # mkdir -p goes through _exec (has its own lock acquisition)
         self._exec(f"mkdir -p {parent!r}")
@@ -554,46 +604,61 @@ class SSHBackend(Backend):
                 f.write(content.encode("utf-8"))
 
     def file_exists(self, path: str) -> bool:
+        remote = self._remote_path(path)
+        self._ensure_under_working(remote)
         with self._lock:
             self._reconnect_if_needed()
             try:
-                self._sftp.stat(self._remote_path(path))
+                self._sftp.stat(remote)
                 return True
             except FileNotFoundError:
                 return False
 
     def is_dir(self, path: str) -> bool:
         import stat as stat_mod
+        remote = self._remote_path(path)
+        self._ensure_under_working(remote)
         with self._lock:
             self._reconnect_if_needed()
             try:
-                attr = self._sftp.stat(self._remote_path(path))
+                attr = self._sftp.stat(remote)
                 return stat_mod.S_ISDIR(attr.st_mode or 0)
             except (FileNotFoundError, OSError):
                 return False
 
     def is_file(self, path: str) -> bool:
         import stat as stat_mod
+        remote = self._remote_path(path)
+        self._ensure_under_working(remote)
         with self._lock:
             self._reconnect_if_needed()
             try:
-                attr = self._sftp.stat(self._remote_path(path))
+                attr = self._sftp.stat(remote)
                 return stat_mod.S_ISREG(attr.st_mode or 0)
             except (FileNotFoundError, OSError):
                 return False
 
     def file_size(self, path: str) -> int:
+        remote = self._remote_path(path)
+        self._ensure_under_working(remote)
         with self._lock:
             self._reconnect_if_needed()
-            attr = self._sftp.stat(self._remote_path(path))
+            attr = self._sftp.stat(remote)
             return attr.st_size or 0
 
     def remove_file(self, path: str) -> None:
+        remote = self._remote_path(path)
+        self._ensure_under_working(remote)
         with self._lock:
             self._reconnect_if_needed()
-            self._sftp.remove(self._remote_path(path))
+            self._sftp.remove(remote)
 
     def run_command(self, command: str, cwd: str, timeout: int = 30) -> Tuple[str, str, int]:
+        if _dangerous_shell_chars(command):
+            raise ValueError(
+                "Command contains disallowed shell metacharacters (e.g. & | ; $ `). "
+                "Use a single command with arguments only."
+            )
         full_cwd = self._remote_path(cwd) if cwd != "." else self._working_directory
         cmd = f"cd {full_cwd!r} && {command}"
         return self._exec(cmd, timeout=timeout)
@@ -605,6 +670,11 @@ class SSHBackend(Backend):
         timeout: int = 30,
         on_output: Optional[Any] = None,
     ) -> Tuple[str, str, int]:
+        if _dangerous_shell_chars(command):
+            raise ValueError(
+                "Command contains disallowed shell metacharacters (e.g. & | ; $ `). "
+                "Use a single command with arguments only."
+            )
         full_cwd = self._remote_path(cwd) if cwd != "." else self._working_directory
         cmd = f"cd {full_cwd!r} && {command}"
 

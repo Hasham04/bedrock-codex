@@ -87,10 +87,16 @@ def _parse_ssh_composite(wd: str) -> Optional[Dict[str, Any]]:
 
 def _normalize_wd(working_directory: str) -> str:
     """Normalize a working directory for hashing/storage.
-    SSH paths are kept as-is; local paths are made absolute."""
-    if _is_ssh_path(working_directory):
-        return working_directory
-    return os.path.abspath(working_directory)
+    SSH paths: strip trailing slash from directory part so remove matches list.
+    Local paths: make absolute (abspath also strips trailing slash)."""
+    wd = (working_directory or "").strip()
+    if _is_ssh_path(wd):
+        parts = wd.split(":", 2)
+        if len(parts) >= 3:
+            parts[2] = (parts[2] or "/").rstrip("/") or "/"
+            return ":".join(parts)
+        return wd
+    return os.path.abspath(wd) if wd else wd
 
 
 def _dir_hash(working_directory: str) -> str:
@@ -314,22 +320,39 @@ class SessionStore:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return Session(
-                session_id=data.get("session_id", ""),
-                version=data.get("version", 1),
-                name=data.get("name", "default"),
-                working_directory=data.get("working_directory", ""),
-                model_id=data.get("model_id", ""),
-                created_at=data.get("created_at", ""),
-                updated_at=data.get("updated_at", ""),
-                history=data.get("history", []),
-                token_usage=data.get("token_usage", {
+            if not isinstance(data, dict):
+                logger.warning("Session file %s: root is not a dict", path)
+                return None
+            history = data.get("history", [])
+            if not isinstance(history, list):
+                history = []
+            token_usage = data.get("token_usage", {})
+            if not isinstance(token_usage, dict):
+                token_usage = {
                     "input_tokens": 0,
                     "output_tokens": 0,
                     "cache_read_tokens": 0,
                     "cache_write_tokens": 0,
-                }),
-                extra_state=data.get("extra_state", {}),
+                }
+            extra_state = data.get("extra_state", {})
+            if not isinstance(extra_state, dict):
+                extra_state = {}
+            return Session(
+                session_id=str(data.get("session_id", "")),
+                version=int(data.get("version", 1)) if data.get("version") is not None else 1,
+                name=str(data.get("name", "default")),
+                working_directory=str(data.get("working_directory", "")),
+                model_id=str(data.get("model_id", "")),
+                created_at=str(data.get("created_at", "")),
+                updated_at=str(data.get("updated_at", "")),
+                history=history,
+                token_usage={
+                    "input_tokens": int(token_usage.get("input_tokens", 0)),
+                    "output_tokens": int(token_usage.get("output_tokens", 0)),
+                    "cache_read_tokens": int(token_usage.get("cache_read_tokens", 0)),
+                    "cache_write_tokens": int(token_usage.get("cache_write_tokens", 0)),
+                },
+                extra_state=extra_state,
             )
         except Exception as e:
             logger.warning(f"Failed to read session {path}: {e}")

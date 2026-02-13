@@ -2108,8 +2108,9 @@
     // ================================================================
 
     let currentPlanSteps = [];
+    let currentChecklistItems = [];
 
-    function showPlan(steps, planFile, planText) {
+    function showPlan(steps, planFile, planText, skipChecklist) {
         currentPlanSteps = [...steps];
         const bubble = getOrCreateBubble();
         const block = document.createElement("div"); block.className = "plan-block"; block.id = "active-plan";
@@ -2127,18 +2128,6 @@
             html += `</div>`;
         }
 
-        // Editable steps section
-        html += `<div class="plan-steps-header">Implementation Steps <span style="font-weight:normal;font-size:10px;color:var(--text-muted)">(editable \u2014 modify before building)</span></div>`;
-        html += `<div class="plan-steps-list">`;
-        steps.forEach((s, i) => {
-            html += `<div class="plan-step" data-idx="${i}">
-                <span class="plan-step-num">${i+1}</span>
-                <textarea class="plan-step-input" rows="1">${escapeHtml(s)}</textarea>
-                <button class="plan-step-delete" title="Remove step">\u00D7</button>
-            </div>`;
-        });
-        html += `</div>`;
-        html += `<button class="plan-add-step">+ Add step</button>`;
         block.innerHTML = html;
         block.appendChild(makeCopyBtn(planText || steps.join("\n")));
         bubble.appendChild(block);
@@ -2148,70 +2137,24 @@
             if (typeof hljs !== "undefined") hljs.highlightElement(b);
         });
 
-        // Open plan file in editor when clicked
         const openBtn = block.querySelector(".plan-open-file");
         if (openBtn) {
             openBtn.addEventListener("click", () => {
                 const path = openBtn.dataset.path;
-                if (path && typeof openFile === "function") {
-                    openFile(path);
-                }
+                if (path && typeof openFile === "function") openFile(path);
             });
         }
 
-        // Auto-resize textareas
-        block.querySelectorAll(".plan-step-input").forEach(ta => {
-            autoResizeTA(ta);
-            ta.addEventListener("input", () => { autoResizeTA(ta); syncPlanSteps(); });
-        });
-
-        // Delete step
-        block.querySelectorAll(".plan-step-delete").forEach(btn => {
-            btn.addEventListener("click", () => {
-                btn.closest(".plan-step").remove();
-                renumberPlan();
-                syncPlanSteps();
-            });
-        });
-
-        // Add step
-        block.querySelector(".plan-add-step").addEventListener("click", () => {
-            addPlanStep("");
-        });
-
-        // Action bar with Build, Feedback, and Reject
         showActionBar([
             { label: "\u25B6 Build", cls: "primary", onClick: () => { hideActionBar(); send({ type: "build", steps: currentPlanSteps }); setRunning(true); }},
             { label: "\uD83D\uDCAC Feedback", cls: "secondary", onClick: () => { showPlanFeedbackInput(); }},
             { label: "\u2715 Reject", cls: "danger", onClick: () => { hideActionBar(); send({ type: "reject_plan" }); }},
         ]);
+        if (!skipChecklist) {
+            currentChecklistItems = steps.map((s, i) => ({ id: String(i + 1), content: s, status: "pending" }));
+            showAgentChecklist(currentChecklistItems);
+        }
         scrollChat();
-    }
-
-    function addPlanStep(text) {
-        const list = document.querySelector("#active-plan .plan-steps-list");
-        if (!list) return;
-        const idx = list.children.length;
-        const step = document.createElement("div"); step.className = "plan-step"; step.dataset.idx = idx;
-        step.innerHTML = `<span class="plan-step-num">${idx+1}</span><textarea class="plan-step-input" rows="1">${escapeHtml(text)}</textarea><button class="plan-step-delete" title="Remove step">\u00D7</button>`;
-        const ta = step.querySelector(".plan-step-input");
-        autoResizeTA(ta);
-        ta.addEventListener("input", () => { autoResizeTA(ta); syncPlanSteps(); });
-        step.querySelector(".plan-step-delete").addEventListener("click", () => { step.remove(); renumberPlan(); syncPlanSteps(); });
-        list.appendChild(step);
-        ta.focus();
-        syncPlanSteps();
-    }
-
-    function renumberPlan() {
-        document.querySelectorAll("#active-plan .plan-step").forEach((el, i) => {
-            el.dataset.idx = i;
-            el.querySelector(".plan-step-num").textContent = i + 1;
-        });
-    }
-
-    function syncPlanSteps() {
-        currentPlanSteps = [...document.querySelectorAll("#active-plan .plan-step-input")].map(ta => ta.value.trim()).filter(Boolean);
     }
 
     function autoResizeTA(ta) { ta.style.height = "auto"; ta.style.height = ta.scrollHeight + "px"; }
@@ -2266,76 +2209,61 @@
     }
 
     // ── Plan step progress during build ────────────────────────
-    function updatePlanStepProgress(stepNum, totalSteps) {
-        const planBlock = document.getElementById("active-plan");
-        if (!planBlock) return;
-
-        // Disable editing during build
-        planBlock.querySelectorAll(".plan-step-input").forEach(ta => { ta.readOnly = true; ta.style.cursor = "default"; });
-        planBlock.querySelectorAll(".plan-step-delete, .plan-add-step").forEach(el => { el.style.display = "none"; });
-
-        const steps = planBlock.querySelectorAll(".plan-step");
-        steps.forEach((el, i) => {
-            const num = i + 1;
-            const numEl = el.querySelector(".plan-step-num");
-            // Remove all states first
-            el.classList.remove("step-done", "step-active", "step-pending");
-            if (num < stepNum) {
-                el.classList.add("step-done");
-                if (numEl) numEl.innerHTML = "\u2713"; // checkmark
-                // Add "Revert to here" button on completed steps
-                if (!el.querySelector(".step-revert-btn")) {
-                    const rb = document.createElement("button");
-                    rb.className = "step-revert-btn";
-                    rb.textContent = "Revert to here";
-                    rb.title = `Revert all files to state after step ${num}`;
-                    rb.addEventListener("click", (e) => {
-                        e.stopPropagation();
-                        if (confirm(`Revert all changes back to the end of step ${num}?`)) {
-                            send({ type: "revert_to_step", step: num });
-                        }
-                    });
-                    el.appendChild(rb);
-                }
-            } else if (num === stepNum) {
-                el.classList.add("step-active");
-                if (numEl) numEl.textContent = num;
-            } else {
-                el.classList.add("step-pending");
-                if (numEl) numEl.textContent = num;
-            }
-        });
-
-        // Also update/create a progress indicator at the top
-        let prog = planBlock.querySelector(".plan-progress");
-        if (!prog) {
-            prog = document.createElement("div");
-            prog.className = "plan-progress";
-            const title = planBlock.querySelector(".plan-title");
-            if (title) title.after(prog);
-            else planBlock.prepend(prog);
+    function showAgentChecklist(todos, progress) {
+        if (!todos || !Array.isArray(todos) || todos.length === 0) {
+            const el = document.getElementById("agent-checklist");
+            if (el) el.remove();
+            currentChecklistItems = [];
+            return;
         }
-        prog.innerHTML = `<div class="plan-progress-bar"><div class="plan-progress-fill" style="width:${Math.round(((stepNum - 1) / totalSteps) * 100)}%"></div></div><span class="plan-progress-text">Step ${stepNum} of ${totalSteps}</span>`;
+        currentChecklistItems = [...todos];
+        const bubble = getOrCreateBubble();
+        let block = document.getElementById("agent-checklist");
+        if (!block) {
+            block = document.createElement("div");
+            block.className = "agent-checklist-block";
+            block.id = "agent-checklist";
+            bubble.appendChild(block);
+        }
+        let title = "\u2713 Task checklist";
+        if (progress && progress.stepNum != null && progress.totalSteps != null) {
+            title += ` \u2014 Step ${progress.stepNum} of ${progress.totalSteps}`;
+        }
+        let html = `<div class="agent-checklist-title">${title}</div><div class="agent-checklist-list">`;
+        todos.forEach((t) => {
+            const status = (t.status || "pending").toLowerCase();
+            const content = (t.content || "").trim() || "\u2014";
+            const statusCls = status === "completed" ? "done" : status === "in_progress" ? "active" : "pending";
+            const stepNum = t.id != null && /^\d+$/.test(String(t.id)) ? t.id : "";
+            let revertBtn = "";
+            if (status === "completed" && stepNum) {
+                revertBtn = ` <button class="agent-checklist-revert" data-step="${escapeHtml(stepNum)}" title="Revert to after step ${stepNum}">Revert to here</button>`;
+            }
+            html += `<div class="agent-checklist-item agent-checklist-${statusCls}"><span class="agent-checklist-status">${status === "completed" ? "\u2713" : status === "in_progress" ? "\u25B6" : "\u25CB"}</span><span class="agent-checklist-content">${escapeHtml(content)}</span>${revertBtn}</div>`;
+        });
+        html += `</div>`;
+        block.innerHTML = html;
+        block.querySelectorAll(".agent-checklist-revert").forEach(btn => {
+            const step = parseInt(btn.getAttribute("data-step"), 10);
+            if (!isNaN(step)) btn.addEventListener("click", () => {
+                if (confirm(`Revert all changes back to the end of step ${step}?`)) send({ type: "revert_to_step", step });
+            });
+        });
+        scrollChat();
+    }
+
+    function updatePlanStepProgress(stepNum, totalSteps) {
+        if (currentChecklistItems.length === 0) return;
+        currentChecklistItems.forEach((item, i) => {
+            const num = i + 1;
+            item.status = num < stepNum ? "completed" : num === stepNum ? "in_progress" : "pending";
+        });
+        showAgentChecklist(currentChecklistItems, { stepNum, totalSteps });
     }
 
     function markPlanComplete() {
-        const planBlock = document.getElementById("active-plan");
-        if (!planBlock) return;
-
-        // Mark all steps as done
-        planBlock.querySelectorAll(".plan-step").forEach(el => {
-            el.classList.remove("step-active", "step-pending");
-            el.classList.add("step-done");
-            const numEl = el.querySelector(".plan-step-num");
-            if (numEl) numEl.innerHTML = "\u2713";
-        });
-
-        // Update progress bar to 100%
-        const prog = planBlock.querySelector(".plan-progress");
-        if (prog) {
-            const total = planBlock.querySelectorAll(".plan-step").length;
-            prog.innerHTML = `<div class="plan-progress-bar"><div class="plan-progress-fill" style="width:100%"></div></div><span class="plan-progress-text">\u2713 All ${total} steps complete</span>`;
-        }
+        currentChecklistItems.forEach(item => { item.status = "completed"; });
+        showAgentChecklist(currentChecklistItems);
     }
 
     // ================================================================
@@ -2651,6 +2579,9 @@
                 );
                 setRunning(false);
                 break;
+            case "todos_updated":
+                showAgentChecklist(evt.todos || (evt.data && evt.data.todos) || []);
+                break;
             case "plan_step_progress":
                 updatePlanStepProgress(
                     evt.step || (evt.data && evt.data.step) || 1,
@@ -2763,14 +2694,14 @@
                 scrollChat();
                 break;
             case "replay_state":
-                // Restore interactive UI state after reconnect (plan block with "Open in Editor")
+                if (evt.todos && evt.todos.length > 0) {
+                    showAgentChecklist(evt.todos);
+                } else if (evt.pending_plan && evt.pending_plan.length > 0) {
+                    currentChecklistItems = evt.pending_plan.map((s, i) => ({ id: String(i + 1), content: s, status: "pending" }));
+                    showAgentChecklist(currentChecklistItems);
+                }
                 if (evt.awaiting_build && evt.pending_plan) {
-                    showPlan(
-                        evt.pending_plan,
-                        evt.plan_file || null,
-                        evt.plan_text || ""
-                    );
-                    // Don't setRunning(false) — we want the user to click Build
+                    showPlan(evt.pending_plan, evt.plan_file || null, evt.plan_text || "", !!evt.todos?.length);
                 }
                 if (evt.awaiting_keep_revert && evt.has_diffs) {
                     if (evt.diffs && evt.diffs.length > 0) {

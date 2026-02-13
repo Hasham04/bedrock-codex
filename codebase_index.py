@@ -18,6 +18,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+def _index_cache_root() -> str:
+    """Root directory for index cache (e.g. SSH project indexes stored locally)."""
+    return os.path.join(os.path.expanduser("~"), ".bedrock-codex")
+
+
+def _project_key_for_ssh(working_directory: str) -> str:
+    """Stable cache key for an SSH project (normalized path hash)."""
+    from sessions import _normalize_wd
+    normalized = _normalize_wd(working_directory)
+    return "ssh-" + hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
 # Chunk text max length for embedding (Cohere ~512 tokens, ~1500 chars safe)
 CHUNK_TEXT_MAX = 1500
 # Files/dirs to skip (same spirit as .cursorignore)
@@ -174,8 +187,45 @@ class CodebaseIndex:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump({"file_hashes": self.file_hashes}, f, indent=0)
 
+    def _list_indexable_files_remote(self, backend: Any) -> List[str]:
+        """List relative paths of indexable files via backend (SSH). BFS over list_dir."""
+        out: List[str] = []
+        try:
+            queue: List[str] = ["."]
+            while queue:
+                rel_dir = queue.pop(0)
+                entries = backend.list_dir(rel_dir)
+                for e in entries:
+                    name = e.get("name", "")
+                    if not name or name.startswith("."):
+                        continue
+                    typ = e.get("type", "file")
+                    if typ == "directory":
+                        if name in INDEX_SKIP_DIRS:
+                            continue
+                        sub = (rel_dir + "/" + name) if rel_dir != "." else name
+                        queue.append(sub)
+                        continue
+                    if typ != "file":
+                        continue
+                    rel = (rel_dir + "/" + name) if rel_dir != "." else name
+                    rel = rel.replace("\\", "/")
+                    if rel.startswith(".bedrock-codex/") or "/.bedrock-codex/" in rel:
+                        continue
+                    if not _should_index(rel):
+                        continue
+                    ext = os.path.splitext(name)[1].lower()
+                    if f".{ext}" in INDEX_SKIP_EXTENSIONS or ext in ("", ".md", ".txt"):
+                        continue
+                    out.append(rel)
+        except Exception as e:
+            logger.warning("List indexable files (remote) failed: %s", e)
+        return out
+
     def _list_indexable_files(self, backend: Any) -> List[str]:
-        """List relative paths of indexable files under working_directory."""
+        """List relative paths of indexable files under working_directory (local or via backend)."""
+        if backend is not None and getattr(backend, "_host", None) is not None:
+            return self._list_indexable_files_remote(backend)
         out = []
         try:
             for root, dirs, files in os.walk(self.working_directory):
@@ -209,9 +259,8 @@ class CodebaseIndex:
         Returns number of chunks indexed.
         """
         import numpy as np
-        # Indexing only for local backend (SSH would require remote walk/read)
-        if backend is None or getattr(backend, "_host", None) is not None:
-            logger.debug("Codebase index build skipped (remote or no backend)")
+        if backend is None:
+            logger.debug("Codebase index build skipped (no backend)")
             return len(self.chunks)
         self._load_metadata()
         try:
@@ -341,10 +390,22 @@ def get_embed_fn() -> Optional[Any]:
     return _global_embed_fn
 
 
-def get_index(working_directory: str, embed_fn: Optional[Any] = None) -> CodebaseIndex:
-    """Get or create the codebase index for this workspace."""
+def get_index(
+    working_directory: str,
+    embed_fn: Optional[Any] = None,
+    backend: Optional[Any] = None,
+) -> CodebaseIndex:
+    """Get or create the codebase index for this workspace.
+    For SSH backends, index is stored in a local cache (~/.bedrock-codex/indexes/<key>).
+    """
+    index_dir: Optional[str] = None
+    if backend is not None and getattr(backend, "_host", None) is not None:
+        cache_root = os.path.join(_index_cache_root(), "indexes")
+        project_key = _project_key_for_ssh(working_directory)
+        index_dir = os.path.join(cache_root, project_key)
     index = CodebaseIndex(
         working_directory=working_directory,
+        index_dir=index_dir,
         embed_fn=embed_fn if embed_fn is not None else _global_embed_fn,
     )
     index.load_from_disk()

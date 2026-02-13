@@ -694,9 +694,11 @@ async def write_file(request: Request):
     """Save file content from the editor."""
     b = _backend or LocalBackend(os.path.abspath(_working_directory))
     body = await request.json()
-    rel_path = body.get("path", "")
+    rel_path = (body.get("path", "") or "").strip().replace("\\", "/")
     content = body.get("content", "")
 
+    if not rel_path or ".." in rel_path or rel_path.startswith("/"):
+        return JSONResponse({"ok": False, "error": "Invalid path"}, status_code=400)
     try:
         await asyncio.to_thread(b.write_file, rel_path, content)
         return {"ok": True, "path": rel_path}
@@ -1203,6 +1205,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 "scout_context": state.get("scout_context"),
                 "file_snapshots": state.get("file_snapshots", {}),
                 "plan_step_index": state.get("plan_step_index", 0),
+                "todos": state.get("todos", []),
                 # UI state for reconnection
                 "awaiting_build": awaiting_build,
                 "awaiting_keep_revert": awaiting_keep_revert,
@@ -1393,6 +1396,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             "awaiting_build": awaiting_build,
             "awaiting_keep_revert": awaiting_keep_revert,
         }
+        todos = getattr(agent, "_todos", None) or []
+        if todos:
+            state_msg["todos"] = todos
         if awaiting_build and pending_plan:
             state_msg["pending_plan"] = pending_plan
             state_msg["plan_step_index"] = agent._plan_step_index
@@ -1477,24 +1483,41 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         return True
 
     # ------------------------------------------------------------------
-    # Diff generation
+    # Diff generation (works for both local and SSH: SSH uses backend.read_file)
     # ------------------------------------------------------------------
+
+    def _rel_from_working(abs_path: str, working_directory: str) -> str:
+        """Return path relative to working_directory (POSIX-style for SSH)."""
+        norm_wd = (working_directory or "").rstrip("/")
+        norm_abs = (abs_path or "").replace("\\", "/")
+        if norm_abs == norm_wd:
+            return "."
+        if norm_wd and norm_abs.startswith(norm_wd + "/"):
+            return norm_abs[len(norm_wd) + 1:]
+        return norm_abs.split("/")[-1] if "/" in norm_abs else norm_abs
 
     def generate_diffs() -> List[Dict[str, Any]]:
         modified = agent.modified_files
         if not modified:
             return []
-
+        is_ssh = getattr(agent.backend, "_host", None) is not None
         diffs = []
         for abs_path, original in modified.items():
-            rel = os.path.relpath(abs_path, wd)
-            old_lines = (original or "").splitlines(keepends=True)
-            try:
-                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-                    new_content = f.read()
-            except FileNotFoundError:
-                new_content = ""
+            if is_ssh:
+                rel = _rel_from_working(abs_path, agent.working_directory)
+                try:
+                    new_content = agent.backend.read_file(abs_path)
+                except Exception:
+                    new_content = ""
+            else:
+                rel = os.path.relpath(abs_path, wd)
+                try:
+                    with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                        new_content = f.read()
+                except FileNotFoundError:
+                    new_content = ""
             new_lines = new_content.splitlines(keepends=True)
+            old_lines = (original or "").splitlines(keepends=True)
 
             diff_lines = list(difflib.unified_diff(
                 old_lines, new_lines,

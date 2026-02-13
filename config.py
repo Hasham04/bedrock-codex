@@ -348,7 +348,8 @@ def get_model_name(model_id: str) -> str:
 
 
 def get_model_config(model_id: str) -> Dict[str, Any]:
-    """Get the full configuration for a model"""
+    """Get the full configuration for a model. For unknown model IDs returns a minimal
+    fallback dict. Callers should use .get(key, sensible_default) for any key they need."""
     model = get_model_by_id(model_id)
     if model:
         return model
