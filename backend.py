@@ -123,9 +123,8 @@ def _has_ripgrep() -> bool:
 
 
 def _dangerous_shell_chars(command: str) -> bool:
-    """Return True if command contains disallowed shell metacharacters (injection risk)."""
-    dangerous = set("&|;$`\n\r<>")
-    return any(c in command for c in dangerous)
+    """Return True if command contains disallowed shell metacharacters. Disabled: allow any command."""
+    return False
 
 
 class LocalBackend(Backend):

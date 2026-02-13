@@ -2747,7 +2747,7 @@
         const text = $input.value.trim();
         const hasImages = pendingImages.length > 0;
         if ((!text && !hasImages) || isRunning) return;
-        if (text.startsWith("/") && !hasImages) { handleCommand(text); $input.value = ""; autoResizeInput(); return; }
+        if (text.startsWith("/") && /^\/[a-zA-Z]/.test(text) && !hasImages) { handleCommand(text); $input.value = ""; autoResizeInput(); return; }
 
         let imagesPayload = [];
         if (hasImages) {
