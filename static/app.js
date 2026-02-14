@@ -1654,7 +1654,7 @@
     function toolActionIcon(kind) {
         const icons = {
             done: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
-            pending: `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5" stroke="currentColor" stroke-width="2" fill="none"/></svg>`,
+            pending: `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" stroke="currentColor" stroke-width="2" fill="none"/></svg>`,
             failed: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>`,
             open: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
             rerun: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
@@ -1664,6 +1664,8 @@
             pause: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1" stroke="currentColor" stroke-width="2" fill="none"/><rect x="14" y="5" width="4" height="14" rx="1" stroke="currentColor" stroke-width="2" fill="none"/></svg>`,
             play: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>`,
             more: `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="6" r="1.5" fill="currentColor"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/><circle cx="12" cy="18" r="1.5" fill="currentColor"/></svg>`,
+            revert: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10h10a5 5 0 0 1 5 5v0M3 10l4-4M3 10l4 4" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+            plus: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
         };
         return icons[kind] || "";
     }
@@ -1923,7 +1925,6 @@
 
         if (canReuse) {
             group = lastToolGroup;
-            group.classList.remove("collapsed");
             group.dataset.lastAt = String(now);
             group.dataset.count = String(Number(group.dataset.count || "1") + 1);
             updateToolGroupHeader(group);
@@ -1981,6 +1982,7 @@
                     </div>
                     <div class="tool-run-list"></div>
                 </div>`;
+            group.classList.add("collapsed");
             group.querySelector(".tool-header").addEventListener("click", () => group.classList.toggle("collapsed"));
 
             const optionsWrap = group.querySelector(".tool-options-wrap");
@@ -2345,7 +2347,7 @@
         // Compact tab: open plan in editor (no full plan text in panel)
         let html = `<div class="plan-tab-row">`;
         if (planFile) {
-            html += `<button type="button" class="plan-open-tab" title="Open plan in editor (injected back for editing)" data-path="${escapeHtml(planFile)}">\uD83D\uDCC4 Open in Editor</button>`;
+            html += `<button type="button" class="plan-open-tab" title="Open plan in editor" aria-label="Open in editor" data-path="${escapeHtml(planFile)}">${toolActionIcon("open")}</button>`;
         }
         html += `</div>`;
 
@@ -2449,7 +2451,7 @@
                 const todoId = t.id != null ? String(t.id) : "";
                 let revertBtn = "";
                 if (status === "completed" && stepNum) {
-                    revertBtn = ` <button class="agent-checklist-revert" data-step="${escapeHtml(stepNum)}" title="Revert to after step ${stepNum}">Revert to here</button>`;
+                    revertBtn = ` <button type="button" class="agent-checklist-revert" data-step="${escapeHtml(stepNum)}" title="Revert to after step ${stepNum}" aria-label="Revert to here">${toolActionIcon("revert")}</button>`;
                 }
                 const removeBtn = `<button type="button" class="agent-checklist-remove" data-todo-id="${escapeHtml(todoId)}" title="Remove task" aria-label="Remove">\u00D7</button>`;
                 html += `<div class="agent-checklist-item agent-checklist-${statusCls}"><span class="agent-checklist-status">${status === "completed" ? "\u2713" : status === "in_progress" ? "\u25B6" : "\u25CB"}</span><span class="agent-checklist-content">${escapeHtml(content)}</span>${revertBtn}${removeBtn}</div>`;
@@ -2460,7 +2462,7 @@
         html += `</div>
             <div class="agent-checklist-add-row">
                 <input type="text" class="agent-checklist-add-input" placeholder="Add a task..." maxlength="500" />
-                <button type="button" class="agent-checklist-add-btn" title="Add task">Add</button>
+                <button type="button" class="agent-checklist-add-btn" title="Add task" aria-label="Add task">${toolActionIcon("plus")}</button>
             </div>`;
         block.innerHTML = html;
         block.querySelectorAll(".agent-checklist-revert").forEach(btn => {
@@ -3068,7 +3070,11 @@
     }
     $sendBtn.addEventListener("click", submitTask);
     $cancelBtn.addEventListener("click", () => send({type:"cancel"}));
-    $resetBtn.addEventListener("click", () => send({type:"reset"}));
+    $resetBtn.addEventListener("click", () => {
+        if (confirm("Clear this conversation and start a new one? This cannot be undone.")) {
+            send({ type: "reset" });
+        }
+    });
     if ($newAgentBtn) {
         $newAgentBtn.addEventListener("click", createNewAgentSession);
     }

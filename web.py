@@ -69,6 +69,7 @@ async def no_cache_static(request, call_next):
 _working_directory: str = "."
 _backend: Optional[Backend] = None  # Set at startup; LocalBackend or SSHBackend
 _explicit_dir: bool = False  # True if --dir was explicitly set (skip welcome)
+_user_opened_project: bool = False  # True once user opens a project from welcome (skip welcome on refresh)
 _ssh_info: Optional[Dict[str, Any]] = None  # Saved SSH details for current connection
 
 # Shared agent reference so REST endpoints can access snapshots
@@ -130,7 +131,7 @@ async def info():
         "caching": supports_caching(model_config.model_id),
         "working_directory": os.path.abspath(_working_directory),
         "plan_phase_enabled": app_config.plan_phase_enabled,
-        "show_welcome": not _explicit_dir,
+        "show_welcome": not _explicit_dir and not _user_opened_project,
     }
 
 
@@ -281,7 +282,7 @@ async def ssh_list_dir(request: Request):
 @app.post("/api/ssh-connect")
 async def ssh_connect(request: Request):
     """Connect to a remote host via SSH at runtime."""
-    global _backend, _working_directory, _ssh_info
+    global _backend, _working_directory, _ssh_info, _user_opened_project
     body = await request.json()
     host = str(body.get("host", "") or "").strip()
     user = str(body.get("user", "") or "").strip()
@@ -347,6 +348,7 @@ async def ssh_connect(request: Request):
         }
         display = f"{user}@{host}:{directory}"
         logger.info(f"SSH connected to {display}")
+        _user_opened_project = True
         return {"ok": True, "path": _working_directory}
     except Exception as e:
         logger.error(f"SSH connection failed: {e}")
@@ -356,7 +358,7 @@ async def ssh_connect(request: Request):
 @app.post("/api/set-directory")
 async def set_directory(body: dict):
     """Change the working directory at runtime."""
-    global _working_directory, _backend, _ssh_info
+    global _working_directory, _backend, _ssh_info, _user_opened_project
     raw = body.get("path", "").strip()
     if not raw:
         return JSONResponse({"ok": False, "error": "No path provided"}, status_code=400)
@@ -370,6 +372,7 @@ async def set_directory(body: dict):
     _working_directory = resolved
     _backend = LocalBackend(resolved)
     _ssh_info = None  # Clear SSH info when switching to local
+    _user_opened_project = True
     return {"ok": True, "path": resolved}
 
 
@@ -1727,6 +1730,10 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                         pending_plan = plan_steps
                         pending_images = list(task_images or [])
                         awaiting_build = True
+                        try:
+                            await asyncio.to_thread(save_session)
+                        except Exception:
+                            pass  # don't break on save failure; replay will still send plan from agent state
                     else:
                         await ws.send_json({"type": "no_plan"})
                 else:
