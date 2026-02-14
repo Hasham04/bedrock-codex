@@ -1666,6 +1666,7 @@
             more: `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="6" r="1.5" fill="currentColor"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/><circle cx="12" cy="18" r="1.5" fill="currentColor"/></svg>`,
             revert: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10h10a5 5 0 0 1 5 5v0M3 10l4-4M3 10l4 4" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
             plus: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+            pen: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 11l6 6 2-2-6-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M15 5l4 4" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
         };
         return icons[kind] || "";
     }
@@ -2240,6 +2241,7 @@
             edit_file: "Edit",
             glob_find: "Glob",
             run_command: "Bash",
+            SemanticRetrieve: "semantic_retrieve",
         };
         return map[n] || n;
     }
@@ -2263,8 +2265,9 @@
             WebFetch: "Fetch",
             WebSearch: "Search web",
             semantic_retrieve: "Code search",
+            SemanticRetrieve: "Code search",
         };
-        return titles[n] || toolLabel(n);
+        return titles[n] || titles[typeof n === "string" ? n.replace(/([A-Z])/g, "_$1").toLowerCase().replace(/^_/, "") : n] || toolLabel(n);
     }
     function toolDesc(n, i) {
         /* Used for grouping; keep so distinct calls (e.g. different paths) stay in separate groups. */
@@ -2318,6 +2321,7 @@
             Bash: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`,
             search: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`,
             semantic_retrieve: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="10" cy="10" r="7"/><line x1="19" y1="19" x2="15.5" y2="15.5"/><line x1="6" y1="14" x2="14" y2="14"/><line x1="6" y1="17" x2="12" y2="17"/><line x1="6" y1="20" x2="13" y2="20"/></svg>`,
+            SemanticRetrieve: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="10" cy="10" r="7"/><line x1="19" y1="19" x2="15.5" y2="15.5"/><line x1="6" y1="14" x2="14" y2="14"/><line x1="6" y1="17" x2="12" y2="17"/><line x1="6" y1="20" x2="13" y2="20"/></svg>`,
             find_symbol: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16"/><path d="M7 4v3a5 5 0 0 0 10 0V4"/><line x1="12" y1="17" x2="12" y2="21"/><line x1="8" y1="21" x2="16" y2="21"/></svg>`,
             list_directory: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`,
             Glob: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><path d="M11 8v6"/><path d="M8 11h6"/></svg>`,
@@ -2329,7 +2333,8 @@
             WebFetch: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`,
             WebSearch: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><path d="M8 11h6"/></svg>`,
         };
-        return svgs[n] || `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/></svg>`;
+        const snake = typeof n === "string" ? n.replace(/([A-Z])/g, "_$1").toLowerCase().replace(/^_/, "") : n;
+        return svgs[n] || svgs[snake] || `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/></svg>`;
     }
 
     // ================================================================
@@ -2462,7 +2467,7 @@
         html += `</div>
             <div class="agent-checklist-add-row">
                 <input type="text" class="agent-checklist-add-input" placeholder="Add a task..." maxlength="500" />
-                <button type="button" class="agent-checklist-add-btn" title="Add task" aria-label="Add task">${toolActionIcon("plus")}</button>
+                <button type="button" class="agent-checklist-add-btn" title="Add task" aria-label="Add task">${toolActionIcon("pen")}</button>
             </div>`;
         block.innerHTML = html;
         block.querySelectorAll(".agent-checklist-revert").forEach(btn => {
@@ -2599,9 +2604,11 @@
         ta.focus();
     }
     function showPhase(name) {
+        const bubble = getOrCreateBubble();
         const div = document.createElement("div"); div.className = "phase-indicator"; div.id = `phase-${name}`;
         div.innerHTML = `<div class="spinner"></div><span>${escapeHtml(phaseLabel(name))}</span>`;
-        $chatMessages.appendChild(div); scrollChat();
+        bubble.appendChild(div);
+        scrollChat();
     }
     function endPhase(name, elapsed) {
         const el = document.getElementById(`phase-${name}`);
@@ -2706,28 +2713,39 @@
 
     function handleEvent(evt) {
         switch (evt.type) {
-            case "init":
+            case "init": {
                 $modelName.textContent = evt.model_name || "?";
                 currentSessionId = evt.session_id || currentSessionId;
                 if ($conversationTitle) $conversationTitle.textContent = evt.session_name || "New conversation";
-                $tokenCount.textContent = formatTokens(evt.total_tokens || 0) + " tokens";
+                if (evt.input_tokens !== undefined && evt.output_tokens !== undefined) {
+                    const parts = [`In: ${formatTokens(evt.input_tokens)}`, `Out: ${formatTokens(evt.output_tokens)}`];
+                    if (evt.cache_read) parts.push(`Cache: ${formatTokens(evt.cache_read)}`);
+                    $tokenCount.textContent = parts.join(" | ");
+                    $tokenCount.title = `Input: ${(evt.input_tokens || 0).toLocaleString()} | Output: ${(evt.output_tokens || 0).toLocaleString()} | Cache: ${(evt.cache_read || 0).toLocaleString()}`;
+                } else {
+                    $tokenCount.textContent = formatTokens(evt.total_tokens || 0) + " tokens";
+                    $tokenCount.title = "Total tokens used";
+                }
                 $workingDir.textContent = evt.working_directory || "";
+                // Reset context gauge so we don't show stale yellow/red from previous session
+                const gaugeFill = document.getElementById("context-gauge-fill");
+                const gauge = document.getElementById("context-gauge");
+                if (gaugeFill) { gaugeFill.style.width = "0%"; gaugeFill.className = "context-gauge-fill"; }
+                if (gauge) gauge.title = "Context window usage";
                 loadAgentSessions();
                 toolRunById.clear();
                 if (_isFirstConnect) {
-                    // First connect: clear chat, load tree fresh
                     $chatMessages.innerHTML = "";
                     if ($conversationTitle) $conversationTitle.textContent = "New conversation";
                     loadTree();
                 } else {
-                    // Reconnect: clear chat before replay rebuilds it,
-                    // but don't flash — the reconnect banner covers the gap
                     $chatMessages.innerHTML = "";
                     if ($conversationTitle) $conversationTitle.textContent = "New conversation";
                     loadTree();
                 }
                 _isFirstConnect = false;
                 break;
+            }
             case "thinking_start": currentThinkingEl = createThinkingBlock(); break;
             case "thinking":
                 if (currentThinkingEl) {

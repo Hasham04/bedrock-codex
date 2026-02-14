@@ -1649,6 +1649,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             "session_name": session.name if session else "default",
             "message_count": session.message_count if session else 0,
             "total_tokens": agent.total_tokens,
+            "input_tokens": getattr(agent, "_total_input_tokens", 0),
+            "output_tokens": getattr(agent, "_total_output_tokens", 0),
+            "cache_read": getattr(agent, "_cache_read_tokens", 0),
             "is_ssh": is_ssh,
         })
 
@@ -1672,6 +1675,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 })
             except Exception:
                 pass
+
+        # Send status so token badge and context gauge are correct after connect (not stale 0 / yellow)
+        await _send_status()
 
         # State for Cursor-style clarifying questions (plan phase asks user, we wait for answer)
         _pending_question = {"future": None, "tool_use_id": None}

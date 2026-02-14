@@ -656,7 +656,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "MemoryWrite",
-        "description": "Store a fact or preference for the rest of this session (e.g. 'user prefers TypeScript', 'API base URL is https://api.example.com'). Key should be a short identifier; value can be a string or brief structured fact. Overwrites existing key. Use for user preferences, decisions, or context you want to reuse.",
+        "description": "Store a critical or important fact for the rest of this session so you can reuse it later. Use when you learn: user preferences (e.g. 'preferred_language: TypeScript'), key decisions, project conventions, important errors and how they were fixed, or environment/config facts. Key: short identifier (e.g. 'api_base', 'auth_package'). Value: concise string. Do not store trivial or one-off details. Overwrites existing key. Be contextually aware: write when the information would help you in a future message or session.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -669,7 +669,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "MemoryRead",
-        "description": "Retrieve one or all stored facts. Call with no key (or key omitted) to get all stored facts; call with key to get a single value. Returns empty or the value(s).",
+        "description": "Retrieve stored facts. Call with no key to get all facts; with key to get one value. Use at the start of a follow-up task, when the user asks what you know, or before acting when stored context (preferences, prior decisions) could change your approach.",
         "input_schema": {
             "type": "object",
             "properties": {
