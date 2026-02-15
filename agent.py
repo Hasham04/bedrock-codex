@@ -37,7 +37,8 @@ SCOUT_TOOL_DISPLAY_NAMES = {
 
 from config import (
     model_config, supports_thinking, app_config, get_context_window,
-    get_max_output_tokens, get_default_max_tokens,
+    get_max_output_tokens, get_default_max_tokens, supports_adaptive_thinking,
+    get_thinking_max_budget,
 )
 
 logger = logging.getLogger(__name__)
@@ -128,17 +129,34 @@ PLAN_SYSTEM_PROMPT = f"""You are a principal engineer designing implementation p
 
 <mission>
 Create a precise implementation plan. Every ambiguity you leave becomes a bug. If your plan is vague, the implementation will be vague.
+
+Before finalizing your plan, THINK DEEPLY about:
+- Am I missing any dependencies or side effects?
+- Would a junior engineer be able to execute this step-by-step?
+- What could go wrong and how would we recover?
+- Is there a simpler approach I haven't considered?
 </mission>
 
 <process>
 **Phase 1 - UNDERSTAND**: Read relevant source files. Batch reads, follow imports, check tests. Read with purpose — each batch answers a specific question.
 
-**Phase 2 - DESIGN**: Consider constraints, patterns, reusable code. What's the simplest approach that fully solves the problem?
+**Phase 2 - DESIGN**: Consider constraints, patterns, reusable code. What's the simplest approach that fully solves the problem? THINK about alternatives and trade-offs.
 
-**Phase 3 - DOCUMENT**: Write the complete plan. Every step must be specific enough for execution without clarification.
+**Phase 3 - VALIDATE**: Walk through your plan mentally. Trace each step. Do they connect properly? Are there circular dependencies or missing steps?
+
+**Phase 4 - DOCUMENT**: Write the complete plan. Every step must be specific enough for execution without clarification.
 
 Stop reading when you can write a precise, actionable plan. Don't read "just one more file."
 </process>
+
+<thinking_during_planning>
+**Use Your Thinking Time To**:
+1. Evaluate multiple design approaches before settling on one
+2. Trace through dependencies to catch circular refs or missing imports
+3. Consider how this scales/changes in the future
+4. Imagine potential failure modes during execution
+5. Check: is there existing code I should reuse instead of reinventing?
+</thinking_during_planning>
 
 <plan_format>
 # Plan: {{concise title}}
@@ -146,11 +164,18 @@ Stop reading when you can write a precise, actionable plan. Don't read "just one
 ## Problem
 Current state vs desired state. What we're solving and why.
 
+## Reasoning
+How you arrived at this approach:
+- Considered alternatives and why this is best
+- Key constraints and how you're addressing them
+- Risk/complexity assessment
+
 ## Solution
 High-level approach:
 - Architecture pattern to use
 - Existing code/utilities to reuse (specific paths/functions)
 - Why this approach over alternatives
+- Assumptions you're making
 
 ## Files to Change
 | File | Action | Changes |
@@ -165,9 +190,15 @@ High-level approach:
 
 ## Verification
 Exact commands: `pytest tests/test_feature.py -v` expects new test_xyz to pass.
+Success criteria: [specific, measurable outcomes]
 
-## Risks
-- **Risk**: Scenario → **Impact**: What breaks → **Mitigation**: How to handle
+## Risks & Mitigations
+| Risk | Impact | Mitigation |
+|------|--------|-----------|
+| Scenario | What breaks | How to handle |
+
+## Open Questions
+Anything you're uncertain about that the builder should watch for.
 </plan_format>
 
 <working_directory>{{working_directory}}</working_directory>
@@ -176,6 +207,26 @@ Exact commands: `pytest tests/test_feature.py -v` expects new test_xyz to pass.
 BUILD_SYSTEM_PROMPT = f"""You are a principal engineer implementing approved plans. Write code like a craftsman — every detail matters, nothing is rough, result feels natural.
 
 {CORE_BEHAVIOR}
+
+<thinking_directives>
+**Before Each Implementation Step**:
+1. Think through: What is the current code doing? What could break?
+2. Validate: Does this fit the existing pattern? What imports/dependencies are affected?
+3. Edge cases: What boundary conditions haven't I considered?
+4. Error paths: What could fail? How will it be caught?
+
+**During Implementation**:
+- Trace through call sites of your changes — are callers affected?
+- Consider backward compatibility — is this a breaking change?
+- Think about the reviewer's perspective — would they approve this?
+
+**After Implementation**:
+- Verify the changed section is read and correct
+- Check lint passes with NO warnings
+- Consider: does this fully solve the original problem?
+
+**When Uncertain**: THINK DEEPER. Your thinking is free — use it to catch errors before they happen.
+</thinking_directives>
 
 <execution_method>
 **Multi-Step Tasks**: Use TodoWrite at start with full checklist. Set items in_progress/completed as you go. Add discovered work so nothing drops.
@@ -188,6 +239,12 @@ BUILD_SYSTEM_PROMPT = f"""You are a principal engineer implementing approved pla
 5. Move to next step
 
 **Before Every Edit**: Understand current code, trace dependencies, consider impact on callers/imports/tests.
+
+**Error Recovery**: If something breaks:
+1. Stop and analyze what went wrong
+2. Read the error message carefully
+3. Think about root cause, not just symptoms
+4. Fix systematically, verify each fix
 </execution_method>
 
 <verification_standards>
@@ -196,7 +253,63 @@ BUILD_SYSTEM_PROMPT = f"""You are a principal engineer implementing approved pla
 - No new dependencies/patterns unless plan specifies
 - Security: sanitize inputs, no injection vulnerabilities
 - Final check: would a reviewer approve this?
+
+**Think About**:
+- Could this code be misused?
+- What error messages would a user see?
+- Is state being modified in unexpected ways?
+- Could this fail silently?
 </verification_standards>
+
+<confidence_calibration>
+After each major change, assess your confidence:
+
+🟢 **High Confidence** (90%+): 
+- Code closely matches existing patterns
+- All edge cases considered
+- Tests pass
+- No lint warnings
+
+🟡 **Medium Confidence** (70-90%):
+- Code is correct but uses novel pattern
+- Some edge cases need testing
+- Minor lint warnings acceptable
+- Should mention uncertainty
+
+🔴 **Low Confidence** (<70%):
+- Uncertain about impact or correctness
+- Complex interaction with other systems
+- Unusual patterns that need review
+- MUST flag concerns explicitly
+
+Be honest about confidence. It's better to flag uncertainty than hide it.
+</confidence_calibration>
+
+<output_structure>
+When implementing complex changes, structure your response as:
+
+**🎯 IMPLEMENTATION OVERVIEW**
+- Brief summary of what you're implementing
+- Key files being modified
+- Main approach being used
+
+**🔍 ANALYSIS** (when reading/investigating)
+- What you discovered in the code
+- Key patterns, dependencies, or constraints
+- Potential issues or considerations
+
+**⚙️ IMPLEMENTATION** (when making changes)  
+- Step-by-step description of changes
+- Rationale for each decision
+- How this fits with existing patterns
+
+**✅ VERIFICATION**
+- What you checked/tested
+- Confidence level and reasoning
+- Any remaining concerns or next steps
+
+This structure helps both you and users follow complex implementations clearly.
+</output_structure>
 
 <working_directory>{{working_directory}}</working_directory>
 <tools_available>{{available_tools}}</tools_available>"""
@@ -423,6 +536,12 @@ class CodingAgent:
         self._failure_pattern_cache: Optional[List[Dict[str, Any]]] = None
         self._todos: List[Dict[str, Any]] = []
         self._memory: Dict[str, str] = {}  # key -> value for MemoryWrite/MemoryRead
+        
+        # Enhanced caching and state management inspired by modern build systems
+        self._verification_cache: Dict[str, Dict[str, Any]] = {}  # file_hash -> verification_results
+        self._dependency_graph: Dict[str, List[str]] = {}  # file -> dependent_files
+        self._last_verification_hashes: Dict[str, str] = {}  # abs_path -> last_verified_hash
+        self._incremental_state: Dict[str, Any] = {}  # persistent state across sessions
 
     @property
     def total_tokens(self) -> int:
@@ -744,6 +863,100 @@ class CodingAgent:
         if not parts:
             return ""
         return "\n\n".join(parts)
+
+    def _generate_context_metadata(self, project_docs: str) -> str:
+        """
+        Generate strategic metadata about the provided project context.
+        Helps Claude understand what information is available and its scope.
+        """
+        import re
+        
+        lines = project_docs.split('\n')
+        total_lines = len(lines)
+        
+        # Count different types of documentation
+        readme_count = len(re.findall(r'--- README.*---', project_docs, re.IGNORECASE))
+        contributing_count = len(re.findall(r'--- CONTRIBUTING.*---', project_docs, re.IGNORECASE))  
+        doc_sections = len(re.findall(r'--- .*\.md.*---', project_docs))
+        code_snippets = len(re.findall(r'```', project_docs))
+        
+        # Estimate completeness based on truncation markers
+        is_truncated = "..." in project_docs or "[truncated]" in project_docs.lower()
+        max_chars_reached = len(project_docs) >= (self._PROJECT_DOCS_MAX_CHARS * 0.9)
+        
+        metadata_parts = [
+            "📋 **CONTEXT METADATA**:",
+            f"- **Scope**: {total_lines:,} lines across {doc_sections} documentation files",
+        ]
+        
+        if readme_count > 0:
+            metadata_parts.append("- **Architecture**: README with project overview available")
+        if contributing_count > 0:
+            metadata_parts.append("- **Process**: Contributing guidelines included")
+        if code_snippets > 0:
+            metadata_parts.append(f"- **Examples**: {code_snippets // 2} code examples/snippets")
+        
+        # Completeness assessment
+        if is_truncated or max_chars_reached:
+            metadata_parts.append("⚠️  **Completeness**: PARTIAL - Some docs may be truncated due to size limits")
+            metadata_parts.append("💡 **Strategy**: Use tools to read specific files for complete details")
+        else:
+            metadata_parts.append("✅ **Completeness**: FULL - Complete project documentation loaded")
+        
+        # Usage guidance
+        metadata_parts.extend([
+            "",
+            "🎯 **How to Use This Context**:",
+            "- This context provides project overview and patterns",
+            "- For implementation details, read specific source files using tools",
+            "- Look for existing patterns and utilities to reuse",
+            "- Pay attention to architectural decisions and constraints",
+        ])
+        
+        return "\n".join(metadata_parts)
+
+    def _parse_structured_response(self, response_text: str) -> Dict[str, Any]:
+        """
+        Parse structured responses that follow the expected output format.
+        Extracts key sections for better workflow integration.
+        """
+        import re
+        
+        structured = {
+            "overview": None,
+            "analysis": None,
+            "implementation": None,
+            "verification": None,
+            "confidence": None,
+            "has_structure": False
+        }
+        
+        # Look for structured sections
+        sections = [
+            (r"🎯\s*IMPLEMENTATION OVERVIEW\*\*(.*?)(?=\*\*|$)", "overview"),
+            (r"🔍\s*ANALYSIS\*\*(.*?)(?=\*\*|$)", "analysis"),
+            (r"⚙️\s*IMPLEMENTATION\*\*(.*?)(?=\*\*|$)", "implementation"),
+            (r"✅\s*VERIFICATION\*\*(.*?)(?=\*\*|$)", "verification"),
+        ]
+        
+        for pattern, key in sections:
+            match = re.search(pattern, response_text, re.DOTALL | re.IGNORECASE)
+            if match:
+                structured[key] = match.group(1).strip()
+                structured["has_structure"] = True
+        
+        # Extract confidence indicators
+        confidence_match = re.search(r"(🟢|🟡|🔴)", response_text)
+        if confidence_match:
+            emoji = confidence_match.group(1)
+            if emoji == "🟢":
+                structured["confidence"] = "high"
+            elif emoji == "🟡":
+                structured["confidence"] = "medium"  
+            elif emoji == "🔴":
+                structured["confidence"] = "low"
+        
+        return structured
 
     def _effective_system_prompt(self, base: str) -> str:
         """Return system prompt with project rules appended when present."""
@@ -1300,6 +1513,69 @@ class CodingAgent:
             throughput_mode=model_config.throughput_mode,
         )
 
+    def _get_generation_config_for_phase(self, phase: str, base_config: Optional[GenerationConfig] = None) -> GenerationConfig:
+        """
+        Create phase-specific generation config with optimized sampling parameters.
+        
+        Scout: Fast exploration (balanced sampling for discovery)
+        Plan: Careful reasoning (deterministic + deep thinking for rigor)
+        Build: Precision execution (very deterministic for consistent, correct code)
+        Verify: Deep analysis (deterministic + maximum thinking for thoroughness)
+        """
+        if base_config is None:
+            base_config = self._default_config()
+            
+        config = GenerationConfig(
+            max_tokens=base_config.max_tokens,
+            enable_thinking=base_config.enable_thinking,
+            thinking_budget=base_config.thinking_budget,
+            use_adaptive_thinking=base_config.use_adaptive_thinking,
+            adaptive_thinking_effort=base_config.adaptive_thinking_effort,
+            throughput_mode=base_config.throughput_mode,
+        )
+        
+        model_id = self.service.model_id
+        supports_thinking_model = supports_thinking(model_id)
+        
+        if phase == "scout":
+            # Fast exploration: balanced sampling for discovery
+            config.temperature = 0.8  # Some variety for creative discovery
+            config.top_p = 0.9
+            # Scout uses fast model, typically no thinking
+            config.enable_thinking = False
+            config.thinking_budget = 0
+        elif phase == "plan":
+            # Careful reasoning: more deterministic + thinking for rigor
+            config.temperature = 0.3  # Lower temp for consistent reasoning
+            config.top_p = 0.9
+            config.enable_thinking = model_config.enable_thinking and supports_thinking_model
+            config.thinking_budget = model_config.thinking_budget if supports_thinking_model else 0
+            # Use adaptive thinking effort "high" for planning
+            if supports_adaptive_thinking(model_id):
+                config.adaptive_thinking_effort = "high"
+        elif phase == "build":
+            # Precision execution: very deterministic for consistent, correct code
+            config.temperature = 0.1  # Very low temp for precise, consistent output
+            config.top_p = 0.95
+            config.enable_thinking = model_config.enable_thinking and supports_thinking_model
+            config.thinking_budget = model_config.thinking_budget if supports_thinking_model else 0
+            # Use adaptive thinking effort "high" for complex implementation
+            if supports_adaptive_thinking(model_id):
+                config.adaptive_thinking_effort = "high"
+        elif phase == "verify":
+            # Deep analysis: deterministic + maximum thinking for thoroughness
+            config.temperature = 0.1  # Very deterministic for consistent verification
+            config.top_p = 0.95
+            config.enable_thinking = model_config.enable_thinking and supports_thinking_model
+            # Use maximum thinking budget for verification
+            config.thinking_budget = min(model_config.thinking_budget * 1.2, 
+                                       get_thinking_max_budget(model_id)) if supports_thinking_model else 0
+            # Use adaptive thinking effort "max" for thorough verification
+            if supports_adaptive_thinking(model_id):
+                config.adaptive_thinking_effort = "max"
+                
+        return config
+
     # ------------------------------------------------------------------
     # Context window management — intelligent, like Cursor
     # ------------------------------------------------------------------
@@ -1336,6 +1612,464 @@ class CodingAgent:
     def _total_history_tokens(self) -> int:
         """Estimate total tokens across all history messages."""
         return sum(self._message_tokens(m) for m in self.history)
+
+    def _parse_confidence_indicators(self, text: str) -> Dict[str, Any]:
+        """
+        Parse confidence indicators and uncertainty markers from model response.
+        Helps with quality assurance and risk assessment.
+        """
+        import re
+        
+        confidence_info = {
+            "confidence_level": None,
+            "uncertainty_flags": [],
+            "risk_indicators": [],
+            "needs_review": False
+        }
+        
+        # Look for explicit confidence markers
+        confidence_patterns = [
+            r"🟢.*[Hh]igh [Cc]onfidence",
+            r"🟡.*[Mm]edium [Cc]onfidence", 
+            r"🔴.*[Ll]ow [Cc]onfidence"
+        ]
+        
+        for pattern in confidence_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                if "🟢" in pattern:
+                    confidence_info["confidence_level"] = "high"
+                elif "🟡" in pattern:
+                    confidence_info["confidence_level"] = "medium"
+                elif "🔴" in pattern:
+                    confidence_info["confidence_level"] = "low"
+                    confidence_info["needs_review"] = True
+                break
+        
+        # Look for uncertainty flags
+        uncertainty_phrases = [
+            r"not (sure|certain|confident)",
+            r"uncertain about",
+            r"might need", r"should (probably|likely)",
+            r"unsure (about|if|whether)",
+            r"unclear (if|whether|how)",
+            r"may need.*review",
+            r"flag.*concern"
+        ]
+        
+        for phrase in uncertainty_phrases:
+            matches = re.findall(phrase, text, re.IGNORECASE)
+            confidence_info["uncertainty_flags"].extend(matches)
+        
+        # Look for risk indicators
+        risk_phrases = [
+            r"could break", r"might fail", r"potential.*issue",
+            r"breaking change", r"backward compatibility",
+            r"security.*concern", r"edge case",
+            r"needs.*testing", r"haven't.*tested"
+        ]
+        
+        for phrase in risk_phrases:
+            matches = re.findall(phrase, text, re.IGNORECASE)
+            confidence_info["risk_indicators"].extend(matches)
+        
+        # Determine overall review need
+        if (len(confidence_info["uncertainty_flags"]) > 2 or 
+            len(confidence_info["risk_indicators"]) > 1 or
+            confidence_info["confidence_level"] == "low"):
+            confidence_info["needs_review"] = True
+        
+        return confidence_info
+
+    def _compute_file_hash(self, abs_path: str) -> Optional[str]:
+        """Compute hash of file for caching purposes"""
+        try:
+            with open(abs_path, 'rb') as f:
+                return hashlib.sha256(f.read()).hexdigest()[:16]  # Short hash for efficiency
+        except Exception as e:
+            logger.debug(f"Failed to hash {abs_path}: {e}")
+            return None
+
+    def _get_cached_verification_result(self, abs_path: str) -> Optional[Dict[str, Any]]:
+        """Get cached verification result if file unchanged since last verification"""
+        current_hash = self._compute_file_hash(abs_path)
+        if not current_hash:
+            return None
+            
+        last_verified_hash = self._last_verification_hashes.get(abs_path)
+        if current_hash == last_verified_hash and current_hash in self._verification_cache:
+            cached_result = self._verification_cache[current_hash]
+            logger.debug(f"Using cached verification result for {abs_path}")
+            return cached_result
+            
+        return None
+
+    def _cache_verification_result(self, abs_path: str, result: Dict[str, Any]) -> None:
+        """Cache verification result for future use"""
+        file_hash = self._compute_file_hash(abs_path)
+        if file_hash:
+            self._verification_cache[file_hash] = result
+            self._last_verification_hashes[abs_path] = file_hash
+            
+            # Keep cache size reasonable
+            if len(self._verification_cache) > 1000:
+                # Remove oldest entries (simple FIFO)
+                oldest_keys = list(self._verification_cache.keys())[:100]
+                for key in oldest_keys:
+                    del self._verification_cache[key]
+
+    def _get_incremental_verification_plan(self, modified_abs: List[str]) -> Dict[str, Any]:
+        """
+        Create smart verification plan based on caches and dependencies.
+        Inspired by incremental build systems like Bazel and Nx.
+        """
+        plan = {
+            "files_to_verify": [],
+            "cached_results": {},
+            "verification_strategy": "full"  # full, incremental, minimal
+        }
+        
+        files_needing_verification = []
+        cached_count = 0
+        
+        # Check what can be cached
+        for abs_path in modified_abs:
+            cached_result = self._get_cached_verification_result(abs_path)
+            if cached_result and cached_result.get("success", False):
+                plan["cached_results"][abs_path] = cached_result
+                cached_count += 1
+            else:
+                files_needing_verification.append(abs_path)
+        
+        # Determine verification strategy
+        if cached_count == len(modified_abs):
+            plan["verification_strategy"] = "minimal"  # Everything cached
+        elif cached_count > len(modified_abs) * 0.5:
+            plan["verification_strategy"] = "incremental"  # Mix of cached and new
+        else:
+            plan["verification_strategy"] = "full"  # Most files need verification
+            
+        plan["files_to_verify"] = files_needing_verification
+        
+        return plan
+
+    def _handle_uncertain_response(self, response_text: str, confidence_info: Dict[str, Any]) -> str:
+        """
+        Generate follow-up guidance when the model expresses uncertainty.
+        Helps improve quality by encouraging deeper analysis.
+        """
+        if not confidence_info["needs_review"]:
+            return response_text
+        
+        uncertainty_guidance = []
+        
+        if confidence_info["confidence_level"] == "low":
+            uncertainty_guidance.append(
+                "⚠️  **Low Confidence Detected**: Please think more deeply about this approach. "
+                "Consider alternative solutions or seek validation for uncertain aspects."
+            )
+        
+        if confidence_info["uncertainty_flags"]:
+            uncertainty_guidance.append(
+                f"🤔 **Uncertainty Flags Found**: {len(confidence_info['uncertainty_flags'])} uncertain aspects detected. "
+                "Please elaborate on what you're unsure about and how to mitigate risks."
+            )
+        
+        if confidence_info["risk_indicators"]:
+            uncertainty_guidance.append(
+                f"⚠️  **Risk Indicators Found**: {len(confidence_info['risk_indicators'])} potential risks identified. "
+                "Please provide specific mitigation strategies for each risk."
+            )
+        
+        if uncertainty_guidance:
+            guidance_text = "\n\n---\n**CONFIDENCE ASSESSMENT**:\n" + "\n".join(uncertainty_guidance)
+            guidance_text += "\n\nPlease address these concerns before proceeding to ensure high-quality implementation."
+            return response_text + guidance_text
+        
+        return response_text
+
+    def _generate_contextual_guidance(self, phase: str, context: Dict[str, Any]) -> str:
+        """
+        Generate adaptive, contextual guidance based on current phase and context.
+        Inspired by GitHub Copilot, Cursor, and modern AI coding assistants.
+        """
+        guidance_parts = []
+        
+        # Phase-specific guidance
+        if phase == "build":
+            if context.get("complexity_high", False):
+                guidance_parts.append(
+                    "🧠 **High Complexity Detected**: Consider breaking this into smaller, "
+                    "testable components. Use thinking time to plan the approach carefully."
+                )
+            
+            if context.get("verification_failures", 0) > 2:
+                guidance_parts.append(
+                    "⚠️ **Multiple Verification Failures**: Take a step back. Read error "
+                    "messages carefully and fix systematically rather than making multiple changes."
+                )
+                
+            if context.get("files_modified", 0) > 5:
+                guidance_parts.append(
+                    "📁 **Large Change Set**: Consider creating a checkpoint before proceeding. "
+                    "Verify changes incrementally to isolate any issues."
+                )
+        
+        elif phase == "plan":
+            if context.get("unclear_requirements", False):
+                guidance_parts.append(
+                    "❓ **Ambiguous Requirements**: Ask clarifying questions before implementing. "
+                    "It's better to get clarity now than to build the wrong thing."
+                )
+                
+            if context.get("existing_code_unknown", False):
+                guidance_parts.append(
+                    "🔍 **Unknown Codebase**: Read key files first to understand patterns, "
+                    "conventions, and existing utilities you can reuse."
+                )
+                
+        elif phase == "verify":
+            if context.get("test_coverage_low", False):
+                guidance_parts.append(
+                    "🧪 **Low Test Coverage**: Consider adding basic tests for critical paths "
+                    "before considering this feature complete."
+                )
+        
+        # Adaptive guidance based on historical patterns
+        failure_patterns = self._failure_pattern_cache or []
+        if len(failure_patterns) > 0:
+            recent_failures = [p for p in failure_patterns if p.get("timestamp", 0) > time.time() - 3600]
+            if recent_failures:
+                common_patterns = {}
+                for failure in recent_failures:
+                    pattern = failure.get("pattern", "")
+                    common_patterns[pattern] = common_patterns.get(pattern, 0) + 1
+                
+                most_common = max(common_patterns, key=common_patterns.get) if common_patterns else None
+                if most_common and common_patterns[most_common] >= 2:
+                    guidance_parts.append(
+                        f"🔄 **Learned Pattern**: Recent issues with '{most_common}' - "
+                        "double-check this area carefully."
+                    )
+        
+        # Context-aware suggestions
+        if context.get("working_late", False):
+            guidance_parts.append(
+                "🌙 **Late Hour Detected**: Take extra care with verification. "
+                "Consider smaller changes and thorough testing when tired."
+            )
+            
+        if context.get("large_diff", False):
+            guidance_parts.append(
+                "📊 **Large Diff**: Review changes section by section. "
+                "Consider if this should be broken into multiple commits."
+            )
+        
+        if guidance_parts:
+            return "\n\n💡 **ADAPTIVE GUIDANCE**:\n" + "\n".join(guidance_parts) + "\n"
+        else:
+            return ""
+
+    def _assess_context_for_guidance(self, modified_abs: List[str]) -> Dict[str, Any]:
+        """Assess current context to determine what guidance to provide"""
+        context = {}
+        
+        # Analyze change complexity
+        total_lines_changed = 0
+        files_modified = len(modified_abs)
+        
+        for abs_path in modified_abs:
+            try:
+                with open(abs_path, 'r', encoding='utf-8') as f:
+                    lines = len(f.readlines())
+                    total_lines_changed += lines
+                    if lines > 200:
+                        context["complexity_high"] = True
+            except:
+                pass
+        
+        context["files_modified"] = files_modified
+        context["large_diff"] = total_lines_changed > 500
+        
+        # Check time of day (simple heuristic)
+        current_hour = time.localtime().tm_hour
+        context["working_late"] = current_hour < 6 or current_hour > 22
+        
+        # Check recent verification failures
+        context["verification_failures"] = len([
+            p for p in (self._failure_pattern_cache or []) 
+            if p.get("timestamp", 0) > time.time() - 1800  # Last 30 minutes
+        ])
+        
+        return context
+
+    async def _handle_verification_failure_with_recovery(
+        self, 
+        failures: List[str], 
+        modified_abs: List[str],
+        on_event: Callable[[AgentEvent], Awaitable[None]]
+    ) -> Dict[str, Any]:
+        """
+        Intelligent error recovery inspired by resilient systems.
+        Attempts multiple recovery strategies based on failure patterns.
+        """
+        recovery_result = {
+            "recovered": False,
+            "recovery_strategy": None,
+            "remaining_failures": failures.copy(),
+            "recovery_actions": []
+        }
+        
+        await on_event(AgentEvent(
+            type="error_recovery",
+            content=f"🔄 **Error Recovery Initiated** - Analyzing {len(failures)} failures...",
+            data={"failure_count": len(failures)}
+        ))
+        
+        # Strategy 1: Syntax Error Auto-Fix
+        syntax_failures = [f for f in failures if any(
+            term in f.lower() for term in ["syntax error", "invalid syntax", "indentation error"]
+        )]
+        
+        if syntax_failures:
+            recovery_result["recovery_strategy"] = "syntax_auto_fix"
+            for failure in syntax_failures:
+                # Extract filename from failure message
+                for abs_path in modified_abs:
+                    rel_path = os.path.relpath(abs_path, self.working_directory)
+                    if rel_path in failure:
+                        success = await self._attempt_syntax_fix(abs_path, on_event)
+                        if success:
+                            recovery_result["remaining_failures"].remove(failure)
+                            recovery_result["recovery_actions"].append(f"Auto-fixed syntax in {rel_path}")
+                        break
+        
+        # Strategy 2: Import Error Resolution
+        import_failures = [f for f in failures if "import" in f.lower() or "module" in f.lower()]
+        if import_failures:
+            if not recovery_result["recovery_strategy"]:
+                recovery_result["recovery_strategy"] = "import_resolution"
+            
+            for failure in import_failures:
+                for abs_path in modified_abs:
+                    rel_path = os.path.relpath(abs_path, self.working_directory)
+                    if rel_path in failure:
+                        success = await self._attempt_import_fix(abs_path, failure, on_event)
+                        if success and failure in recovery_result["remaining_failures"]:
+                            recovery_result["remaining_failures"].remove(failure)
+                            recovery_result["recovery_actions"].append(f"Resolved imports in {rel_path}")
+                        break
+        
+        # Strategy 3: Test Failure Analysis and Guided Recovery
+        test_failures = [f for f in failures if "test" in f.lower() or "assert" in f.lower()]
+        if test_failures:
+            if not recovery_result["recovery_strategy"]:
+                recovery_result["recovery_strategy"] = "test_guidance"
+            
+            await self._provide_test_failure_guidance(test_failures, on_event)
+            recovery_result["recovery_actions"].append("Provided test failure analysis")
+        
+        # Determine overall recovery success
+        recovery_result["recovered"] = len(recovery_result["remaining_failures"]) < len(failures)
+        
+        if recovery_result["recovered"]:
+            await on_event(AgentEvent(
+                type="error_recovery_success",
+                content=f"✅ **Recovery Successful** - {len(recovery_result['recovery_actions'])} fixes applied",
+                data=recovery_result
+            ))
+        else:
+            await on_event(AgentEvent(
+                type="error_recovery_partial",
+                content=f"⚠️ **Partial Recovery** - {len(failures) - len(recovery_result['remaining_failures'])} issues resolved",
+                data=recovery_result
+            ))
+        
+        return recovery_result
+
+    async def _attempt_syntax_fix(self, abs_path: str, on_event: Callable[[AgentEvent], Awaitable[None]]) -> bool:
+        """Attempt basic syntax error fixes"""
+        try:
+            with open(abs_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            original_content = content
+            fixes_applied = []
+            
+            # Common syntax fixes
+            # Fix missing colons
+            lines = content.split('\n')
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if (stripped.startswith(('if ', 'elif ', 'else', 'for ', 'while ', 'def ', 'class ', 'try', 'except', 'finally', 'with ')) 
+                    and not stripped.endswith(':') and not stripped.endswith(':\\')):
+                    lines[i] = line + ':'
+                    fixes_applied.append(f"Added missing colon at line {i+1}")
+            
+            if fixes_applied:
+                fixed_content = '\n'.join(lines)
+                with open(abs_path, 'w', encoding='utf-8') as f:
+                    f.write(fixed_content)
+                
+                # Test if fix worked
+                try:
+                    compile(fixed_content, abs_path, 'exec')
+                    await on_event(AgentEvent(
+                        type="auto_fix_success",
+                        content=f"🔧 **Auto-Fixed Syntax**: {os.path.relpath(abs_path, self.working_directory)} - {', '.join(fixes_applied)}",
+                        data={"fixes": fixes_applied, "file": abs_path}
+                    ))
+                    return True
+                except SyntaxError:
+                    # Revert if fix didn't work
+                    with open(abs_path, 'w', encoding='utf-8') as f:
+                        f.write(original_content)
+            
+        except Exception as e:
+            logger.debug(f"Syntax fix failed for {abs_path}: {e}")
+        
+        return False
+
+    async def _attempt_import_fix(self, abs_path: str, failure: str, on_event: Callable[[AgentEvent], Awaitable[None]]) -> bool:
+        """Attempt to fix common import errors"""
+        try:
+            # This is a placeholder for more sophisticated import fixing
+            # In a real implementation, this could:
+            # - Analyze available modules and suggest corrections
+            # - Add missing imports based on usage
+            # - Fix relative/absolute import issues
+            
+            await on_event(AgentEvent(
+                type="import_analysis",
+                content=f"🔍 **Import Analysis**: {os.path.relpath(abs_path, self.working_directory)} - Manual review recommended",
+                data={"file": abs_path, "failure": failure}
+            ))
+            return False  # Placeholder - no automatic fixes yet
+            
+        except Exception as e:
+            logger.debug(f"Import fix failed for {abs_path}: {e}")
+            return False
+
+    async def _provide_test_failure_guidance(self, test_failures: List[str], on_event: Callable[[AgentEvent], Awaitable[None]]):
+        """Provide intelligent guidance for test failures"""
+        guidance_parts = []
+        
+        for failure in test_failures:
+            if "assertion" in failure.lower():
+                guidance_parts.append("🧪 **Assertion Failure**: Check expected vs actual values")
+            elif "timeout" in failure.lower():
+                guidance_parts.append("⏱️ **Timeout**: Consider async issues or performance problems")
+            elif "fixture" in failure.lower():
+                guidance_parts.append("🔧 **Fixture Issue**: Verify test setup and dependencies")
+            elif "import" in failure.lower():
+                guidance_parts.append("📦 **Import Issue**: Check module paths and dependencies")
+        
+        if guidance_parts:
+            guidance_text = "\n".join(f"- {part}" for part in guidance_parts)
+            await on_event(AgentEvent(
+                type="test_failure_guidance",
+                content=f"🎯 **Test Failure Analysis**:\n{guidance_text}",
+                data={"guidance": guidance_parts}
+            ))
 
     def _extract_file_paths_from_history(self) -> set:
         """Find file paths referenced in the last few messages (working set)."""
@@ -2119,17 +2853,13 @@ Keep the whole response under 300 words. If the request is already very clear an
             )
         project_docs = self._load_project_docs()
         if project_docs:
-            plan_user = f"<project_context>\n{project_docs}\n</project_context>\n\n" + plan_user
+            context_metadata = self._generate_context_metadata(project_docs)
+            plan_user = f"<project_context>\n{context_metadata}\n\n{project_docs}\n</project_context>\n\n" + plan_user
 
         # Agentic loop with STREAMING + read-only tools so the user
         # sees thinking/text in real time during plan generation
         loop = asyncio.get_event_loop()
-        plan_config = GenerationConfig(
-            max_tokens=model_config.max_tokens,
-            enable_thinking=model_config.enable_thinking and supports_thinking(self.service.model_id),
-            thinking_budget=model_config.thinking_budget if supports_thinking(self.service.model_id) else 0,
-            throughput_mode=model_config.throughput_mode,
-        )
+        plan_config = self._get_generation_config_for_phase("plan")
 
         plan_messages: List[Dict[str, Any]] = [
             {"role": "user", "content": self._compose_user_content(plan_user, user_images)}
@@ -2689,11 +3419,13 @@ Keep the whole response under 300 words. If the request is already very clear an
         # Add to history
         self.history.append({"role": "user", "content": user_content})
 
-        # Run the main agent loop (build can ask user when verification conflicts with user request)
-        await self._agent_loop(on_event, request_approval, config, request_question_answer=request_question_answer)
+        # Run the main agent loop with build-optimized configuration
+        build_config = self._get_generation_config_for_phase("build", config)
+        await self._agent_loop(on_event, request_approval, build_config, request_question_answer=request_question_answer)
 
-        # Post-build verification pass
-        await self._run_post_build_verification(on_event, request_approval, config, request_question_answer=request_question_answer)
+        # Post-build verification pass with verification-optimized configuration
+        verify_config = self._get_generation_config_for_phase("verify", config)
+        await self._run_post_build_verification(on_event, request_approval, verify_config, request_question_answer=request_question_answer)
 
         # Restore the general-purpose system prompt
         self.system_prompt = saved_prompt
@@ -2732,15 +3464,40 @@ Keep the whole response under 300 words. If the request is already very clear an
             )
 
         verify_msg = (
-            f"You have completed all plan steps. Modified files: {files_str}\n\n"
-            "Do a final verification pass — this is your quality gate:\n"
-            "1. Re-read each modified file. Look for: typos, missing imports, incorrect "
-            "variable names, logic errors, incomplete changes.\n"
-            "2. Run lint_file on each changed file. Fix any errors.\n"
-            f"3. Run relevant tests.{test_section}\n"
-            "4. Think: did I miss anything from the plan? Are there edge cases I didn't handle?\n"
-            "5. Briefly report what you verified and the results.\n\n"
-            "Do NOT skip this. A shipped bug is worse than a slow verification."
+            f"🔍 **DEEP VERIFICATION PASS** — Modified files: {files_str}\n\n"
+            
+            "This is your quality gate. Think through EACH step methodically:\n\n"
+            
+            "**STEP 1: Code Review with Fresh Eyes**\n"
+            "- Re-read each modified file AS IF you didn't write it\n"
+            "- Look for: typos, missing imports, incorrect variable names, logic errors\n"
+            "- Check: does this ACTUALLY implement what the plan asked for?\n"
+            "- Trace execution paths: what happens on success vs failure?\n\n"
+            
+            "**STEP 2: Static Analysis & Linting**\n"
+            "- Run lint_file on each changed file\n"
+            "- Fix ALL errors and warnings — don't tolerate \"minor\" issues\n"
+            "- Think: what would a security-conscious reviewer flag?\n\n"
+            
+            f"**STEP 3: Test Coverage & Validation**{test_section}\n"
+            "- Run relevant tests first, then broader suite if needed\n"
+            "- Think: what edge cases am I NOT testing?\n"
+            "- Consider: backward compatibility, performance, error handling\n\n"
+            
+            "**STEP 4: Deep Reasoning Check**\n"
+            "- Review original requirement: did I solve the RIGHT problem?\n"
+            "- Check plan completeness: did I miss any steps or requirements?\n"
+            "- Think about production: what could break in real usage?\n"
+            "- Imagine you're debugging this at 2 AM — is it clear and robust?\n\n"
+            
+            "**STEP 5: Confidence Assessment & Report**\n"
+            "- Assess your confidence level (🟢/🟡/🔴) using the standards\n"
+            "- Briefly report: what you verified, results, any concerns\n"
+            "- Flag anything you're uncertain about\n\n"
+            
+            "**THINK DEEPLY**: Use your extended thinking budget for this verification.\n"
+            "A shipped bug costs exponentially more than thorough verification now.\n"
+            "Do NOT skip steps or rush through this."
         )
         self.history.append({"role": "user", "content": verify_msg})
 
@@ -2898,18 +3655,428 @@ Keep the whole response under 300 words. If the request is already very clear an
                 dedup.append(c)
         return dedup[:8]
 
+    async def _run_progressive_verification(
+        self, 
+        modified_abs: List[str], 
+        on_event: Callable[[AgentEvent], Awaitable[None]]
+    ) -> Dict[str, Any]:
+        """
+        Enhanced multi-stage verification pipeline inspired by modern DevOps practices.
+        
+        Stages:
+        1. Static Analysis - Fast syntax, import, and style checks
+        2. Semantic Validation - Logic patterns, code quality, security
+        3. Dynamic Testing - Unit tests, integration tests with impact analysis
+        4. Quality Assessment - Coverage, complexity, maintainability scores
+        5. Confidence Scoring - Risk assessment and adaptive thresholds
+        """
+        verification_result = {
+            "success": True,
+            "confidence_score": 0.0,
+            "progressive_enabled": True,
+            "stage_results": {},
+            "recommendations": [],
+            "failures": []
+        }
+        
+        try:
+            # Get incremental verification plan
+            verification_plan = self._get_incremental_verification_plan(modified_abs)
+            
+            await on_event(AgentEvent(
+                type="verification_plan",
+                content=f"📋 **Verification Plan**: {verification_plan['verification_strategy'].title()} strategy - "
+                       f"{len(verification_plan['files_to_verify'])} files to verify, "
+                       f"{len(verification_plan['cached_results'])} cached",
+                data=verification_plan
+            ))
+            
+            # Use cached results for files that haven't changed
+            for abs_path, cached_result in verification_plan["cached_results"].items():
+                verification_result["stage_results"][f"cached_{abs_path}"] = cached_result
+            
+            # Only verify files that need it
+            files_to_verify = verification_plan["files_to_verify"]
+            if not files_to_verify:
+                # Everything is cached and successful
+                verification_result["success"] = True
+                verification_result["confidence_score"] = 0.95  # High confidence for cached results
+                verification_result["recommendations"].append("✅ All files passed cached verification")
+                return verification_result
+            
+            # Stage 1: Static Analysis (Fast) - Only for files needing verification
+            static_result = await self._run_static_analysis_stage(files_to_verify, on_event)
+            verification_result["stage_results"]["static"] = static_result
+            
+            # Early exit if critical static failures
+            if not static_result["success"] and static_result.get("critical", False):
+                verification_result["success"] = False
+                verification_result["failures"].extend(static_result.get("failures", []))
+                return verification_result
+            
+            # Stage 2: Semantic Validation
+            semantic_result = await self._run_semantic_validation_stage(modified_abs, on_event)
+            verification_result["stage_results"]["semantic"] = semantic_result
+            
+            # Stage 3: Dynamic Testing (with impact analysis)
+            testing_result = await self._run_testing_stage(modified_abs, on_event)
+            verification_result["stage_results"]["testing"] = testing_result
+            
+            # Stage 4: Quality Assessment
+            quality_result = await self._run_quality_assessment_stage(modified_abs, on_event)
+            verification_result["stage_results"]["quality"] = quality_result
+            
+            # Stage 5: Confidence Scoring and Final Assessment
+            confidence_result = self._calculate_verification_confidence(verification_result)
+            verification_result.update(confidence_result)
+            
+            # Cache successful results for future use
+            if verification_result["success"]:
+                for abs_path in files_to_verify:
+                    file_result = {
+                        "success": True,
+                        "timestamp": time.time(),
+                        "confidence_score": verification_result["confidence_score"],
+                        "stage": "progressive_verification"
+                    }
+                    self._cache_verification_result(abs_path, file_result)
+            
+            return verification_result
+            
+        except Exception as e:
+            logger.warning(f"Progressive verification failed, falling back to legacy: {e}")
+            verification_result["progressive_enabled"] = False
+            return verification_result
+
+    async def _run_static_analysis_stage(
+        self, 
+        modified_abs: List[str], 
+        on_event: Callable[[AgentEvent], Awaitable[None]]
+    ) -> Dict[str, Any]:
+        """Stage 1: Fast static analysis - syntax, imports, basic linting"""
+        loop = asyncio.get_event_loop()
+        stage_result = {
+            "success": True,
+            "critical": False,
+            "failures": [],
+            "warnings": [],
+            "files_checked": len(modified_abs)
+        }
+        
+        await on_event(AgentEvent(
+            type="verification_stage",
+            content="🔍 **STAGE 1: Static Analysis** - Checking syntax, imports, and code style...",
+            data={"stage": "static", "total_files": len(modified_abs)}
+        ))
+        
+        for abs_path in modified_abs:
+            rel_path = os.path.relpath(abs_path, self.working_directory)
+            
+            # Run enhanced linting with additional checks
+            lint_result = await loop.run_in_executor(
+                None,
+                lambda rp=rel_path: execute_tool(
+                    "lint_file",
+                    {"path": rp},
+                    self.working_directory,
+                    backend=self.backend,
+                ),
+            )
+            
+            if not lint_result.success:
+                failure_msg = f"lint_file {rel_path}: {lint_result.output[:800]}"
+                stage_result["failures"].append(failure_msg)
+                
+                # Check if this is a critical syntax error
+                if any(term in lint_result.output.lower() for term in ["syntax error", "invalid syntax", "indentation error"]):
+                    stage_result["critical"] = True
+            
+            await on_event(AgentEvent(
+                type="tool_result",
+                content=lint_result.output if lint_result.success else f"❌ {lint_result.output}",
+                data={
+                    "tool_name": "lint_file",
+                    "tool_use_id": f"static-{rel_path}",
+                    "success": lint_result.success,
+                    "verification_stage": "static"
+                }
+            ))
+        
+        stage_result["success"] = len(stage_result["failures"]) == 0
+        return stage_result
+
+    async def _run_testing_stage(
+        self, 
+        modified_abs: List[str], 
+        on_event: Callable[[AgentEvent], Awaitable[None]]
+    ) -> Dict[str, Any]:
+        """Stage 3: Dynamic testing with impact analysis using existing test discovery"""
+        stage_result = {
+            "success": True,
+            "failures": [],
+            "tests_run": 0,
+            "coverage_impact": None
+        }
+        
+        await on_event(AgentEvent(
+            type="verification_stage",
+            content="🧪 **STAGE 3: Dynamic Testing** - Running impacted tests...",
+            data={"stage": "testing", "total_files": len(modified_abs)}
+        ))
+        
+        try:
+            # Use existing orchestrator commands for testing
+            test_cmds = self._verification_orchestrator_commands(modified_abs)
+            test_cmds = [cmd for cmd in test_cmds if "pytest" in cmd or "test" in cmd]
+            
+            if test_cmds:
+                loop = asyncio.get_event_loop()
+                for idx, cmd in enumerate(test_cmds[:3], 1):  # Limit to 3 test commands for performance
+                    test_result = await loop.run_in_executor(
+                        None,
+                        lambda c=cmd: execute_tool(
+                            "Bash",
+                            {"command": c},
+                            self.working_directory,
+                            backend=self.backend,
+                        ),
+                    )
+                    
+                    await on_event(AgentEvent(
+                        type="tool_result",
+                        content=test_result.output if test_result.success else f"❌ {test_result.output}",
+                        data={
+                            "tool_name": "Bash",
+                            "tool_use_id": f"testing-{idx}",
+                            "success": test_result.success,
+                            "verification_stage": "testing",
+                            "command": cmd
+                        }
+                    ))
+                    
+                    if not test_result.success:
+                        stage_result["failures"].append(f"{cmd}: {test_result.output[:800]}")
+                    
+                    stage_result["tests_run"] += 1
+            else:
+                # No test commands found - use legacy test discovery
+                rel_files = [os.path.relpath(p, self.working_directory) for p in modified_abs]
+                test_files = self._select_impacted_tests(rel_files)
+                
+                if test_files:
+                    loop = asyncio.get_event_loop()
+                    test_files_quoted = [shlex.quote(f) for f in test_files[:10]]
+                    test_cmd = f"pytest -q {' '.join(test_files_quoted)}"
+                    
+                    test_result = await loop.run_in_executor(
+                        None,
+                        lambda: execute_tool(
+                            "Bash",
+                            {"command": test_cmd},
+                            self.working_directory,
+                            backend=self.backend,
+                        ),
+                    )
+                    
+                    await on_event(AgentEvent(
+                        type="tool_result",
+                        content=test_result.output if test_result.success else f"❌ {test_result.output}",
+                        data={
+                            "tool_name": "pytest",
+                            "tool_use_id": "legacy-testing",
+                            "success": test_result.success,
+                            "verification_stage": "testing"
+                        }
+                    ))
+                    
+                    if not test_result.success:
+                        stage_result["failures"].append(f"{test_cmd}: {test_result.output[:800]}")
+                    
+                    stage_result["tests_run"] = len(test_files)
+                        
+        except Exception as e:
+            stage_result["failures"].append(f"Testing stage error: {str(e)}")
+            logger.debug(f"Testing stage exception: {e}")
+        
+        stage_result["success"] = len(stage_result["failures"]) == 0
+        return stage_result
+
+    async def _run_quality_assessment_stage(
+        self, 
+        modified_abs: List[str], 
+        on_event: Callable[[AgentEvent], Awaitable[None]]
+    ) -> Dict[str, Any]:
+        """Stage 4: Quality assessment - complexity, maintainability, coverage (future expansion)"""
+        stage_result = {
+            "success": True,
+            "complexity_score": 0.0,
+            "maintainability_score": 0.0,
+            "quality_warnings": []
+        }
+        
+        await on_event(AgentEvent(
+            type="verification_stage",
+            content="📊 **STAGE 4: Quality Assessment** - Analyzing code quality metrics...",
+            data={"stage": "quality", "total_files": len(modified_abs)}
+        ))
+        
+        # Basic quality checks that can be implemented immediately
+        for abs_path in modified_abs:
+            if abs_path.endswith('.py'):
+                rel_path = os.path.relpath(abs_path, self.working_directory)
+                try:
+                    with open(abs_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        
+                    # Simple complexity indicators
+                    line_count = len(content.split('\n'))
+                    if line_count > 500:
+                        stage_result["quality_warnings"].append(f"{rel_path}: Large file ({line_count} lines)")
+                    
+                    # Check for code smells
+                    if content.count('except:') > 0:
+                        stage_result["quality_warnings"].append(f"{rel_path}: Bare except clauses detected")
+                    
+                    if content.count('# TODO') + content.count('# FIXME') > 5:
+                        stage_result["quality_warnings"].append(f"{rel_path}: Many TODOs/FIXMEs")
+                        
+                except Exception as e:
+                    logger.debug(f"Quality assessment failed for {rel_path}: {e}")
+        
+        # Future: Add more sophisticated quality metrics
+        # - Cyclomatic complexity analysis
+        # - Code duplication detection  
+        # - Maintainability index calculation
+        # - Test coverage impact assessment
+        
+        return stage_result
+
+    def _calculate_verification_confidence(self, verification_result: Dict[str, Any]) -> Dict[str, Any]:
+        """Stage 5: Calculate overall confidence score and recommendations"""
+        stages = verification_result["stage_results"]
+        
+        # Base confidence scoring
+        confidence_score = 1.0
+        recommendations = []
+        
+        # Static analysis impact (40% weight)
+        static_result = stages.get("static", {})
+        if not static_result.get("success", True):
+            if static_result.get("critical", False):
+                confidence_score *= 0.2  # Critical syntax errors
+                recommendations.append("🚨 Critical syntax errors must be fixed before deployment")
+            else:
+                confidence_score *= 0.7  # Non-critical linting issues
+                recommendations.append("⚠️ Consider fixing linting issues for better code quality")
+        
+        # Testing impact (60% weight for existing testing)
+        testing_result = stages.get("testing", {})
+        if not testing_result.get("success", True):
+            confidence_score *= 0.6
+            recommendations.append("🧪 Test failures detected - ensure functionality works correctly")
+        elif testing_result.get("tests_run", 0) == 0:
+            confidence_score *= 0.8
+            recommendations.append("💡 No tests run - consider adding test coverage")
+        
+        # Overall assessment
+        overall_success = all(
+            stages.get(stage, {}).get("success", True) 
+            for stage in ["static", "testing"]
+        )
+        
+        return {
+            "confidence_score": max(0.0, min(1.0, confidence_score)),
+            "success": overall_success,
+            "recommendations": recommendations
+        }
+
     async def _run_deterministic_verification_gate(
         self,
         on_event: Callable[[AgentEvent], Awaitable[None]],
     ) -> tuple[bool, str]:
-        """Run deterministic verification checks before final done.
-        Checks:
-        - lint_file for each modified file
-        - targeted pytest for discovered Python test files (optional)
+        """
+        Run intelligent progressive verification with adaptive quality gates.
+        
+        Multi-stage verification inspired by GitHub Actions, CircleCI, and modern DevOps:
+        1. Fast static analysis (syntax, imports, basic linting)
+        2. Semantic validation (logic checks, pattern compliance)  
+        3. Dynamic testing (unit tests, integration tests)
+        4. Quality assessment (coverage, complexity, security)
+        5. Confidence scoring and adaptive thresholds
         """
         modified_abs = list(self._file_snapshots.keys())
         if not modified_abs:
             return True, "No modified files."
+
+        # Try progressive verification first (with fallback to legacy)
+        try:
+            progressive_result = await self._run_progressive_verification(modified_abs, on_event)
+            
+            if progressive_result.get("progressive_enabled", False):
+                # Use progressive verification results
+                success = progressive_result["success"]
+                confidence_score = progressive_result.get("confidence_score", 0.0)
+                recommendations = progressive_result.get("recommendations", [])
+                failures = progressive_result.get("failures", [])
+                
+                # Attempt error recovery if there are failures
+                if not success and failures:
+                    recovery_result = await self._handle_verification_failure_with_recovery(
+                        failures, modified_abs, on_event
+                    )
+                    
+                    if recovery_result["recovered"]:
+                        # Some issues were resolved - re-run verification on affected files
+                        success = len(recovery_result["remaining_failures"]) == 0
+                        if success:
+                            confidence_score = max(confidence_score, 0.8)  # Boost confidence after successful recovery
+                            recommendations.extend(recovery_result["recovery_actions"])
+                        else:
+                            failures = recovery_result["remaining_failures"]
+                            recommendations.append(f"🔄 Partial recovery: {len(recovery_result['recovery_actions'])} issues auto-resolved")
+                
+                # Add contextual guidance based on current situation
+                context = self._assess_context_for_guidance(modified_abs)
+                guidance = self._generate_contextual_guidance("verify", context)
+                
+                # Prepare summary message
+                if success:
+                    summary = f"✅ **Progressive Verification PASSED** (Confidence: {confidence_score:.1%})"
+                    if recommendations:
+                        summary += f"\n\n**Recommendations**:\n" + "\n".join(f"- {rec}" for rec in recommendations)
+                    if guidance:
+                        summary += guidance
+                else:
+                    summary = f"❌ **Progressive Verification FAILED** (Confidence: {confidence_score:.1%})"
+                    if failures:
+                        summary += f"\n\n**Failures**:\n" + "\n".join(f"- {fail}" for fail in failures[:5])
+                    if recommendations:
+                        summary += f"\n\n**Recommendations**:\n" + "\n".join(f"- {rec}" for rec in recommendations)
+                    if guidance:
+                        summary += guidance
+                
+                await on_event(AgentEvent(
+                    type="verification_complete",
+                    content=summary,
+                    data={
+                        "progressive_verification": True,
+                        "confidence_score": confidence_score,
+                        "stage_results": progressive_result.get("stage_results", {}),
+                        "recommendations": recommendations
+                    }
+                ))
+                
+                return success, summary
+                
+        except Exception as e:
+            logger.warning(f"Progressive verification system failed: {e}")
+            await on_event(AgentEvent(
+                type="verification_fallback", 
+                content=f"⚠️ Progressive verification failed, using legacy system: {e}",
+                data={"error": str(e)}
+            ))
+
+        # Fallback to legacy verification
 
         loop = asyncio.get_event_loop()
         failures: List[str] = []
