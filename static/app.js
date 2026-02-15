@@ -79,16 +79,50 @@
     const $replaceToggle = document.getElementById("search-replace-toggle");
     const $terminalToggleBtn = document.getElementById("terminal-toggle-btn");
     const $terminalPanel = document.getElementById("terminal-panel");
-    const $terminalOutput = document.getElementById("terminal-output");
-    const $terminalInput = document.getElementById("terminal-input");
-    const $terminalPrompt = document.getElementById("terminal-prompt");
+    const $terminalXtermContainer = document.getElementById("terminal-xterm-container");
     const $terminalCloseBtn = document.getElementById("terminal-close-btn");
     const $terminalClearBtn = document.getElementById("terminal-clear-btn");
     const $resizeTerminal = document.getElementById("resize-terminal");
     const $sourceControlList = document.getElementById("source-control-list");
     const $sourceControlRefreshBtn = document.getElementById("source-control-refresh-btn");
-    let terminalCwd = null;  // current working directory for terminal (project root or after cd)
-    let terminalCompletionState = null;  // { prefix, completions, index } for Tab cycling
+    let terminalXterm = null;
+    let terminalFitAddon = null;
+    let terminalWs = null;
+    let terminalFocusInput = null;
+    var terminalOutputBuffer = "";
+    var terminalFlushRaf = 0;
+    var terminalBlobQueue = [];
+    var terminalBlobProcessing = false;
+
+    function terminalFlushOutput() {
+        terminalFlushRaf = 0;
+        if (terminalOutputBuffer.length && terminalXterm) {
+            terminalXterm.write(terminalOutputBuffer);
+            terminalOutputBuffer = "";
+        }
+    }
+
+    function terminalScheduleFlush() {
+        if (terminalFlushRaf) return;
+        terminalFlushRaf = requestAnimationFrame(terminalFlushOutput);
+    }
+
+    function terminalProcessNextBlob(wsRef) {
+        if (terminalBlobProcessing || terminalBlobQueue.length === 0 || terminalWs !== wsRef) return;
+        terminalBlobProcessing = true;
+        var blob = terminalBlobQueue.shift();
+        blob.arrayBuffer().then(function (buf) {
+            if (terminalWs === wsRef) {
+                terminalOutputBuffer += new TextDecoder().decode(buf);
+                terminalScheduleFlush();
+            }
+            terminalBlobProcessing = false;
+            if (terminalBlobQueue.length > 0) terminalProcessNextBlob(wsRef);
+        }).catch(function () {
+            terminalBlobProcessing = false;
+            if (terminalBlobQueue.length > 0) terminalProcessNextBlob(wsRef);
+        });
+    }
 
     // ── State ─────────────────────────────────────────────────
     let ws = null;
@@ -1298,160 +1332,205 @@
     }
 
     // ================================================================
-    // INTEGRATED TERMINAL (bottom of editor panel)
+    // INTEGRATED TERMINAL (full PTY + xterm.js)
     // ================================================================
 
     const TERMINAL_DEFAULT_HEIGHT = 220;
     const TERMINAL_MIN_HEIGHT = 100;
 
-    async function updateTerminalPrompt() {
-        if (!$terminalPrompt) return;
-        try {
-            const res = await fetch("/api/terminal-cwd");
-            const data = await res.json();
-            const cwd = data.ok && data.cwd ? data.cwd : "~";
-            terminalCwd = cwd !== "~" ? cwd : null;
-            const short = cwd.split("/").filter(Boolean).pop() || cwd.replace(/^.*@/, "").split(":").pop() || "~";
-            $terminalPrompt.textContent = short + " $ ";
-        } catch {
-            terminalCwd = null;
-            $terminalPrompt.textContent = "$ ";
+    function terminalDisconnect(clearDisplay) {
+        if (terminalWs) {
+            try { terminalWs.close(); } catch (e) {}
+            terminalWs = null;
+            setTerminalStatus("", "");
+        }
+        if (terminalFlushRaf) {
+            cancelAnimationFrame(terminalFlushRaf);
+            terminalFlushRaf = 0;
+        }
+        terminalOutputBuffer = "";
+        terminalBlobQueue = [];
+        if (clearDisplay && terminalXterm) {
+            terminalXterm.clear();
+            setTerminalStatus("", "");
         }
     }
 
-    function setTerminalCwdFromResponse(cwd) {
-        if (cwd) terminalCwd = cwd;
-        if ($terminalPrompt && terminalCwd) {
-            const short = terminalCwd.split("/").filter(Boolean).pop() || terminalCwd.replace(/^.*@/, "").split(":").pop() || "~";
-            $terminalPrompt.textContent = short + " $ ";
+    function setTerminalStatus(text, className) {
+        var el = document.getElementById("terminal-status");
+        if (el) {
+            el.textContent = text || "";
+            el.className = "terminal-status" + (className ? " " + className : "");
         }
     }
 
-    function appendTerminalLine(htmlOrText, className) {
-        if (!$terminalOutput) return;
-        const line = document.createElement("div");
-        line.className = "terminal-line" + (className ? " " + className : "");
-        if (htmlOrText.startsWith("<")) {
-            line.innerHTML = htmlOrText;
-        } else {
-            line.textContent = htmlOrText;
-        }
-        $terminalOutput.appendChild(line);
-        $terminalOutput.scrollTop = $terminalOutput.scrollHeight;
-    }
+    function terminalConnect() {
+        if (!window.Terminal || !$terminalXtermContainer) return;
+        if (terminalWs && terminalWs.readyState === WebSocket.CONNECTING) return;
+        terminalDisconnect();
+        setTerminalStatus("Connecting…", "");
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const wsUrl = protocol + "//" + window.location.host + "/ws/terminal";
+        const ws = new WebSocket(wsUrl);
+        terminalWs = ws;
 
-    async function runTerminalCommand() {
-        const cmd = $terminalInput && $terminalInput.value.trim();
-        if (!cmd) return;
-        if ($terminalInput) $terminalInput.value = "";
-        const promptText = ($terminalPrompt && $terminalPrompt.textContent) || "$ ";
-        appendTerminalLine(promptText + escapeHtml(cmd), "terminal-command");
-        appendTerminalLine("", "terminal-running");
-        const runningEl = $terminalOutput.lastElementChild;
-        const isCd = cmd === "cd" || (cmd.startsWith("cd ") && cmd.length > 3);
-        const runCmd = isCd ? (cmd === "cd" ? "cd && pwd" : cmd + " && pwd") : cmd;
-        const body = { command: runCmd };
-        if (terminalCwd) body.cwd = terminalCwd;
-        try {
-            const res = await fetch("/api/terminal-run", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-            });
-            const data = await res.json();
-            if (runningEl) runningEl.remove();
-            if (data.ok) {
-                if (data.stdout) appendTerminalLine(data.stdout, "terminal-stdout");
-                if (data.stderr) appendTerminalLine(data.stderr, "terminal-stderr");
-                if (data.cwd) {
-                    if (isCd && data.stdout) {
-                        const firstLine = data.stdout.trim().split("\n")[0].trim();
-                        if (firstLine) terminalCwd = firstLine;
-                        else terminalCwd = data.cwd;
-                    } else {
-                        terminalCwd = data.cwd;
+        ws.onopen = function () {};
+
+        ws.onmessage = function (ev) {
+            if (ev.data instanceof Blob) {
+                terminalBlobQueue.push(ev.data);
+                terminalProcessNextBlob(ws);
+                return;
+            }
+            try {
+                const obj = JSON.parse(ev.data);
+                if (obj.type === "error") {
+                    if (terminalXterm && terminalWs === ws) {
+                        var msg = obj.message || obj.content || "Connection error.";
+                        terminalXterm.writeln("\r\n\u001b[31mTerminal: " + msg + "\u001b[0m");
                     }
-                    setTerminalCwdFromResponse(terminalCwd);
+                    terminalDisconnect();
+                } else if (obj.type === "ready" && terminalFitAddon && terminalXterm && terminalWs === ws) {
+                    setTerminalStatus("Connected", "connected");
+                    requestAnimationFrame(function () {
+                        terminalFitAddon.fit();
+                        terminalSendResize(terminalXterm.rows, terminalXterm.cols);
+                        setTimeout(function () {
+                            if (terminalFocusInput) terminalFocusInput();
+                        }, 50);
+                    });
                 }
-            } else {
-                appendTerminalLine("Error: " + (data.error && data.error.trim() ? data.error.trim() : "Unknown"), "terminal-stderr");
+            } catch (e) {}
+        };
+
+        ws.onclose = function () {
+            if (terminalWs === ws) {
+                terminalWs = null;
+                setTerminalStatus("Disconnected", "");
             }
-        } catch (e) {
-            if (runningEl) runningEl.remove();
-            appendTerminalLine("Error: " + (e.message || "Request failed"), "terminal-stderr");
-        }
-        if ($terminalOutput) $terminalOutput.scrollTop = $terminalOutput.scrollHeight;
+        };
+        ws.onerror = function () {
+            setTerminalStatus("Error", "error");
+            if (terminalXterm && terminalWs === ws) {
+                terminalXterm.writeln("\r\n\u001b[31mConnection failed. Open a local project for full terminal.\u001b[0m");
+            }
+            terminalDisconnect();
+        };
     }
 
-    function getTerminalWordAtCursor() {
-        if (!$terminalInput) return null;
-        const line = $terminalInput.value;
-        const pos = $terminalInput.selectionStart;
-        let start = pos;
-        while (start > 0 && line[start - 1] !== " " && line[start - 1] !== "\t") start--;
-        let end = pos;
-        while (end < line.length && line[end] !== " " && line[end] !== "\t") end++;
-        const word = line.slice(start, end);
-        const beforeCursor = line.slice(0, start);
-        const isFirstWord = !beforeCursor.trim();
-        return { word, start, end, isFirstWord };
-    }
+    function terminalInit() {
+        if (!window.Terminal || !$terminalXtermContainer) return;
+        if (terminalXterm) return;
+        $terminalXtermContainer.innerHTML = "";
+        const term = new window.Terminal({
+            cursorBlink: true,
+            fontSize: 12,
+            fontFamily: "ui-monospace, monospace",
+            theme: {
+                background: "#0d1117",
+                foreground: "#e6edf3",
+                cursor: "#58a6ff",
+                cursorAccent: "#0d1117",
+            },
+        });
+        const FitAddonCtor = window.FitAddon && (window.FitAddon.FitAddon || window.FitAddon);
+        const fitAddon = FitAddonCtor ? new FitAddonCtor() : null;
+        if (fitAddon) term.loadAddon(fitAddon);
+        term.open($terminalXtermContainer);
+        terminalXterm = term;
+        terminalFitAddon = fitAddon;
 
-    function commonPrefix(arr) {
-        if (!arr.length) return "";
-        let p = arr[0];
-        for (let i = 1; i < arr.length; i++) {
-            while (arr[i].indexOf(p) !== 0) {
-                p = p.slice(0, -1);
-                if (!p) return "";
+        function terminalSendKeys(data) {
+            if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
+                terminalWs.send(data);
             }
         }
-        return p;
-    }
 
-    async function handleTerminalTab() {
-        if (!$terminalInput) return;
-        const info = getTerminalWordAtCursor();
-        if (!info) return;
-        const { word, start, end, isFirstWord } = info;
-        const completeType = isFirstWord ? "command" : "path";
-        const body = { prefix: word, type: completeType };
-        if (terminalCwd) body.cwd = terminalCwd;
-        let completions = [];
-        let prefix = word;
-        try {
-            const res = await fetch("/api/terminal-complete", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
+        var bodyWrap = document.getElementById("terminal-body-wrap");
+        terminalFocusInput = function () {
+            if (bodyWrap) bodyWrap.focus();
+        };
+        if ($terminalPanel) {
+            $terminalPanel.addEventListener("mousedown", function focusTerminalOnClick(e) {
+                if (e.target.closest && e.target.closest("button")) return;
+                if ($terminalPanel.contains(e.target)) {
+                    e.preventDefault();
+                    if (bodyWrap) bodyWrap.focus();
+                }
             });
-            const data = await res.json();
-            if (!data.ok || !Array.isArray(data.completions)) return;
-            completions = data.completions;
-            prefix = data.prefix != null ? data.prefix : word;
-        } catch {
-            return;
+            $terminalPanel.addEventListener("keydown", function terminalPanelKeydown(e) {
+                var panelHasFocus = $terminalPanel.contains(document.activeElement);
+                var targetInPanel = e.target && $terminalPanel.contains(e.target);
+                var panelVisible = $terminalPanel && !$terminalPanel.classList.contains("hidden");
+                if (!panelVisible || (!panelHasFocus && !targetInPanel)) return;
+                if (targetInPanel && !panelHasFocus && bodyWrap) {
+                    bodyWrap.focus();
+                }
+                var key = e.key;
+                var toSend = null;
+                if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                    toSend = key;
+                } else if (e.ctrlKey && !e.metaKey && !e.altKey) {
+                    if (key === "c") {
+                        var sel = (terminalXterm && typeof terminalXterm.getSelection === "function") ? terminalXterm.getSelection() : "";
+                        if (sel && sel.length > 0) return;
+                        toSend = "\x03";
+                    } else if (key === "d") { toSend = "\x04"; }
+                    else if (key === "z") { toSend = "\x1a"; }
+                    else if (key === "l") { toSend = "\x0c"; }
+                    else if (key === "a") { toSend = "\x01"; }
+                    else if (key === "e") { toSend = "\x05"; }
+                    else if (key === "k") { toSend = "\x0b"; }
+                    else if (key === "u") { toSend = "\x15"; }
+                    else if (key === "w") { toSend = "\x17"; }
+                    else if (key === "\\") { toSend = "\x1c"; }
+                    else if (key >= "a" && key <= "z") { toSend = String.fromCharCode(key.charCodeAt(0) - 96); }
+                    else if (key >= "@" && key <= "_") { toSend = String.fromCharCode(key.charCodeAt(0) - 64); }
+                } else if (key === "Enter") { toSend = "\r"; }
+                else if (key === "Backspace") { toSend = "\x7f"; }
+                else if (key === "Tab") { toSend = "\t"; }
+                else if (key === "Escape") { toSend = "\x1b"; }
+                else if (key === "ArrowUp") { toSend = "\x1b[A"; }
+                else if (key === "ArrowDown") { toSend = "\x1b[B"; }
+                else if (key === "ArrowRight") { toSend = "\x1b[C"; }
+                else if (key === "ArrowLeft") { toSend = "\x1b[D"; }
+                if (toSend !== null) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
+                        terminalSendKeys(toSend);
+                    } else if (terminalXterm) {
+                        terminalXterm.writeln("\r\n\u001b[33mTerminal not connected. Open a project first.\u001b[0m");
+                    }
+                }
+            }, true);
+            $terminalPanel.addEventListener("paste", function terminalPanelPaste(e) {
+                var panelVisible = $terminalPanel && !$terminalPanel.classList.contains("hidden");
+                var inPanel = $terminalPanel.contains(document.activeElement) || (e.target && $terminalPanel.contains(e.target));
+                if (!bodyWrap || !panelVisible || !inPanel) return;
+                e.preventDefault();
+                var text = (e.clipboardData || window.clipboardData).getData("text");
+                if (text && terminalWs && terminalWs.readyState === WebSocket.OPEN) {
+                    terminalSendKeys(text);
+                } else if (text && terminalXterm) {
+                    terminalXterm.writeln("\r\n\u001b[33mTerminal not connected. Open a project first.\u001b[0m");
+                }
+            }, true);
         }
-        if (!completions.length) return;
-        let replacement;
-        if (completions.length === 1) {
-            replacement = completions[0];
-            terminalCompletionState = null;
-        } else {
-            const samePrefix = terminalCompletionState && terminalCompletionState.prefix === prefix &&
-                JSON.stringify(terminalCompletionState.completions) === JSON.stringify(completions);
-            if (samePrefix && terminalCompletionState.index != null) {
-                terminalCompletionState.index = (terminalCompletionState.index + 1) % completions.length;
-                replacement = completions[terminalCompletionState.index];
-            } else {
-                const cp = commonPrefix(completions);
-                replacement = cp && cp.length > prefix.length ? cp : completions[0];
-                terminalCompletionState = { prefix, completions, index: 0 };
+
+        terminalConnect();
+
+        term.onBinary(function (data) {
+            if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
+                terminalWs.send(data);
             }
+        });
+    }
+
+    function terminalSendResize(rows, cols) {
+        if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
+            terminalWs.send(JSON.stringify({ resize: [rows, cols] }));
         }
-        const line = $terminalInput.value;
-        $terminalInput.value = line.slice(0, start) + replacement + line.slice(end);
-        $terminalInput.setSelectionRange(start + replacement.length, start + replacement.length);
     }
 
     function setTerminalPanelVisible(visible) {
@@ -1462,14 +1541,31 @@
             if (!$terminalPanel.style.height || $terminalPanel.dataset.height) {
                 $terminalPanel.style.height = ($terminalPanel.dataset.height || TERMINAL_DEFAULT_HEIGHT) + "px";
             }
-            updateTerminalPrompt();
             if ($terminalToggleBtn) $terminalToggleBtn.classList.add("active");
+            requestAnimationFrame(function () {
+                terminalInit();
+                if (terminalFitAddon) {
+                    terminalFitAddon.fit();
+                    if (terminalXterm) {
+                        terminalSendResize(terminalXterm.rows, terminalXterm.cols);
+                    }
+                }
+                if (terminalXterm && (!terminalWs || terminalWs.readyState !== WebSocket.OPEN)) {
+                    terminalConnect();
+                }
+                if (terminalFocusInput) terminalFocusInput();
+                setTimeout(function () { if (terminalFocusInput) terminalFocusInput(); }, 50);
+                setTimeout(function () { if (terminalFocusInput) terminalFocusInput(); }, 300);
+                if (monacoInstance) monacoInstance.layout();
+                if (diffEditorInstance) diffEditorInstance.layout();
+            });
         } else {
             $terminalPanel.classList.add("hidden");
             $resizeTerminal.classList.add("hidden");
             if ($terminalToggleBtn) $terminalToggleBtn.classList.remove("active");
+            terminalDisconnect();
         }
-        requestAnimationFrame(() => {
+        requestAnimationFrame(function () {
             if (monacoInstance) monacoInstance.layout();
             if (diffEditorInstance) diffEditorInstance.layout();
         });
@@ -1484,32 +1580,16 @@
         $terminalToggleBtn.addEventListener("click", toggleTerminalPanel);
     }
     if ($terminalCloseBtn) {
-        $terminalCloseBtn.addEventListener("click", () => setTerminalPanelVisible(false));
+        $terminalCloseBtn.addEventListener("click", function () { setTerminalPanelVisible(false); });
     }
     if ($terminalClearBtn) {
-        $terminalClearBtn.addEventListener("click", () => {
-            if ($terminalOutput) $terminalOutput.innerHTML = "";
-        });
-    }
-    if ($terminalInput) {
-        $terminalInput.addEventListener("keydown", (e) => {
-            if (e.key === "Enter") {
-                e.preventDefault();
-                runTerminalCommand();
-                return;
-            }
-            if (e.key === "Tab") {
-                e.preventDefault();
-                handleTerminalTab();
-                return;
-            }
-            terminalCompletionState = null;
+        $terminalClearBtn.addEventListener("click", function () {
+            if (terminalXterm) terminalXterm.clear();
         });
     }
 
-    // Terminal panel vertical resize
     if ($resizeTerminal && $terminalPanel) {
-        $resizeTerminal.addEventListener("mousedown", (e) => {
+        $resizeTerminal.addEventListener("mousedown", function (e) {
             e.preventDefault();
             const startY = e.clientY;
             const startHeight = $terminalPanel.offsetHeight;
@@ -1523,6 +1603,12 @@
                 $terminalPanel.dataset.height = newHeight;
                 if (monacoInstance) monacoInstance.layout();
                 if (diffEditorInstance) diffEditorInstance.layout();
+                if (terminalFitAddon) {
+                    terminalFitAddon.fit();
+                    if (terminalXterm && terminalWs && terminalWs.readyState === WebSocket.OPEN) {
+                        terminalSendResize(terminalXterm.rows, terminalXterm.cols);
+                    }
+                }
             }
             function onUp() {
                 $resizeTerminal.classList.remove("dragging");
@@ -1535,6 +1621,15 @@
             document.addEventListener("mouseup", onUp);
         });
     }
+
+    window.addEventListener("resize", function () {
+        if (terminalFitAddon && $terminalPanel && !$terminalPanel.classList.contains("hidden")) {
+            terminalFitAddon.fit();
+            if (terminalXterm && terminalWs && terminalWs.readyState === WebSocket.OPEN) {
+                terminalSendResize(terminalXterm.rows, terminalXterm.cols);
+            }
+        }
+    });
 
     // ================================================================
     // CHAT — Messages
@@ -3106,13 +3201,21 @@
             connect();
         });
     }
+    function isTerminalFocused() {
+        var panel = document.getElementById("terminal-panel");
+        if (!panel || panel.classList.contains("hidden")) return false;
+        return panel.contains(document.activeElement);
+    }
+
     // Escape key cancels the running agent
     document.addEventListener("keydown", e => {
+        if (isTerminalFocused()) return;
         if (e.key === "Escape" && isRunning) { e.preventDefault(); send({type:"cancel"}); }
     });
 
     // ── Keyboard shortcuts ──
     document.addEventListener("keydown", e => {
+        if (isTerminalFocused()) return;
         const isMeta = e.metaKey || e.ctrlKey;
         if (!isMeta) return;
 
@@ -3185,6 +3288,10 @@
                 if (diffEditorInstance) { diffEditorInstance.dispose(); diffEditorInstance = null; }
                 $editorWelcome.classList.remove("hidden");
                 modifiedFiles.clear();
+                if (typeof terminalDisconnect === "function" && typeof terminalConnect === "function") {
+                    terminalDisconnect(true);
+                    if ($terminalPanel && !$terminalPanel.classList.contains("hidden")) terminalConnect();
+                }
                 showToast("Opened: " + data.path);
             } else {
                 $dirError.textContent = data.error || "Failed"; $dirError.classList.remove("hidden");
@@ -3593,12 +3700,20 @@
         // Connect WebSocket (will load session + replay history)
         disconnectWs();
         connect();
+        // Terminal follows the project: disconnect and clear so it uses the new backend (local or SSH)
+        if (typeof terminalDisconnect === "function" && typeof terminalConnect === "function") {
+            terminalDisconnect(true);
+            if ($terminalPanel && !$terminalPanel.classList.contains("hidden")) {
+                terminalConnect();
+            }
+        }
         $input.focus();
     }
 
     function showWelcome() {
         // Disconnect without auto-reconnect
         disconnectWs();
+        if (typeof terminalDisconnect === "function") terminalDisconnect(true);
 
         // Reset IDE state
         $chatMessages.innerHTML = "";

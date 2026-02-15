@@ -17,6 +17,10 @@ import mimetypes
 import os
 import posixpath
 import shlex
+import struct
+import sys
+import termios
+import threading
 import time
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -31,7 +35,7 @@ from fastapi.staticfiles import StaticFiles
 
 from bedrock_service import BedrockService, BedrockError
 from agent import CodingAgent, AgentEvent, classify_intent
-from backend import Backend, LocalBackend
+from backend import Backend, LocalBackend, SSHBackend
 from sessions import SessionStore, Session
 from config import (
     get_model_name,
@@ -508,6 +512,290 @@ async def terminal_complete(request: Request):
     except Exception as e:
         logger.exception("Terminal complete failed")
         return JSONResponse({"ok": False, "error": str(e).strip() or "Completion failed"}, status_code=500)
+
+
+# ------------------------------------------------------------------
+# Full terminal (PTY) WebSocket — local backend only
+# ------------------------------------------------------------------
+
+def _pty_shell(cwd: str) -> None:
+    """Run in the child after pty.fork(): stdio is already the slave; chdir and exec shell."""
+    os.setsid()
+    os.chdir(cwd)
+    shell = os.environ.get("SHELL", "/bin/bash")
+    if not os.path.exists(shell):
+        shell = "/bin/bash"
+    os.execlp(shell, os.path.basename(shell), "-l")
+
+
+def _pty_read_loop(master_fd: int, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop) -> None:
+    """Thread: read from PTY master and put bytes into asyncio queue."""
+    try:
+        while True:
+            try:
+                data = os.read(master_fd, 4096)
+            except (OSError, AttributeError):
+                break
+            if not data:
+                break
+            loop.call_soon_threadsafe(queue.put_nowait, data)
+    except Exception:
+        pass
+    try:
+        loop.call_soon_threadsafe(queue.put_nowait, None)
+    except Exception:
+        pass
+
+
+def _ssh_channel_read_loop(channel: Any, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop) -> None:
+    """Thread: read from paramiko Channel and put bytes into asyncio queue."""
+    try:
+        while channel.active:
+            try:
+                data = channel.recv(4096)
+            except Exception:
+                break
+            if not data:
+                break
+            loop.call_soon_threadsafe(queue.put_nowait, data)
+    except Exception:
+        pass
+    try:
+        loop.call_soon_threadsafe(queue.put_nowait, None)
+    except Exception:
+        pass
+
+
+@app.websocket("/ws/terminal")
+async def websocket_terminal(ws: WebSocket):
+    """Full PTY terminal. Local: pty.fork(); SSH: invoke_shell. Binary = I/O; text JSON = resize [rows, cols]."""
+    global _backend, _working_directory
+    await ws.accept()
+
+    async def _send_error_and_close(message: str) -> None:
+        await ws.send_json({"type": "error", "message": message})
+        await asyncio.sleep(0.05)
+        await ws.close()
+
+    if _backend is None:
+        logger.warning("terminal ws: rejected (no project open)")
+        await _send_error_and_close("No project open. Open a project first.")
+        return
+
+    is_local = isinstance(_backend, LocalBackend)
+    is_ssh = isinstance(_backend, SSHBackend)
+    if not is_local and not is_ssh:
+        logger.warning("terminal ws: rejected (backend type %s)", type(_backend).__name__)
+        await _send_error_and_close("Full terminal is not available for this backend.")
+        return
+
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+    master_fd: Optional[int] = None
+    pid: Optional[int] = None
+    ssh_channel: Optional[Any] = None
+
+    if is_local:
+        cwd = os.path.abspath(os.path.expanduser(str(_working_directory)))
+        if not os.path.isdir(cwd):
+            logger.warning("terminal ws: local project dir not found: %s", cwd)
+            await _send_error_and_close(f"Project directory not found: {cwd}")
+            return
+        pty_available = False
+        try:
+            import pty
+            pty_available = True
+        except ImportError:
+            pass
+        if not pty_available or sys.platform == "win32":
+            logger.warning("terminal ws: PTY not available (platform=%s)", sys.platform)
+            await _send_error_and_close("PTY not available on this system (required for local terminal).")
+            return
+        import pty
+        try:
+            pid, master_fd = pty.fork()
+        except OSError as e:
+            logger.exception("terminal ws: pty.fork failed")
+            await _send_error_and_close(f"Terminal failed to start: {e!s}")
+            return
+        if pid == 0:
+            try:
+                _pty_shell(cwd)
+            except Exception:
+                os._exit(1)
+            os._exit(0)
+        reader_thread = threading.Thread(
+            target=_pty_read_loop,
+            args=(master_fd, queue, loop),
+            daemon=True,
+        )
+        reader_thread.start()
+    else:
+        # SSH: open interactive shell with PTY
+        backend = _backend
+        cwd = (backend.working_directory or "").rstrip("/") or "/"
+        with backend._lock:
+            backend._reconnect_if_needed()
+            try:
+                ssh_channel = backend._client.invoke_shell(term="xterm", width=80, height=24)
+            except Exception as e:
+                await _send_error_and_close(f"SSH shell failed: {e!s}")
+                return
+        ssh_channel.settimeout(0.5)
+        # Start in project directory
+        if cwd and cwd != "~":
+            try:
+                ssh_channel.send(f"cd {shlex.quote(cwd)}\r\n")
+            except Exception:
+                pass
+        reader_thread = threading.Thread(
+            target=_ssh_channel_read_loop,
+            args=(ssh_channel, queue, loop),
+            daemon=True,
+        )
+        reader_thread.start()
+
+    async def send_output():
+        """Batch PTY output: drain queue for a short window and send one combined message to reduce WebSocket chatter."""
+        batch: list = []
+        batch_size = 0
+        max_batch_bytes = 8192
+        flush_interval = 0.008  # 8ms
+
+        async def flush():
+            nonlocal batch, batch_size
+            if not batch:
+                return
+            try:
+                await ws.send_bytes(b"".join(batch))
+            except Exception:
+                pass
+            batch = []
+            batch_size = 0
+
+        while True:
+            try:
+                data = await asyncio.wait_for(queue.get(), timeout=flush_interval)
+            except asyncio.TimeoutError:
+                await flush()
+                continue
+            if data is None:
+                await flush()
+                break
+            batch.append(data)
+            batch_size += len(data)
+            while batch_size >= max_batch_bytes:
+                await flush()
+            # Drain any more available without waiting
+            while True:
+                try:
+                    data = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if data is None:
+                    await flush()
+                    return
+                batch.append(data)
+                batch_size += len(data)
+                if batch_size >= max_batch_bytes:
+                    await flush()
+                    break
+        await flush()
+
+    send_task = asyncio.create_task(send_output())
+
+    def do_resize(rows: int, cols: int) -> None:
+        if rows <= 0 or cols <= 0:
+            return
+        if is_local and master_fd is not None:
+            try:
+                if hasattr(termios, "tcsetwinsize"):
+                    termios.tcsetwinsize(master_fd, (rows, cols))
+                else:
+                    import fcntl
+                    buf = struct.pack("HHHH", rows, cols, 0, 0)
+                    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, buf)
+            except (OSError, AttributeError, NameError):
+                pass
+        elif is_ssh and ssh_channel is not None:
+            try:
+                ssh_channel.resize_pty(width=cols, height=rows)
+            except Exception:
+                pass
+
+    try:
+        logger.info("terminal ws: connected (backend=%s)", "local" if is_local else "ssh")
+        await ws.send_json({"type": "ready"})
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=3600.0)
+            except asyncio.TimeoutError:
+                continue
+            if msg.get("type") == "websocket.disconnect":
+                break
+            if msg.get("type") == "websocket.receive":
+                text = msg.get("text")
+                data = msg.get("bytes")
+                if text is not None:
+                    logger.info("terminal ws: received text len=%s (first 50 repr=%s)", len(text), repr(text[:50]))
+                    try:
+                        obj = json.loads(text)
+                        if not isinstance(obj, dict):
+                            logger.warning(
+                                "terminal ws: received JSON text that is not a dict (type=%s, repr=%s, raw_len=%s)",
+                                type(obj).__name__, repr(obj)[:200], len(text),
+                            )
+                        elif isinstance(obj.get("resize"), (list, tuple)) and len(obj["resize"]) >= 2:
+                            rows, cols = int(obj["resize"][0]), int(obj["resize"][1])
+                            logger.info("terminal ws: resize rows=%s cols=%s", rows, cols)
+                            do_resize(rows, cols)
+                            continue
+                    except (json.JSONDecodeError, ValueError, TypeError) as e:
+                        logger.debug("terminal ws: JSON parse failed for text (len=%s): %s", len(text), e)
+                    try:
+                        if is_local and master_fd is not None:
+                            os.write(master_fd, text.encode("utf-8"))
+                        elif is_ssh and ssh_channel is not None:
+                            ssh_channel.send(text)
+                    except (OSError, BrokenPipeError, Exception):
+                        break
+                elif data is not None:
+                    logger.debug("terminal ws: received binary payload len=%s", len(data))
+                    try:
+                        if is_local and master_fd is not None:
+                            os.write(master_fd, data)
+                        elif is_ssh and ssh_channel is not None:
+                            ssh_channel.send(data)
+                    except (OSError, BrokenPipeError, Exception):
+                        break
+    except WebSocketDisconnect:
+        logger.debug("terminal ws: client disconnected")
+    finally:
+        logger.info("terminal ws: closing")
+        send_task.cancel()
+        try:
+            send_task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
+        if is_local and master_fd is not None:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            if pid is not None:
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except OSError:
+                    pass
+        if is_ssh and ssh_channel is not None:
+            try:
+                ssh_channel.close()
+            except Exception:
+                pass
 
 
 # ------------------------------------------------------------------
@@ -2158,6 +2446,15 @@ def main():
         else:
             print(f"  Welcome screen enabled — select a project in the browser")
         print()
+
+    # Ensure our app logs (e.g. terminal ws) are visible; uvicorn's log_level only affects its own loggers
+    web_log = logging.getLogger("web")
+    web_log.setLevel(logging.INFO)
+    if not web_log.handlers:
+        h = logging.StreamHandler()
+        h.setLevel(logging.INFO)
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [web] %(message)s"))
+        web_log.addHandler(h)
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

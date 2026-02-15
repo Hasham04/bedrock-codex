@@ -10,6 +10,10 @@
     <!-- Syntax highlighting for chat code blocks -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
     <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+    <!-- xterm.js for full terminal -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
 </head>
 <body>
 
@@ -250,15 +254,14 @@
                 <div id="terminal-panel" class="terminal-panel hidden">
                     <div class="terminal-panel-header">
                         <span class="terminal-panel-title">Terminal</span>
+                        <span id="terminal-status" class="terminal-status" title="WebSocket connection"></span>
                         <div class="terminal-panel-actions">
                             <button id="terminal-clear-btn" class="icon-btn-sm" title="Clear">Clear</button>
                             <button id="terminal-close-btn" class="icon-btn-sm" title="Close panel" aria-label="Close terminal">&#x00D7;</button>
                         </div>
                     </div>
-                    <div id="terminal-output" class="terminal-output"></div>
-                    <div class="terminal-input-row">
-                        <span id="terminal-prompt" class="terminal-prompt"></span>
-                        <input type="text" id="terminal-input" class="terminal-input" placeholder="Type a command..." spellcheck="false" autocomplete="off" />
+                    <div class="terminal-body-wrap" tabindex="0" id="terminal-body-wrap">
+                        <div id="terminal-xterm-container" class="terminal-xterm-container"></div>
                     </div>
                 </div>
             </main>
