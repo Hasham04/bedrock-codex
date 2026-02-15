@@ -546,7 +546,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "Read",
-        "description": "Read the contents of a file with line numbers. ALWAYS read a file before editing it — understand existing code before suggesting modifications. For large files (>500 lines), returns a structural overview (imports, classes, functions) plus head/tail. Use offset and limit to read specific sections of large files. When you need to read multiple files, request them all in a single turn — they run in parallel.",
+        "description": "Read the contents of a file with line numbers. ALWAYS read a file before editing it — understand existing code before suggesting modifications. For large files (>500 lines), returns a structural overview (imports, classes, functions) plus head/tail. Use offset and limit to read specific sections of large files. **Batch multiple files in ONE request** — they run in parallel (5-12 files per turn is optimal). After semantic_retrieve, use targeted reads with offset/limit.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -681,7 +681,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "semantic_retrieve",
-        "description": "Semantic codebase search. Returns the most relevant code chunks (functions, classes) for a natural-language query. Prefer this over search when exploring the codebase or finding where something is implemented (use search for exact string/regex matches). Then use read_file with offset/limit to open only the returned locations.",
+        "description": "Semantic codebase search. Returns the most relevant code chunks (functions, classes) for a natural-language query. **START HERE for code discovery** - much more effective than reading full files. Examples: 'where is user authentication validated', 'how are database connections handled', 'error handling patterns', 'main entry points'. Use this for exploration and understanding, then use Read with offset/limit to examine specific returned chunks. Cost-efficient: queries against semantic index instead of loading entire files. Prefer over search() for discovery - use search() only for exact strings/regex.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -694,7 +694,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "search",
-        "description": "Regex search (ripgrep) across files. Use when you have an exact string or pattern; for exploring or finding by meaning use semantic_retrieve instead. Returns matching lines with paths and line numbers. Use `include` to filter by file type.",
+        "description": "Regex search (ripgrep) across files. Use when you have an exact string or pattern; for exploring or finding by meaning use semantic_retrieve instead. Returns matching lines with paths and line numbers. Use `include` to filter by file type. **Fast and cheap** - use for exact matches, error messages, TODOs. For discovery, start with semantic_retrieve first.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -708,7 +708,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "find_symbol",
-        "description": "Symbol-aware navigation helper. Finds symbol definitions and/or references using language-aware patterns across Python/JS/TS and common typed languages. Use this before editing ambiguous symbols with many occurrences.",
+        "description": "Symbol-aware navigation helper. Finds symbol definitions and/or references using language-aware patterns across Python/JS/TS and common typed languages. **Use this before editing ambiguous symbols** with many occurrences. Essential for safe refactoring - shows you all places a symbol is used before making changes.",
         "input_schema": {
             "type": "object",
             "properties": {
