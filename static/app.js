@@ -49,11 +49,7 @@
     const $cancelBtn     = document.getElementById("cancel-btn");
     const $actionBar     = document.getElementById("action-bar");
     const $actionBtns    = document.getElementById("action-buttons");
-    const $modifiedFilesBar = document.getElementById("modified-files-bar");
-    const $modifiedFilesToggle = document.getElementById("modified-files-toggle");
-    const $modifiedFilesDropdown = document.getElementById("modified-files-dropdown");
-    const $modifiedFilesList = document.getElementById("modified-files-list");
-    const $modifiedFilesTotalsTop = document.getElementById("modified-files-totals-top");
+
     const $modelName     = document.getElementById("model-name");
     const $tokenCount    = document.getElementById("token-count");
     const $connStatus    = document.getElementById("connection-status");
@@ -62,6 +58,24 @@
     const $newAgentBtn   = document.getElementById("new-agent-btn");
     const $workingDir    = document.getElementById("working-dir");
     const $resetBtn      = document.getElementById("reset-btn");
+    const $chatSessionStats = document.getElementById("chat-session-stats");
+    const $chatSessionTime = document.getElementById("chat-session-time");
+    const $chatSessionTotals = document.getElementById("chat-session-totals");
+    const $chatComposerReviewBtn = document.getElementById("chat-composer-review-btn");
+    const $chatMenuBtn = document.getElementById("chat-menu-btn");
+    const $chatMenuDropdown = document.getElementById("chat-menu-dropdown");
+    const $stickyTodoBar = document.getElementById("sticky-todo-bar");
+    const $stickyTodoToggle = document.getElementById("sticky-todo-toggle");
+    const $stickyTodoCount = document.getElementById("sticky-todo-count");
+    const $stickyTodoList = document.getElementById("sticky-todo-list");
+    const $stickyTodoAddInput = document.getElementById("sticky-todo-add-input");
+    const $stickyTodoAddBtn = document.getElementById("sticky-todo-add-btn");
+    const $chatComposerStats = document.getElementById("chat-composer-stats");
+    const $chatComposerStatsToggle = document.getElementById("chat-composer-stats-toggle");
+    const $chatComposerFilesDropup = document.getElementById("chat-composer-files-dropup");
+    const $chatComposerTime = document.getElementById("chat-composer-time");
+    const $chatComposerTotals = document.getElementById("chat-composer-totals");
+    const $chatComposerFiles = document.getElementById("chat-composer-files");
     const $openBtn       = document.getElementById("open-project-btn");
     const $logoHome      = document.getElementById("logo-home");
     const $searchToggle  = document.getElementById("search-toggle-btn");
@@ -133,6 +147,7 @@
     const openTabs = new Map();   // path -> { model, viewState, content }
     const modifiedFiles = new Set(); // paths changed by agent
     let gitStatus = new Map();       // path -> 'M'|'A'|'D'|'U' (git status for explorer + inline diffs)
+    let fileChangesThisSession = new Map(); // path -> {edits: number, deletions: number}
     let currentThinkingEl = null;
     let currentTextEl = null;
     let currentTextBuffer = "";
@@ -141,6 +156,7 @@
     let scoutEl = null;
     const pendingImages = []; // { id, file, previewUrl, name, size, media_type }
     let currentSessionId = null;
+    let sessionStartTime = null; // set on first user message for "Xm" / "Xh" in header
     let suppressAgentSwitch = false;
 
     // ── Markdown ──────────────────────────────────────────────
@@ -353,13 +369,122 @@
         return map[ext?.toLowerCase()] || "plaintext";
     }
 
+    // ── File Changes Tracking ─────────────────────────────────
+    function trackFileChange(path, edits = 0, deletions = 0) {
+        if (!path) return;
+        const current = fileChangesThisSession.get(path) || { edits: 0, deletions: 0 };
+        fileChangesThisSession.set(path, {
+            edits: current.edits + edits,
+            deletions: current.deletions + deletions
+        });
+        updateFileChangesDropdown();
+    }
+
+    function getFileIcon(path) {
+        const ext = path.split('.').pop()?.toLowerCase();
+        const iconMap = {
+            js: "📄", jsx: "⚛️", ts: "📘", tsx: "⚛️", 
+            py: "🐍", java: "☕", cpp: "⚡", c: "⚡", 
+            html: "🌐", css: "🎨", scss: "🎨", 
+            json: "📋", xml: "📄", md: "📝", 
+            txt: "📄", log: "📜", yaml: "⚙️", yml: "⚙️",
+            png: "🖼️", jpg: "🖼️", jpeg: "🖼️", gif: "🖼️", svg: "🎨"
+        };
+        return iconMap[ext] || "📄";
+    }
+
+    function formatSessionDuration(ms) {
+        if (!ms || ms < 0) return "";
+        const sec = Math.floor(ms / 1000);
+        if (sec < 60) return sec + "s";
+        const min = Math.floor(sec / 60);
+        if (min < 60) return min + "m";
+        const hr = Math.floor(min / 60);
+        return hr + "h";
+    }
+
+    function updateFileChangesDropdown() {
+        const changes = Array.from(fileChangesThisSession.entries())
+            .filter(([_, stats]) => stats.edits > 0 || stats.deletions > 0)
+            .sort(([a], [b]) => a.localeCompare(b));
+
+        let totalAdd = 0, totalDel = 0;
+        changes.forEach(([_, stats]) => {
+            totalAdd += stats.edits;
+            totalDel += stats.deletions;
+        });
+
+        const showStats = sessionStartTime || changes.length > 0;
+        const elapsed = sessionStartTime ? Date.now() - sessionStartTime : 0;
+        const timeStr = formatSessionDuration(elapsed);
+        const filesLabel = changes.length === 0 ? "0 files" : (changes.length + " file" + (changes.length !== 1 ? "s" : ""));
+
+        // Update header session stats (Cursor-style: time · +X -Y · Auto)
+        if ($chatSessionStats) {
+            if (showStats) {
+                $chatSessionStats.classList.remove("hidden");
+                if ($chatSessionTime) $chatSessionTime.textContent = timeStr;
+                if ($chatSessionTotals) {
+                    const addEl = $chatSessionTotals.querySelector(".add");
+                    const delEl = $chatSessionTotals.querySelector(".del");
+                    if (addEl) addEl.textContent = "+" + totalAdd;
+                    if (delEl) delEl.textContent = "\u2212" + totalDel;
+                }
+            } else {
+                $chatSessionStats.classList.add("hidden");
+            }
+        }
+
+        // Update composer stats bar + file edits dropup (time · +N −M · N files; click to show per-file list)
+        if ($chatComposerStats) {
+            if (showStats) {
+                $chatComposerStats.classList.remove("hidden");
+                if ($chatComposerTime) $chatComposerTime.textContent = timeStr;
+                if ($chatComposerTotals) {
+                    const addEl = $chatComposerTotals.querySelector(".add");
+                    const delEl = $chatComposerTotals.querySelector(".del");
+                    if (addEl) addEl.textContent = "+" + totalAdd;
+                    if (delEl) delEl.textContent = "\u2212" + totalDel;
+                }
+                if ($chatComposerFiles) $chatComposerFiles.textContent = filesLabel;
+                // Populate dropup: edits per file with icon, path, +X −Y; click opens file
+                if ($chatComposerFilesDropup) {
+                    if (changes.length > 0) {
+                        $chatComposerFilesDropup.innerHTML = changes.map(([path, stats]) => {
+                            const icon = fileTypeIcon(path, 14);
+                            const add = stats.edits > 0 ? `<span class="add">+${stats.edits}</span>` : "";
+                            const del = stats.deletions > 0 ? `<span class="del">−${stats.deletions}</span>` : "";
+                            return `<div class="composer-file-item" data-path="${escapeHtml(path)}" title="${escapeHtml(path)}">
+                                <span class="file-icon">${icon}</span>
+                                <span class="file-path">${escapeHtml(path)}</span>
+                                <span class="file-stats">${add} ${del}</span>
+                            </div>`;
+                        }).join("");
+                        $chatComposerFilesDropup.querySelectorAll(".composer-file-item[data-path]").forEach((item) => {
+                            item.addEventListener("click", () => {
+                                const path = item.dataset.path;
+                                if (path) openFile(path);
+                            });
+                        });
+                    } else {
+                        $chatComposerFilesDropup.innerHTML = "";
+                    }
+                }
+            } else {
+                $chatComposerStats.classList.add("hidden");
+                if ($chatComposerFilesDropup) $chatComposerFilesDropup.innerHTML = "";
+                if ($chatComposerStats) $chatComposerStats.removeAttribute("data-expanded");
+            }
+        }
+
+    }
+
     // ── UI State ──────────────────────────────────────────────
     function setRunning(running) {
         isRunning = running;
-        $sendBtn.classList.toggle("hidden", running);
-        $cancelBtn.classList.toggle("hidden", !running);
-        $input.disabled = running;
-        if (!running) $input.focus();
+        if ($sendBtn) $sendBtn.classList.toggle("hidden", running);
+        if ($cancelBtn) $cancelBtn.classList.toggle("hidden", !running);
+        if ($input) { $input.disabled = running; if (!running) $input.focus(); }
     }
 
     function showActionBar(buttons) {
@@ -652,19 +777,45 @@
         }
     }
     startGitStatusPolling();
-    if ($modifiedFilesToggle && $modifiedFilesDropdown) {
-        $modifiedFilesToggle.addEventListener("click", () => {
-            const expanded = $modifiedFilesBar.getAttribute("aria-expanded") === "true";
-            $modifiedFilesBar.setAttribute("aria-expanded", expanded ? "false" : "true");
-            $modifiedFilesDropdown.classList.toggle("hidden", expanded);
+    // Review files bar: toggle expand list
+    if ($stickyTodoToggle && $stickyTodoList && $stickyTodoBar) {
+        $stickyTodoToggle.addEventListener("click", () => {
+            const expanded = $stickyTodoBar.getAttribute("data-expanded") === "true";
+            $stickyTodoBar.setAttribute("data-expanded", expanded ? "false" : "true");
+            $stickyTodoList.classList.toggle("hidden", expanded);
+            $stickyTodoToggle.setAttribute("aria-expanded", expanded ? "false" : "true");
         });
     }
-    startModifiedFilesPolling();
-    if ($modifiedFilesTotalsTop && $modifiedFilesBar && $modifiedFilesDropdown) {
-        $modifiedFilesTotalsTop.addEventListener("click", () => {
-            $modifiedFilesBar.setAttribute("aria-expanded", "true");
-            $modifiedFilesDropdown.classList.remove("hidden");
-            $modifiedFilesBar.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    if ($stickyTodoAddBtn && $stickyTodoAddInput) {
+        function submitStickyAddTask() {
+            const content = ($stickyTodoAddInput.value || "").trim();
+            if (!content) return;
+            send({ type: "add_todo", content });
+            $stickyTodoAddInput.value = "";
+        }
+        $stickyTodoAddBtn.addEventListener("click", submitStickyAddTask);
+        $stickyTodoAddInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitStickyAddTask(); } });
+    }
+    if ($chatComposerStatsToggle && $chatComposerFilesDropup && $chatComposerStats) {
+        function toggleComposerFilesDropup() {
+            const expanded = $chatComposerStats.getAttribute("data-expanded") === "true";
+            $chatComposerStats.setAttribute("data-expanded", expanded ? "false" : "true");
+            $chatComposerFilesDropup.classList.toggle("hidden", expanded);
+            $chatComposerStatsToggle.setAttribute("aria-expanded", expanded ? "false" : "true");
+            $chatComposerFilesDropup.setAttribute("aria-hidden", expanded ? "true" : "false");
+        }
+        $chatComposerStatsToggle.addEventListener("click", toggleComposerFilesDropup);
+        if ($chatComposerReviewBtn) $chatComposerReviewBtn.addEventListener("click", toggleComposerFilesDropup);
+    }
+    // Chat menu (…) dropdown
+    if ($chatMenuBtn && $chatMenuDropdown) {
+        $chatMenuBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            $chatMenuDropdown.classList.toggle("hidden");
+        });
+        $chatMenuDropdown.addEventListener("click", (e) => e.stopPropagation());
+        document.addEventListener("click", () => {
+            $chatMenuDropdown.classList.add("hidden");
         });
     }
     $refreshTree.addEventListener("click", refreshTree);
@@ -1663,6 +1814,10 @@
         bubble.appendChild(makeCopyBtn(copyPayload));
         div.appendChild(bubble);
         $chatMessages.appendChild(div);
+        if (!sessionStartTime) {
+            sessionStartTime = Date.now();
+            updateFileChangesDropdown();
+        }
         if ($conversationTitle && $chatMessages.querySelectorAll(".message.user").length === 1) {
             const truncated = safeText.trim().slice(0, 50);
             $conversationTitle.textContent = truncated ? (truncated + (safeText.length > 50 ? "\u2026" : "")) : "New conversation";
@@ -1692,10 +1847,10 @@
         const titleEl = block.querySelector(".thinking-title");
         const statusEl = block.querySelector(".thinking-status-text");
         if (titleEl) {
-            titleEl.textContent = done ? `Thought for ${elapsed}s` : (elapsed > 0 ? `Thinking for ${elapsed}s` : "Thinking...");
+            titleEl.textContent = elapsed > 0 ? `Thought ${elapsed}s` : "Thought 0s";
         }
         if (statusEl) {
-            statusEl.textContent = done ? "Completed" : "In progress";
+            statusEl.textContent = done ? "" : "";
         }
     }
 
@@ -1712,10 +1867,7 @@
                             <path d="M9 19h6"/><path d="M10 22h4"/>
                         </svg>
                     </span>
-                    <div class="thinking-meta">
-                        <span class="thinking-title">Thinking...</span>
-                        <span class="thinking-status-text">In progress</span>
-                    </div>
+                    <span class="thinking-title">Thought 0s</span>
                 </div>
                 <div class="thinking-right">
                     <span class="thinking-spinner spinner"></span>
@@ -1735,7 +1887,8 @@
         updateThinkingHeader(block, true);
         const spinner = block.querySelector(".thinking-spinner"); if (spinner) spinner.remove();
         block.classList.add("collapsed");
-        block.appendChild(makeCopyBtn(() => el.textContent));
+        const header = block.querySelector(".thinking-header");
+        if (header && !header.querySelector(".copy-btn")) header.appendChild(makeCopyBtn(() => el.textContent));
     }
 
     // Tool blocks
@@ -1995,7 +2148,15 @@
         runEl.appendChild(out);
         return out;
     }
-    function updateToolGroupHeader(_groupEl) {}
+    function updateToolGroupHeader(groupEl) {
+        if (!groupEl) return;
+        const summaryEl = groupEl.querySelector(".tool-summary");
+        const count = Number(groupEl.dataset.count || "1");
+        if (summaryEl) {
+            const base = (summaryEl.textContent || "").replace(/\s*\(\d+\s*runs?\)\s*$/i, "").trim();
+            summaryEl.textContent = count > 1 ? `${base} (${count} runs)` : base;
+        }
+    }
     function maybeAutoFollow(groupEl, runEl) {
         if (!groupEl || groupEl.dataset.toolName !== "Bash") return;
         if (groupEl.dataset.follow !== "1") return;
@@ -2030,6 +2191,14 @@
                     ? `<span class="tool-status tool-status-running" title="Running"><span class="tool-spinner"></span></span>`
                     : `<span class="tool-status tool-status-pending" title="Pending">${toolActionIcon("pending")}</span>`;
             }
+            if (name === "TodoWrite" && input?.todos && Array.isArray(input.todos)) {
+                const normalized = input.todos.map((t, i) => ({
+                    id: t.id != null ? t.id : String(i + 1),
+                    content: t.content || "",
+                    status: (t.status || "pending").toLowerCase()
+                }));
+                showAgentChecklist(normalized);
+            }
             /* Stop button lives in .tool-content-actions; no need to inject into options panel */
         } else {
             const desc = toolDesc(name, input);
@@ -2049,14 +2218,12 @@
                 ? `<span class="tool-status tool-status-running" title="Running"><span class="tool-spinner"></span></span>`
                 : `<span class="tool-status tool-status-pending" title="Pending">${toolActionIcon("pending")}</span>`;
 
+            const summaryText = headerDesc ? `${toolTitle(name)} ${headerDesc}` : toolTitle(name);
             group.innerHTML = `
                 <div class="tool-header ${isCmd ? "tool-header-cmd" : ""}">
                     <div class="tool-left">
                         <span class="tool-icon-wrap"><span class="tool-icon">${icon}</span></span>
-                        <div class="tool-meta">
-                            <div class="tool-title-row"><span class="tool-title">${escapeHtml(toolTitle(name))}</span></div>
-                            <span class="tool-desc ${isCmd ? "tool-desc-cmd" : ""}">${escapeHtml(headerDesc)}</span>${linkHtml}
-                        </div>
+                        <span class="tool-summary" title="${escapeHtml(headerDesc || toolTitle(name))}">${escapeHtml(summaryText)}</span>${linkHtml}
                     </div>
                     <div class="tool-right">
                         ${statusHtml}
@@ -2232,11 +2399,11 @@
         const stopBtn = group.querySelector(".tool-stop-btn");
         if (stopBtn && success !== undefined) stopBtn.remove();
         if (searchStats) {
-            const descEl = group.querySelector(".tool-desc");
-            if (descEl) {
+            const summaryEl = group.querySelector(".tool-summary");
+            if (summaryEl) {
                 const fileStr = searchStats.fileCount === 1 ? "1 file" : searchStats.fileCount + " files";
                 const searchStr = searchStats.matchCount === 1 ? "1 search" : searchStats.matchCount + " searches";
-                descEl.textContent = fileStr + " " + searchStr;
+                summaryEl.textContent = "Explored " + fileStr + " " + searchStr;
             }
         }
         if (state.name === "Write" || state.name === "Edit" || state.name === "symbol_edit") {
@@ -2526,77 +2693,50 @@
         scrollChat();
     }
 
-    // ── Plan step progress during build ────────────────────────
+    // ── Todos: only in bottom sticky dropdown (no in-chat checklist) ───
     function showAgentChecklist(todos, progress) {
         currentChecklistItems = Array.isArray(todos) ? [...todos] : [];
-        const bubble = getOrCreateBubble();
-        let block = document.getElementById("agent-checklist");
-        if (!block) {
-            block = document.createElement("div");
-            block.className = "agent-checklist-block";
-            block.id = "agent-checklist";
-            bubble.appendChild(block);
+        const block = document.getElementById("agent-checklist");
+        if (block) block.remove();
+        updateStickyTodoBar(progress);
+    }
+
+    function updateStickyTodoBar(progress) {
+        if (!$stickyTodoBar || !$stickyTodoCount || !$stickyTodoList) return;
+        const items = currentChecklistItems || [];
+        if (items.length === 0) {
+            $stickyTodoBar.classList.add("hidden");
+            $stickyTodoList.classList.add("hidden");
+            $stickyTodoBar.removeAttribute("data-expanded");
+            return;
         }
-        let title = "\u2713 Task checklist";
+        $stickyTodoBar.classList.remove("hidden");
+        let countText = "To-dos " + items.length;
         if (progress && progress.stepNum != null && progress.totalSteps != null) {
-            title += ` \u2014 Step ${progress.stepNum} of ${progress.totalSteps}`;
+            countText += ` — Step ${progress.stepNum}/${progress.totalSteps}`;
         }
-        let html = `<div class="agent-checklist-title">${title}</div><div class="agent-checklist-list">`;
-        if (currentChecklistItems.length > 0) {
-            currentChecklistItems.forEach((t) => {
-                const status = (t.status || "pending").toLowerCase();
-                const content = (t.content || "").trim() || "\u2014";
-                const statusCls = status === "completed" ? "done" : status === "in_progress" ? "active" : "pending";
-                const stepNum = t.id != null && /^\d+$/.test(String(t.id)) ? t.id : "";
-                const todoId = t.id != null ? String(t.id) : "";
-                let revertBtn = "";
-                if (status === "completed" && stepNum) {
-                    revertBtn = ` <button type="button" class="agent-checklist-revert" data-step="${escapeHtml(stepNum)}" title="Revert to after step ${stepNum}" aria-label="Revert to here">${toolActionIcon("revert")}</button>`;
-                }
-                const removeBtn = `<button type="button" class="agent-checklist-remove" data-todo-id="${escapeHtml(todoId)}" title="Remove task" aria-label="Remove">\u00D7</button>`;
-                html += `<div class="agent-checklist-item agent-checklist-${statusCls}"><span class="agent-checklist-status">${status === "completed" ? "\u2713" : status === "in_progress" ? "\u25B6" : "\u25CB"}</span><span class="agent-checklist-content">${escapeHtml(content)}</span>${revertBtn}${removeBtn}</div>`;
-            });
-        } else {
-            html += `<div class="agent-checklist-empty-hint">No tasks yet. Add one below or let the agent create the list.</div>`;
-        }
-        html += `</div>
-            <div class="agent-checklist-add-row">
-                <input type="text" class="agent-checklist-add-input" placeholder="Add a task..." maxlength="500" />
-                <button type="button" class="agent-checklist-add-btn" title="Add task" aria-label="Add task">${toolActionIcon("pen")}</button>
+        $stickyTodoCount.textContent = countText;
+        $stickyTodoList.innerHTML = items.map((t) => {
+            const status = (t.status || "pending").toLowerCase();
+            const content = (t.content || "").trim() || "\u2014";
+            const statusChar = status === "completed" ? "\u2713" : status === "in_progress" ? "\u25B6" : "\u25CB";
+            const cls = status === "completed" ? "done" : status === "in_progress" ? "active" : "";
+            const todoId = t.id != null ? String(t.id) : "";
+            return `<div class="sticky-todo-item ${cls}" data-todo-id="${escapeHtml(todoId)}">
+                <span class="sticky-todo-status">${statusChar}</span>
+                <span class="sticky-todo-content" title="${escapeHtml(content)}">${escapeHtml(content)}</span>
+                <button type="button" class="sticky-todo-remove" title="Remove" aria-label="Remove">\u00D7</button>
             </div>`;
-        block.innerHTML = html;
-        block.querySelectorAll(".agent-checklist-revert").forEach(btn => {
-            const step = parseInt(btn.getAttribute("data-step"), 10);
-            if (!isNaN(step) && step >= 1) {
-                btn.addEventListener("click", () => {
-                    if (confirm(`Revert all changes back to the end of step ${step}?`)) {
-                        send({ type: "revert_to_step", step });
-                    }
-                });
-            }
+        }).join("");
+        $stickyTodoList.classList.toggle("hidden", $stickyTodoBar.getAttribute("data-expanded") !== "true");
+        $stickyTodoList.querySelectorAll(".sticky-todo-remove").forEach((btn) => {
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const item = btn.closest(".sticky-todo-item");
+                const id = item && item.getAttribute("data-todo-id");
+                if (id != null) send({ type: "remove_todo", id });
+            });
         });
-        block.querySelectorAll(".agent-checklist-remove").forEach(btn => {
-            const id = btn.getAttribute("data-todo-id");
-            if (id != null) {
-                btn.addEventListener("click", (e) => {
-                    e.stopPropagation();
-                    send({ type: "remove_todo", id });
-                });
-            }
-        });
-        const addInput = block.querySelector(".agent-checklist-add-input");
-        const addBtn = block.querySelector(".agent-checklist-add-btn");
-        function submitAddTask() {
-            const content = (addInput && addInput.value || "").trim();
-            if (!content) return;
-            send({ type: "add_todo", content });
-            if (addInput) addInput.value = "";
-        }
-        if (addBtn) addBtn.addEventListener("click", submitAddTask);
-        if (addInput) {
-            addInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitAddTask(); } });
-        }
-        scrollChat();
     }
 
     function updatePlanStepProgress(stepNum, totalSteps) {
@@ -2804,13 +2944,22 @@
             ws = null;
         }
     }
-    function send(obj) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
+    function send(obj) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+        ws.send(JSON.stringify(obj));
+        return true;
+    }
 
     function handleEvent(evt) {
         switch (evt.type) {
             case "init": {
                 $modelName.textContent = evt.model_name || "?";
                 currentSessionId = evt.session_id || currentSessionId;
+                if (evt.session_id) {
+                    fileChangesThisSession.clear();
+                    sessionStartTime = sessionStartTime || Date.now();
+                    updateFileChangesDropdown();
+                }
                 if ($conversationTitle) $conversationTitle.textContent = evt.session_name || "New conversation";
                 if (evt.input_tokens !== undefined && evt.output_tokens !== undefined) {
                     const parts = [`In: ${formatTokens(evt.input_tokens)}`, `Out: ${formatTokens(evt.output_tokens)}`];
@@ -2874,8 +3023,18 @@
                     evt.data?.input || evt.data || {},
                     evt.data?.id || evt.data?.tool_use_id || null
                 );
-                // Track file modifications
-                if (evt.data?.name === "write_file" || evt.data?.name === "edit_file" || evt.data?.name === "symbol_edit") {
+                // Update todo UI immediately when agent sends TodoWrite (don't wait for todos_updated)
+                const toolName = evt.data?.name;
+                if (toolName === "TodoWrite" && evt.data?.input?.todos && Array.isArray(evt.data.input.todos)) {
+                    const normalized = evt.data.input.todos.map((t, i) => ({
+                        id: t.id != null ? t.id : String(i + 1),
+                        content: t.content || "",
+                        status: (t.status || "pending").toLowerCase()
+                    }));
+                    showAgentChecklist(normalized);
+                }
+                // Track file modifications (accept Write/Edit or write_file/edit_file)
+                if (toolName === "Write" || toolName === "write_file" || toolName === "Edit" || toolName === "edit_file" || toolName === "symbol_edit") {
                     const p = evt.data?.input?.path;
                     if (p) { markFileModified(p); reloadFileInEditor(p); }
                 }
@@ -2884,15 +3043,38 @@
                 {
                     const runEl = (evt.data?.tool_use_id && toolRunById.get(String(evt.data.tool_use_id))) || lastToolBlock;
                     addToolResult(evt.content || "", evt.data?.success !== false, runEl, evt.data);
+                    const todoList = evt.data?.todos ?? evt.data?.data?.todos;
+                    const isTodoWrite = evt.data?.tool_name === "TodoWrite" || (runEl && (runEl.dataset.toolName === "TodoWrite" || runEl.dataset.toolName === "todo_write"));
+                    if (isTodoWrite && Array.isArray(todoList)) {
+                        const list = todoList.map((t, i) => ({
+                            id: t.id != null ? t.id : String(i + 1),
+                            content: t.content || "",
+                            status: (String(t.status || "pending")).toLowerCase()
+                        }));
+                        showAgentChecklist(list);
+                    }
                 }
-                // Reload file if it was just written
+                // Reload file if it was just written and track changes (accept Write/Edit or write_file/edit_file)
                 {
                     const runEl = (evt.data?.tool_use_id && toolRunById.get(String(evt.data.tool_use_id))) || lastToolBlock;
                     if (runEl) {
                         const tn = runEl.dataset.toolName;
-                        if (tn === "write_file" || tn === "edit_file" || tn === "symbol_edit") {
+                        const isWrite = tn === "Write" || tn === "write_file";
+                        const isEdit = tn === "Edit" || tn === "edit_file" || tn === "symbol_edit";
+                        if (isWrite || isEdit) {
                             const path = runEl.dataset.path;
-                            if (path) reloadFileInEditor(path);
+                            if (path && evt.data?.success !== false) {
+                                reloadFileInEditor(path);
+                                if (isWrite) {
+                                    trackFileChange(path, 1, 0);
+                                } else {
+                                    const oldLines = (runEl.dataset.oldContent || "").split('\n').length;
+                                    const newLines = (runEl.dataset.newContent || "").split('\n').length;
+                                    const edits = Math.max(1, Math.abs(newLines - oldLines) || 1);
+                                    const deletions = oldLines > newLines ? oldLines - newLines : 0;
+                                    trackFileChange(path, edits, deletions);
+                                }
+                            }
                         }
                     }
                 }
@@ -2950,9 +3132,16 @@
                 );
                 setRunning(false);
                 break;
-            case "todos_updated":
-                showAgentChecklist(evt.todos || (evt.data && evt.data.todos) || []);
+            case "todos_updated": {
+                const list = evt.todos || (evt.data && evt.data.todos) || [];
+                const normalized = Array.isArray(list) ? list.map((t, i) => ({
+                    id: t.id != null ? t.id : String(i + 1),
+                    content: t.content || "",
+                    status: normalizeTodoStatus(t.status)
+                })) : [];
+                showAgentChecklist(normalized);
                 break;
+            }
             case "plan_step_progress":
                 updatePlanStepProgress(
                     evt.step || (evt.data && evt.data.step) || 1,
@@ -2963,6 +3152,7 @@
                 showDiffs(evt.files || []);
                 setRunning(false);
                 refreshTree();
+                updateModifiedFilesBar();
                 break;
             case "no_changes": showInfo("No file changes."); setRunning(false); break;
             case "no_plan": showInfo("Completed directly."); setRunning(false); break;
@@ -2971,6 +3161,9 @@
                 if (evt.data) updateTokenDisplay(evt.data);
                 break;
             case "kept":
+                hideActionBar();
+                clearAllDiffDecorations();
+                modifiedFiles.clear();
                 showInfo("\u2713 Changes kept.");
                 refreshTree();
                 fetchGitStatus().then(() => { if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); });
@@ -3027,6 +3220,11 @@
             case "reset_done":
                 $chatMessages.innerHTML = "";
                 currentSessionId = evt.session_id || currentSessionId;
+                sessionStartTime = null;
+                fileChangesThisSession.clear();
+                currentChecklistItems = [];
+                updateFileChangesDropdown();
+                updateStickyTodoBar();
                 if ($conversationTitle) $conversationTitle.textContent = evt.session_name || "New conversation";
                 $tokenCount.textContent = "0 tokens";
                 loadAgentSessions();
@@ -3073,6 +3271,14 @@
                 {
                     const runEl = (evt.data?.tool_use_id && toolRunById.get(String(evt.data.tool_use_id))) || lastToolBlock;
                     addToolResult(evt.content || "", evt.data?.success !== false, runEl, evt.data);
+                    if (runEl && evt.data?.success !== false) {
+                        const tn = runEl.dataset.toolName;
+                        const isWrite = tn === "Write" || tn === "write_file";
+                        const isEdit = tn === "Edit" || tn === "edit_file" || tn === "symbol_edit";
+                        if ((isWrite || isEdit) && runEl.dataset.path) {
+                            trackFileChange(runEl.dataset.path, isWrite ? 1 : 1, isWrite ? 0 : 0);
+                        }
+                    }
                     if (evt.data?.tool_use_id) toolRunById.delete(String(evt.data.tool_use_id));
                 }
                 lastToolBlock = null;
@@ -3132,10 +3338,16 @@
     // ================================================================
 
     async function submitTask() {
-        const text = $input.value.trim();
+        const text = ($input && $input.value) ? $input.value.trim() : "";
         const hasImages = pendingImages.length > 0;
         if ((!text && !hasImages) || isRunning) return;
         if (text.startsWith("/") && /^\/[a-zA-Z]/.test(text) && !hasImages) { handleCommand(text); $input.value = ""; autoResizeInput(); return; }
+
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            showInfo("Not connected. Waiting for connection…");
+            if (typeof showToast === "function") showToast("Not connected");
+            return;
+        }
 
         let imagesPayload = [];
         if (hasImages) {
@@ -3152,7 +3364,11 @@
         clearPendingImages();
         setRunning(true);
         addAssistantMessage();
-        send({ type: "task", content: text, images: imagesPayload });
+        const sent = send({ type: "task", content: text, images: imagesPayload });
+        if (!sent) {
+            setRunning(false);
+            showInfo("Send failed. Check connection.");
+        }
     }
 
     function handleCommand(text) {
@@ -3170,9 +3386,11 @@
         }
     }
 
-    function autoResizeInput() { $input.style.height = "auto"; $input.style.height = Math.min($input.scrollHeight, 150) + "px"; }
-    $input.addEventListener("input", autoResizeInput);
-    $input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitTask(); } });
+    function autoResizeInput() { if ($input) { $input.style.height = "auto"; $input.style.height = Math.min($input.scrollHeight, 150) + "px"; } }
+    if ($input) {
+        $input.addEventListener("input", autoResizeInput);
+        $input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitTask(); } });
+    }
     if ($attachImageBtn && $imageInput) {
         $attachImageBtn.addEventListener("click", () => $imageInput.click());
         $imageInput.addEventListener("change", (e) => {
@@ -3181,13 +3399,16 @@
             $imageInput.value = "";
         });
     }
-    $sendBtn.addEventListener("click", submitTask);
+    if ($sendBtn) $sendBtn.addEventListener("click", submitTask);
     $cancelBtn.addEventListener("click", () => send({type:"cancel"}));
-    $resetBtn.addEventListener("click", () => {
-        if (confirm("Clear this conversation and start a new one? This cannot be undone.")) {
-            send({ type: "reset" });
-        }
-    });
+    if ($resetBtn) {
+        $resetBtn.addEventListener("click", () => {
+            if ($chatMenuDropdown) $chatMenuDropdown.classList.add("hidden");
+            if (confirm("Clear this conversation and start a new one? This cannot be undone.")) {
+                send({ type: "reset" });
+            }
+        });
+    }
     if ($newAgentBtn) {
         $newAgentBtn.addEventListener("click", createNewAgentSession);
     }

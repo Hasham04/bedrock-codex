@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Bedrock Codex</title>
-    <link rel="stylesheet" href="/static/style.css?v=8">
+    <link rel="stylesheet" href="/static/style.css?v=11">
     <!-- Markdown rendering -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <!-- Syntax highlighting for chat code blocks -->
@@ -269,18 +269,31 @@
             <!-- Resize handle: editor | chat -->
             <div class="resize-handle" id="resize-right" title="Drag to resize"></div>
 
-            <!-- Right: Agent Chat -->
+            <!-- Right: Agent Chat (Cursor-style) -->
             <aside id="chat-panel">
-                <div class="panel-header">
-                    <span class="panel-title">Agent</span>
-                    <div class="agent-header-controls">
-                        <select id="agent-select" title="Switch agent session"></select>
-                        <button id="new-agent-btn" class="chat-header-icon-btn" title="New conversation" aria-label="New conversation">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
-                        </button>
-                        <button id="reset-btn" class="chat-header-icon-btn" title="Reset current session (clear and start fresh)" aria-label="Reset current session">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
-                        </button>
+                <div class="chat-panel-header">
+                    <div class="chat-panel-header-top">
+                        <span id="conversation-title" class="chat-session-title" title="Conversation title">New conversation</span>
+                        <div class="agent-header-controls">
+                            <select id="agent-select" title="Switch agent session"></select>
+                            <button id="new-agent-btn" class="chat-header-icon-btn" title="New conversation" aria-label="New conversation">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+                            </button>
+                            <div class="chat-menu-wrap">
+                                <button id="chat-menu-btn" class="chat-header-icon-btn" title="More options" aria-label="More options">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1.5"/><circle cx="6" cy="12" r="1.5"/><circle cx="18" cy="12" r="1.5"/></svg>
+                                </button>
+                                <div id="chat-menu-dropdown" class="chat-menu-dropdown hidden">
+                                    <button type="button" id="reset-btn" class="chat-menu-item">Reset session</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="chat-session-stats" class="chat-session-stats hidden">
+                        <span id="chat-session-time" class="chat-stat-time"></span>
+                        <span id="chat-session-totals" class="chat-stat-totals"><span class="add">+0</span> <span class="del">−0</span></span>
+                        <span class="chat-stat-sep">·</span>
+                        <span id="chat-session-mode" class="chat-stat-mode">Auto</span>
                     </div>
                 </div>
 
@@ -289,6 +302,34 @@
                 <!-- Action bar (plan/build/keep/revert) -->
                 <div id="action-bar" class="hidden">
                     <div id="action-buttons"></div>
+                </div>
+
+                <!-- Sticky todo bar: todos only here (dropdown above input) -->
+                <div id="sticky-todo-bar" class="sticky-todo-bar hidden">
+                    <button type="button" id="sticky-todo-toggle" class="sticky-todo-toggle" aria-expanded="false">
+                        <span class="sticky-todo-chevron">&#x25BC;</span>
+                        <span id="sticky-todo-count" class="sticky-todo-count">To-dos 0</span>
+                    </button>
+                    <div id="sticky-todo-list" class="sticky-todo-list hidden"></div>
+                    <div class="sticky-todo-add-row">
+                        <input type="text" id="sticky-todo-add-input" class="sticky-todo-add-input" placeholder="Add a task..." maxlength="500" />
+                        <button type="button" id="sticky-todo-add-btn" class="sticky-todo-add-btn" title="Add task" aria-label="Add task">+</button>
+                    </div>
+                </div>
+
+                <!-- Session stats + file edits dropup + Review on one line -->
+                <div id="chat-composer-stats" class="chat-composer-stats hidden">
+                    <div id="chat-composer-files-dropup" class="chat-composer-files-dropup hidden" aria-hidden="true"></div>
+                    <div class="chat-composer-stats-row">
+                        <button type="button" id="chat-composer-stats-toggle" class="chat-composer-stats-line" aria-expanded="false" title="Click to show edits per file">
+                            <span id="chat-composer-time" class="chat-stat-time"></span>
+                            <span id="chat-composer-totals" class="chat-stat-totals"><span class="add">+0</span> <span class="del">−0</span></span>
+                            <span class="chat-stat-sep">·</span>
+                            <span id="chat-composer-files" class="chat-stat-files">0 files</span>
+                            <span class="chat-composer-chevron" aria-hidden="true">&#x25B2;</span>
+                        </button>
+                        <button type="button" id="chat-composer-review-btn" class="chat-composer-review-btn" title="Review changed files">Review</button>
+                    </div>
                 </div>
 
                 <!-- Input -->
@@ -301,8 +342,8 @@
                             </svg>
                         </button>
                         <input id="image-input" type="file" accept="image/*" multiple class="hidden">
-                        <textarea id="user-input" placeholder="Describe a task... (Enter to send)" rows="1"></textarea>
-                        <button id="send-btn" title="Send (Enter)">
+                        <textarea id="user-input" placeholder="Ask anything... (Enter to send)" rows="1"></textarea>
+                        <button type="button" id="send-btn" title="Send (Enter)">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/>
                             </svg>

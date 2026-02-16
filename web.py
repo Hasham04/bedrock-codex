@@ -1772,8 +1772,8 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             "awaiting_keep_revert": awaiting_keep_revert,
         }
         todos = getattr(agent, "_todos", None) or []
-        if todos:
-            state_msg["todos"] = todos
+        # Always send todos (even if empty) to properly restore checklist state
+        state_msg["todos"] = todos
         if awaiting_build and pending_plan:
             state_msg["pending_plan"] = pending_plan
             state_msg["plan_step_index"] = agent._plan_step_index
@@ -1822,6 +1822,10 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             msg["content"] = event.content
         if event.data:
             msg["data"] = event.data
+
+        # So frontend can use evt.todos without digging into evt.data
+        if event.type == "todos_updated" and event.data and "todos" in event.data:
+            msg["todos"] = event.data["todos"]
 
         # Special handling for plan phase
         if event.type == "phase_plan":
@@ -1918,6 +1922,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
     # Message loop
     # ------------------------------------------------------------------
 
+    _watcher_task = None
     try:
         # Send initial info
         mcfg = get_model_config(model_config.model_id)
@@ -2058,6 +2063,13 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     elapsed = round(time.time() - task_start, 1)
                     await ws.send_json({"type": "phase_end", "content": "direct", "elapsed": elapsed})
                     await ws.send_json({"type": "done"})
+
+                    # Show diff and Keep/Revert bar if direct run modified files
+                    if agent.modified_files:
+                        awaiting_keep_revert = True
+                        diffs = generate_diffs()
+                        if diffs:
+                            await ws.send_json({"type": "diff", "files": diffs})
             except asyncio.CancelledError:
                 return
             except Exception as exc:
@@ -2111,8 +2123,6 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
         # ── Background file watcher ────────────────────────────
         _file_mtimes: Dict[str, float] = {}
-        _watcher_task = None
-
         async def _file_watcher():
             """Lightweight polling watcher that detects external file changes."""
             POLL_INTERVAL = 3  # seconds

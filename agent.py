@@ -27,12 +27,14 @@ SCOUT_TOOL_NAMES = ", ".join(t["name"] for t in SCOUT_TOOL_DEFINITIONS)
 # Display names for scout-phase progress
 SCOUT_TOOL_DISPLAY_NAMES = {
     "list_directory": "Directory",
-    "search": "Search", 
+    "search": "Search",
     "find_symbol": "Symbols",
     "semantic_retrieve": "Code search",
     "WebFetch": "Fetch",
     "WebSearch": "Search web",
     "lint_file": "Lint",
+    "TodoWrite": "Planning",
+    "TodoRead": "Read todos",
 }
 
 from config import (
@@ -223,7 +225,7 @@ Stop reading when you can write a precise, actionable plan. Don't read "just one
 </thinking_during_planning>
 
 <plan_format>
-# Plan: {{concise title}}
+# Plan: [concise title]
 
 ## Problem
 Current state vs desired state. What we're solving and why.
@@ -571,7 +573,7 @@ def classify_intent(task: str, service=None) -> Dict[str, Any]:
         )
         resp = service.generate_response(
             messages=[{"role": "user", "content": stripped}],
-            system_prompt=_CLASSIFY_SYSTEM,
+            system_prompt=CLASSIFY_SYSTEM,
             model_id=app_config.scout_model,
             config=config,
         )
@@ -2176,23 +2178,89 @@ class CodingAgent:
         return False
 
     async def _attempt_import_fix(self, abs_path: str, failure: str, on_event: Callable[[AgentEvent], Awaitable[None]]) -> bool:
-        """Attempt to fix common import errors"""
+        """Attempt to fix common import errors by adding missing stdlib/same-dir imports."""
+        if not abs_path.endswith(".py"):
+            return False
         try:
-            # This is a placeholder for more sophisticated import fixing
-            # In a real implementation, this could:
-            # - Analyze available modules and suggest corrections
-            # - Add missing imports based on usage
-            # - Fix relative/absolute import issues
-            
+            rel_path = os.path.relpath(abs_path, self.working_directory)
+            content = self.backend.read_file(rel_path)
+            if not content:
+                return False
+            tree = ast.parse(content)
+            defined: set = set()
+            used: set = set()
+
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    for alias in (node.names if hasattr(node, "names") else []):
+                        name = alias.asname or alias.name
+                        defined.add(name.split(".", 1)[0])
+                elif isinstance(node, ast.FunctionDef):
+                    defined.add(node.name)
+                    for a in node.args.args:
+                        defined.add(a.arg)
+                elif isinstance(node, ast.ClassDef):
+                    defined.add(node.name)
+                elif isinstance(node, ast.Name):
+                    if isinstance(node.ctx, ast.Load):
+                        used.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    if isinstance(node.ctx, ast.Load) and isinstance(node.value, ast.Name):
+                        used.add(node.value.id)
+
+            missing = used - defined - {"__name__", "__file__", "self", "True", "False", "None"}
+            if not missing:
+                return False
+
+            # Common stdlib and third-party modules we can safely add
+            stdlib_known = {
+                "os", "re", "sys", "json", "time", "pathlib", "logging", "asyncio",
+                "dataclasses", "typing", "collections", "functools", "itertools",
+                "subprocess", "shutil", "tempfile", "io", "codecs", "hashlib",
+                "uuid", "random", "math", "decimal", "datetime", "argparse",
+            }
+            to_add = [n for n in sorted(missing) if n in stdlib_known][:5]
+            if not to_add:
+                await on_event(AgentEvent(
+                    type="import_analysis",
+                    content=f"🔍 **Import Analysis**: {os.path.relpath(abs_path, self.working_directory)} - Could not auto-add imports for {list(missing)[:5]}",
+                    data={"file": abs_path, "failure": failure, "missing": list(missing)[:10]},
+                ))
+                return False
+
+            lines = content.split("\n")
+            insert_idx = 0
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith(("import ", "from ")) or (stripped and not stripped.startswith("#")):
+                    insert_idx = i
+                    if stripped.startswith(("import ", "from ")):
+                        while insert_idx + 1 < len(lines) and lines[insert_idx + 1].strip().startswith(("import ", "from ")):
+                            insert_idx += 1
+                        insert_idx += 1
+                    break
+
+            new_imports = "\n".join(f"import {m}" for m in to_add)
+            new_content = "\n".join(lines[:insert_idx]) + "\n" + new_imports + "\n" + "\n".join(lines[insert_idx:])
+            try:
+                ast.parse(new_content)
+            except SyntaxError:
+                return False
+
+            self.backend.write_file(rel_path, new_content)
+            await on_event(AgentEvent(
+                type="import_analysis",
+                content=f"🔧 **Auto-added imports**: {os.path.relpath(abs_path, self.working_directory)} - added {', '.join(to_add)}",
+                data={"file": abs_path, "added": to_add},
+            ))
+            return True
+        except Exception as e:
+            logger.debug(f"Import fix failed for {abs_path}: {e}")
             await on_event(AgentEvent(
                 type="import_analysis",
                 content=f"🔍 **Import Analysis**: {os.path.relpath(abs_path, self.working_directory)} - Manual review recommended",
-                data={"file": abs_path, "failure": failure}
+                data={"file": abs_path, "failure": failure},
             ))
-            return False  # Placeholder - no automatic fixes yet
-            
-        except Exception as e:
-            logger.debug(f"Import fix failed for {abs_path}: {e}")
             return False
 
     async def _provide_test_failure_guidance(self, test_failures: List[str], on_event: Callable[[AgentEvent], Awaitable[None]]):
@@ -2435,12 +2503,13 @@ class CodingAgent:
         Tier 1 is usually sufficient. Tiers 2-3 are safety nets.
         """
         context_window = get_context_window(self.service.model_id)
-        # Reserve output headroom so the model always has room to respond (never "ran out of tokens")
-        reserved_output = min(64_000, get_max_output_tokens(self.service.model_id) // 2)
+        # Reserve generous output headroom so the model NEVER runs out of space (Cursor/Claude-style)
+        reserved_output = min(80_000, get_max_output_tokens(self.service.model_id) // 2)
         usable = max(1, context_window - reserved_output)
-        tier1_limit = int(usable * 0.52)
-        tier2_limit = int(usable * 0.70)
-        tier3_limit = int(usable * 0.85)
+        # More aggressive thresholds - start trimming much earlier to NEVER hit walls
+        tier1_limit = int(usable * 0.40)  # Start trimming at 40% (was 52%)
+        tier2_limit = int(usable * 0.55)  # Aggressive at 55% (was 70%)
+        tier3_limit = int(usable * 0.70)  # Emergency at 70% (was 85%)
 
         current = self._current_token_estimate()
         if current <= tier1_limit:
@@ -2849,7 +2918,7 @@ class CodingAgent:
                 # Execute scout tools in parallel (all safe/read-only)
                 async def _exec_scout_tool(tu) -> tuple:
                     r = await loop.run_in_executor(
-                        None, lambda: execute_tool(tu.name, tu.input, self.working_directory, backend=self.backend)
+                        None, lambda: execute_tool(tu.name, tu.input, self.working_directory, backend=self.backend, extra_context={"todos": self._todos})
                     )
                     return tu, r
 
@@ -2872,7 +2941,12 @@ class CodingAgent:
                     })
 
                     display_name = SCOUT_TOOL_DISPLAY_NAMES.get(tu.name, tu.name)
-                    detail = tu.input.get("path") or tu.input.get("pattern") or tu.input.get("query") or "?"
+                    inp = tu.input or {}
+                    if "todos" in inp and isinstance(inp["todos"], list):
+                        n = len(inp["todos"])
+                        detail = f"{n} item{'s' if n != 1 else ''}"
+                    else:
+                        detail = inp.get("path") or inp.get("pattern") or inp.get("query") or inp.get("symbol") or "?"
                     await on_event(AgentEvent(
                         type="scout_progress",
                         content=f"{display_name}: {detail}",
@@ -3194,7 +3268,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                 # Execute read-only tools in parallel
                 async def _exec_plan_tool(tu):
                     r = await loop.run_in_executor(
-                        None, lambda tu=tu: execute_tool(tu["name"], tu["input"], self.working_directory, backend=self.backend)
+                        None, lambda tu=tu: execute_tool(tu["name"], tu["input"], self.working_directory, backend=self.backend, extra_context={"todos": self._todos})
                     )
                     return tu, r
 
@@ -3926,6 +4000,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                     {"path": rp},
                     self.working_directory,
                     backend=self.backend,
+                    extra_context={"todos": self._todos},
                 ),
             )
             
@@ -3948,6 +4023,64 @@ Keep the whole response under 300 words. If the request is already very clear an
                 }
             ))
         
+        stage_result["success"] = len(stage_result["failures"]) == 0
+        return stage_result
+
+    async def _run_semantic_validation_stage(
+        self,
+        modified_abs: List[str],
+        on_event: Callable[[AgentEvent], Awaitable[None]],
+    ) -> Dict[str, Any]:
+        """Stage 2: Semantic validation - security patterns and code-quality checks."""
+        stage_result = {
+            "success": True,
+            "failures": [],
+            "warnings": [],
+            "files_checked": len(modified_abs),
+        }
+        await on_event(AgentEvent(
+            type="verification_stage",
+            content="🔎 **STAGE 2: Semantic Validation** - Checking logic and security patterns...",
+            data={"stage": "semantic", "total_files": len(modified_abs)},
+        ))
+        loop = asyncio.get_event_loop()
+        py_files = [p for p in modified_abs if str(p).lower().endswith(".py")]
+        for abs_path in py_files:
+            rel_path = os.path.relpath(abs_path, self.working_directory)
+            try:
+                content = self.backend.read_file(rel_path)
+            except Exception:
+                continue
+            # Pattern-based security / quality checks (no extra deps)
+            patterns = [
+                (r"\beval\s*\(", "eval() use - security risk"),
+                (r"\bexec\s*\(", "exec() use - security risk"),
+                (r"subprocess\.(call|run|Popen)\s*\([^)]*shell\s*=\s*True", "subprocess with shell=True - prefer list args"),
+                (r"os\.system\s*\(", "os.system() - prefer subprocess with list args"),
+                (r"pickle\.loads?\s*\(", "pickle.loads - avoid unpickling untrusted data"),
+                (r"__import__\s*\(", "__import__() - prefer import statement"),
+            ]
+            for pat, msg in patterns:
+                if re.search(pat, content):
+                    stage_result["warnings"].append(f"{rel_path}: {msg}")
+            # Optional: run bandit if available
+            try:
+                bandit_result = await loop.run_in_executor(
+                    None,
+                    lambda rp=rel_path: execute_tool(
+                        "Bash",
+                        {"command": f"bandit -q -ll {shlex.quote(rp)} 2>/dev/null || true"},
+                        self.working_directory,
+                        backend=self.backend,
+                        extra_context={"todos": self._todos},
+                    ),
+                )
+                if not bandit_result.success or (bandit_result.output and "Issue" in bandit_result.output):
+                    out = (bandit_result.output or "")[:500]
+                    if out:
+                        stage_result["warnings"].append(f"{rel_path}: bandit findings - {out.strip()[:200]}")
+            except Exception:
+                pass
         stage_result["success"] = len(stage_result["failures"]) == 0
         return stage_result
 
@@ -3985,6 +4118,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                             {"command": c},
                             self.working_directory,
                             backend=self.backend,
+                            extra_context={"todos": self._todos},
                         ),
                     )
                     
@@ -4021,6 +4155,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                             {"command": test_cmd},
                             self.working_directory,
                             backend=self.backend,
+                            extra_context={"todos": self._todos},
                         ),
                     )
                     
@@ -4066,35 +4201,46 @@ Keep the whole response under 300 words. If the request is already very clear an
             data={"stage": "quality", "total_files": len(modified_abs)}
         ))
         
-        # Basic quality checks that can be implemented immediately
+        # Quality checks: complexity, duplication, code smells
         for abs_path in modified_abs:
             if abs_path.endswith('.py'):
                 rel_path = os.path.relpath(abs_path, self.working_directory)
                 try:
-                    with open(abs_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        
-                    # Simple complexity indicators
-                    line_count = len(content.split('\n'))
+                    content = self.backend.read_file(rel_path)
+                    if not content:
+                        continue
+                    lines = content.split('\n')
+                    line_count = len(lines)
                     if line_count > 500:
                         stage_result["quality_warnings"].append(f"{rel_path}: Large file ({line_count} lines)")
-                    
-                    # Check for code smells
+
+                    # Cyclomatic complexity approximation: count decision points
+                    complexity = 0
+                    for line in lines:
+                        stripped = line.strip()
+                        if stripped.startswith(('#', '"', "'")):
+                            continue
+                        complexity += stripped.count(' and ') + stripped.count(' or ')
+                        complexity += sum(1 for k in ('if ', 'elif ', 'for ', 'while ', 'except:', 'except ', 'with ') if k in stripped)
+                    if complexity > 50:
+                        stage_result["quality_warnings"].append(f"{rel_path}: High complexity (~{complexity} decision points)")
+
+                    # Simple duplicate-line detection (normalize whitespace, ignore empty)
+                    seen: Dict[str, int] = {}
+                    for ln in lines:
+                        n = ln.strip()
+                        if len(n) > 15 and not n.startswith('#'):
+                            seen[n] = seen.get(n, 0) + 1
+                    dupes = [k for k, v in seen.items() if v > 3]
+                    if len(dupes) > 5:
+                        stage_result["quality_warnings"].append(f"{rel_path}: Many repeated lines (possible duplication)")
+
                     if content.count('except:') > 0:
                         stage_result["quality_warnings"].append(f"{rel_path}: Bare except clauses detected")
-                    
                     if content.count('# TODO') + content.count('# FIXME') > 5:
                         stage_result["quality_warnings"].append(f"{rel_path}: Many TODOs/FIXMEs")
-                        
                 except Exception as e:
                     logger.debug(f"Quality assessment failed for {rel_path}: {e}")
-        
-        # Future: Add more sophisticated quality metrics
-        # - Cyclomatic complexity analysis
-        # - Code duplication detection  
-        # - Maintainability index calculation
-        # - Test coverage impact assessment
-        
         return stage_result
 
     def _calculate_verification_confidence(self, verification_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -4238,6 +4384,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                     {"path": rp},
                     self.working_directory,
                     backend=self.backend,
+                    extra_context={"todos": self._todos},
                 ),
             )
             lint_text = lint_result.output if lint_result.success else (lint_result.error or lint_result.output or "Unknown lint error")
@@ -4267,6 +4414,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                         {"command": cmd, "timeout": 180},
                         self.working_directory,
                         backend=self.backend,
+                        extra_context={"todos": self._todos},
                     ),
                 )
                 test_text = test_result.output if test_result.success else (test_result.error or test_result.output or "Unknown test failure")
@@ -4293,6 +4441,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                         {"command": full_cmd, "timeout": 300},
                         self.working_directory,
                         backend=self.backend,
+                        extra_context={"todos": self._todos},
                     ),
                 )
                 full_text = full_result.output if full_result.success else (full_result.error or full_result.output or "Unknown test failure")
@@ -4320,6 +4469,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                         {"command": c, "timeout": 240},
                         self.working_directory,
                         backend=self.backend,
+                        extra_context={"todos": self._todos},
                     ),
                 )
                 out = run_result.output if run_result.success else (run_result.error or run_result.output or "Verification command failed")
@@ -4864,7 +5014,7 @@ Keep the whole response under 300 words. If the request is already very clear an
             await on_event(AgentEvent(
                 type="tool_result",
                 content=content,
-                data={"tool_name": "TodoWrite", "tool_use_id": tu["id"], "success": True},
+                data={"tool_name": "TodoWrite", "tool_use_id": tu["id"], "success": True, "todos": list(self._todos)},
             ))
             await on_event(AgentEvent(type="todos_updated", content="", data={"todos": list(self._todos)}))
 
@@ -4968,7 +5118,7 @@ Keep the whole response under 300 words. If the request is already very clear an
 
             if not app_config.live_command_streaming:
                 return await loop.run_in_executor(
-                    None, lambda: execute_tool("Bash", tool_input, self.working_directory, backend=self.backend)
+                    None, lambda: execute_tool("Bash", tool_input, self.working_directory, backend=self.backend, extra_context={"todos": self._todos})
                 )
 
             partial_sent = {"value": False}
@@ -5076,7 +5226,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                             return tu, ToolResult(success=True, output=cached_content)
 
                 result = await loop.run_in_executor(
-                    None, lambda _tu=tu: execute_tool(_tu["name"], _tu["input"], self.working_directory, backend=self.backend)
+                    None, lambda _tu=tu: execute_tool(_tu["name"], _tu["input"], self.working_directory, backend=self.backend, extra_context={"todos": self._todos})
                 )
 
                 # Cache successful full-file reads
@@ -5208,7 +5358,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                     results = []
                     for tu in calls:
                         result = await loop.run_in_executor(
-                            None, lambda _tu=tu: execute_tool(_tu["name"], _tu["input"], self.working_directory, backend=self.backend)
+                            None, lambda _tu=tu: execute_tool(_tu["name"], _tu["input"], self.working_directory, backend=self.backend, extra_context={"todos": self._todos})
                         )
 
                         # ── Auto-retry on edit failure ──
@@ -5223,6 +5373,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                                         None, lambda: execute_tool(
                                             "Read", {"path": path},
                                             self.working_directory, backend=self.backend,
+                                            extra_context={"todos": self._todos},
                                         )
                                     )
                                     if fresh.success:
@@ -5251,6 +5402,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                                     None, lambda: execute_tool(
                                         "lint_file", {"path": path},
                                         self.working_directory, backend=self.backend,
+                                        extra_context={"todos": self._todos},
                                     )
                                 )
                                 if lint_result.success and lint_result.output:
@@ -5429,7 +5581,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                     result = await _run_command_with_streaming(tool_id, tool_input)
                 else:
                     result = await loop.run_in_executor(
-                        None, lambda: execute_tool(tool_name, tool_input, self.working_directory, backend=self.backend)
+                        None, lambda: execute_tool(tool_name, tool_input, self.working_directory, backend=self.backend, extra_context={"todos": self._todos})
                     )
                 cmd_duration = round(time.time() - cmd_start, 1)
 

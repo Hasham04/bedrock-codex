@@ -9,10 +9,19 @@ import json
 import logging
 import re
 import ast
+import contextvars
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 
 from backend import Backend, LocalBackend
+
+# Context for current session todos (set by agent before tool runs; used by TodoRead when called via execute_tool)
+_current_todos_ctx: contextvars.ContextVar[List[Dict[str, Any]]] = contextvars.ContextVar("current_todos", default=[])
+
+
+def set_current_todos(todos: List[Dict[str, Any]]) -> None:
+    """Set the current session todo list for TodoRead when called from execute_tool (e.g. agent context)."""
+    _current_todos_ctx.set(list(todos) if todos is not None else [])
 
 logger = logging.getLogger(__name__)
 
@@ -871,6 +880,47 @@ def web_fetch(url: str, timeout: Optional[int] = None, **kwargs: Any) -> ToolRes
 
 
 # --- WebSearch: optional duckduckgo-search ---
+def todo_write(todos: list, **kwargs: Any) -> ToolResult:
+    """Create or update the task checklist for this session. Use at the start of multi-step tasks: list items with status pending, then set in_progress when working on one and completed when done. Only one task should be in_progress at a time. Replaces the previous list each time. Keeps progress visible and ensures nothing is dropped."""
+    try:
+        # Validate todos structure
+        if not isinstance(todos, list):
+            return ToolResult(success=False, output="", error="todos must be a list")
+        
+        valid_statuses = {"pending", "in_progress", "completed", "cancelled"}
+        for i, todo in enumerate(todos):
+            if not isinstance(todo, dict):
+                return ToolResult(success=False, output="", error=f"todo[{i}] must be a dict")
+            if "content" not in todo or "status" not in todo:
+                return ToolResult(success=False, output="", error=f"todo[{i}] missing required fields: content, status")
+            if todo["status"] not in valid_statuses:
+                return ToolResult(success=False, output="", error=f"todo[{i}] invalid status: {todo['status']}")
+        
+        return ToolResult(
+            success=True,
+            output=f"Updated task checklist with {len(todos)} items",
+        )
+    except Exception as e:
+        return ToolResult(success=False, output="", error=f"todo_write failed: {str(e)}")
+
+def todo_read(
+    working_directory: str = ".",
+    backend: Optional[Backend] = None,
+    todos: Optional[List[Dict[str, Any]]] = None,
+    **kwargs: Any,
+) -> ToolResult:
+    """Get the current task checklist for this session. Uses agent/session context when available."""
+    try:
+        if todos is not None:
+            lst = todos
+        else:
+            lst = _current_todos_ctx.get()
+        if not lst:
+            return ToolResult(success=True, output="No active task checklist found.")
+        return ToolResult(success=True, output=json.dumps(lst, indent=2))
+    except Exception as e:
+        return ToolResult(success=False, output="", error=f"todo_read failed: {str(e)}")
+
 def web_search(query: str, max_results: int = 5, **kwargs: Any) -> ToolResult:
     """Search the web; uses duckduckgo_search if installed."""
     query = (query or "").strip()
@@ -926,10 +976,12 @@ TOOL_IMPLEMENTATIONS = {
     "semantic_retrieve": semantic_retrieve,
     "WebFetch": web_fetch,
     "WebSearch": web_search,
+    "TodoWrite": todo_write,
+    "TodoRead": todo_read,
 }
 
 TOOLS_REQUIRING_APPROVAL = {"Write", "Edit", "symbol_edit", "Bash"}
-SAFE_TOOLS = {"Read", "search", "find_symbol", "list_directory", "Glob", "lint_file", "semantic_retrieve", "WebFetch", "WebSearch"}
+SAFE_TOOLS = {"Read", "search", "find_symbol", "list_directory", "Glob", "lint_file", "semantic_retrieve", "WebFetch", "WebSearch", "TodoWrite", "TodoRead"}
 SCOUT_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     t for t in TOOL_DEFINITIONS if t["name"] in SAFE_TOOLS
 ]
@@ -952,15 +1004,24 @@ ASK_USER_QUESTION_DEFINITION: Dict[str, Any] = {
 }
 
 
-def execute_tool(name: str, inputs: Dict[str, Any], working_directory: str = ".",
-                 backend: Optional[Backend] = None) -> ToolResult:
-    """Execute a tool by name with the given inputs."""
+def execute_tool(
+    name: str,
+    inputs: Dict[str, Any],
+    working_directory: str = ".",
+    backend: Optional[Backend] = None,
+    *,
+    extra_context: Optional[Dict[str, Any]] = None,
+) -> ToolResult:
+    """Execute a tool by name with the given inputs. extra_context can provide e.g. todos for TodoRead."""
     name = TOOL_NAME_NORMALIZE.get(name, name)
     impl = TOOL_IMPLEMENTATIONS.get(name)
     if not impl:
         return ToolResult(success=False, output="", error=f"Unknown tool: {name}")
+    kwargs = dict(inputs, working_directory=working_directory, backend=backend)
+    if extra_context and name == "TodoRead" and "todos" in extra_context:
+        kwargs["todos"] = extra_context["todos"]
     try:
-        return impl(**inputs, working_directory=working_directory, backend=backend)
+        return impl(**kwargs)
     except TypeError as e:
         return ToolResult(success=False, output="", error=f"Invalid arguments for {name}: {e}")
     except Exception as e:
