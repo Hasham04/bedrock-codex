@@ -8,6 +8,7 @@ Open: http://localhost:8765
 
 import argparse
 import asyncio
+import atexit
 import base64
 import errno
 import difflib
@@ -56,6 +57,23 @@ app = FastAPI(title="Bedrock Codex")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.on_event("shutdown")
+async def _on_shutdown():
+    """Save all active sessions before the server exits (e.g. Ctrl+C).
+
+    Without this, a hard server kill loses any state that changed since the
+    last periodic auto-save (every 30s), including pending keep/revert bars,
+    plans awaiting approval, file snapshots, etc.
+    """
+    for sid, save_fn in list(_active_save_fns.items()):
+        try:
+            save_fn()
+            logger.info("Shutdown: saved session %s", sid)
+        except Exception as exc:
+            logger.error("Shutdown: failed to save session %s: %s", sid, exc)
+    _active_save_fns.clear()
+
+
 @app.middleware("http")
 async def no_cache_static(request, call_next):
     """Prevent browser caching of static assets during development."""
@@ -100,6 +118,55 @@ _ALLOWED_IMAGE_MEDIA_TYPES = {
     "image/webp",
     "image/gif",
 }
+
+
+# ============================================================
+# WebSocket reference wrapper (for reconnect-safe sends)
+# ============================================================
+
+class _WSRef:
+    """Mutable WebSocket reference that silently drops sends when disconnected.
+
+    All closures inside websocket_endpoint use ``wsr.send_json()`` instead of
+    ``ws.send_json()`` directly.  When the WebSocket disconnects we set
+    ``wsr.ws = None``; all in-flight sends become silent no-ops.  On reconnect
+    we assign the new WebSocket and sends resume transparently — no need to
+    recreate any closures or background tasks.
+    """
+    __slots__ = ("ws",)
+
+    def __init__(self, ws: Optional[WebSocket]):
+        self.ws: Optional[WebSocket] = ws
+
+    async def send_json(self, data: Dict[str, Any]) -> None:
+        _ws = self.ws
+        if _ws is None:
+            return
+        try:
+            await _ws.send_json(data)
+        except Exception:
+            self.ws = None          # mark disconnected on first failure
+
+
+# Sessions with a running agent waiting for client reconnect.
+# Maps session_id → {"future": asyncio.Future, "done_events": [asyncio.Event]}
+_reconnect_sessions: Dict[str, Dict[str, Any]] = {}
+
+# Global registry of active session save functions so the shutdown handler
+# can persist all sessions before the process exits (e.g. Ctrl+C).
+# Maps session_id → callable (the save_session closure from websocket_endpoint).
+_active_save_fns: Dict[str, Any] = {}
+
+
+def _atexit_save_all():
+    """Last-resort save: called when the Python interpreter is shutting down."""
+    for sid, save_fn in list(_active_save_fns.items()):
+        try:
+            save_fn()
+        except Exception:
+            pass
+
+atexit.register(_atexit_save_all)
 
 
 # ============================================================
@@ -1406,6 +1473,103 @@ async def write_file(request: Request):
 
 
 # ------------------------------------------------------------------
+# File operations: delete, rename, mkdir
+# ------------------------------------------------------------------
+
+def _validate_rel_path(p: str) -> Optional[str]:
+    """Normalise and validate a relative path. Returns cleaned path or None if invalid."""
+    p = (p or "").strip().replace("\\", "/")
+    if not p or ".." in p or p.startswith("/"):
+        return None
+    return p
+
+
+@app.post("/api/file/delete")
+async def delete_file(request: Request):
+    """Delete a file or directory (recursively). Works over SSH."""
+    body = await request.json()
+    rel_path = _validate_rel_path(body.get("path", ""))
+    if not rel_path:
+        return JSONResponse({"ok": False, "error": "Invalid path"}, status_code=400)
+    b = _backend or LocalBackend(os.path.abspath(_working_directory))
+    try:
+        is_dir = await asyncio.to_thread(b.is_dir, rel_path)
+        exists = is_dir or await asyncio.to_thread(b.file_exists, rel_path)
+        if not exists:
+            return JSONResponse({"ok": False, "error": "Path not found"}, status_code=404)
+        if is_dir:
+            import shlex
+            stdout, stderr, rc = await asyncio.to_thread(
+                b.run_command, f"rm -rf {shlex.quote(rel_path)}", cwd=".", timeout=30
+            )
+            if rc != 0:
+                return JSONResponse({"ok": False, "error": stderr or "rm failed"}, status_code=500)
+        else:
+            await asyncio.to_thread(b.remove_file, rel_path)
+        return {"ok": True, "path": rel_path}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/file/rename")
+async def rename_file(request: Request):
+    """Rename (move) a file or directory. Works over SSH."""
+    body = await request.json()
+    old_path = _validate_rel_path(body.get("old_path", ""))
+    new_path = _validate_rel_path(body.get("new_path", ""))
+    if not old_path or not new_path:
+        return JSONResponse({"ok": False, "error": "Invalid path"}, status_code=400)
+    b = _backend or LocalBackend(os.path.abspath(_working_directory))
+    try:
+        src_exists = await asyncio.to_thread(b.file_exists, old_path)
+        if not src_exists:
+            src_exists = await asyncio.to_thread(b.is_dir, old_path)
+        if not src_exists:
+            return JSONResponse({"ok": False, "error": "Source not found"}, status_code=404)
+        dst_exists = await asyncio.to_thread(b.file_exists, new_path)
+        if not dst_exists:
+            dst_exists = await asyncio.to_thread(b.is_dir, new_path)
+        if dst_exists:
+            return JSONResponse({"ok": False, "error": "Destination already exists"}, status_code=409)
+        import shlex, posixpath
+        parent = posixpath.dirname(new_path) if "/" in new_path else ""
+        if parent:
+            await asyncio.to_thread(
+                b.run_command, f"mkdir -p {shlex.quote(parent)}", cwd=".", timeout=15
+            )
+        stdout, stderr, rc = await asyncio.to_thread(
+            b.run_command,
+            f"mv {shlex.quote(old_path)} {shlex.quote(new_path)}",
+            cwd=".", timeout=15,
+        )
+        if rc != 0:
+            return JSONResponse({"ok": False, "error": stderr or "mv failed"}, status_code=500)
+        return {"ok": True, "old_path": old_path, "new_path": new_path}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/file/mkdir")
+async def mkdir_file(request: Request):
+    """Create a new directory (including intermediate parents). Works over SSH."""
+    body = await request.json()
+    rel_path = _validate_rel_path(body.get("path", ""))
+    if not rel_path:
+        return JSONResponse({"ok": False, "error": "Invalid path"}, status_code=400)
+    b = _backend or LocalBackend(os.path.abspath(_working_directory))
+    try:
+        import shlex
+        stdout, stderr, rc = await asyncio.to_thread(
+            b.run_command, f"mkdir -p {shlex.quote(rel_path)}", cwd=".", timeout=15
+        )
+        if rc != 0:
+            return JSONResponse({"ok": False, "error": stderr or "mkdir failed"}, status_code=500)
+        return {"ok": True, "path": rel_path}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+# ------------------------------------------------------------------
 # Git status and diff (for explorer badges and inline diffs)
 # ------------------------------------------------------------------
 
@@ -1793,7 +1957,13 @@ async def file_diff(path: str = Query(...)):
     if safe not in snapshots:
         return JSONResponse({"error": "File not modified by agent"}, status_code=404)
 
-    original = snapshots[safe] or ""
+    snap_val = snapshots[safe]
+    if snap_val is None or (isinstance(snap_val, dict) and snap_val.get("created")):
+        original = ""  # file was created by agent — no prior content
+    elif isinstance(snap_val, str):
+        original = snap_val
+    else:
+        original = ""
     b = _backend or LocalBackend(wd)
     try:
         current = await asyncio.to_thread(b.read_file, safe)
@@ -1896,6 +2066,32 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
     global _active_agent
     await ws.accept()
 
+    # ── Reconnect hand-off ──────────────────────────────────────
+    # If a previous handler is waiting for a reconnect on this session,
+    # hand the new WS over and keep *this* handler alive (so the WS
+    # stays open) until the old handler finishes using it.
+    _req_sid = (ws.query_params.get("session_id") or "").strip()
+    if not _req_sid and session_id:
+        _req_sid = str(session_id).strip()
+
+    if _req_sid and _req_sid in _reconnect_sessions:
+        entry = _reconnect_sessions[_req_sid]
+        done_event = asyncio.Event()
+        try:
+            entry["future"].set_result((ws, done_event))
+        except asyncio.InvalidStateError:
+            pass  # future already resolved (race)
+        else:
+            # Park this handler — the OLD handler now owns the WS.
+            try:
+                await done_event.wait()
+            except (asyncio.CancelledError, Exception):
+                pass
+            return
+
+    # ── Normal / fresh connection ───────────────────────────────
+    wsr = _WSRef(ws)
+
     is_ssh = _ssh_info is not None
     # For SSH projects, _working_directory is composite (user@host:port:dir)
     # For local, normalize to absolute path
@@ -1919,7 +2115,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         )
         _active_agent = agent
     except Exception as e:
-        await ws.send_json({"type": "error", "content": f"Init failed: {e}"})
+        await wsr.send_json({"type": "error", "content": f"Init failed: {e}"})
         await ws.close()
         return
 
@@ -1949,6 +2145,8 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         "pending_task",
         "pending_plan",
         "pending_images",
+        "current_thinking_text",
+        "current_text_buffer",
     }
     _restored_ui_state: Dict[str, Any] = {}
     if session is None:
@@ -1993,6 +2191,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 "pending_task": pending_task,
                 "pending_plan": pending_plan,
                 "pending_images": pending_images,
+                # In-progress stream buffers (survive server restart)
+                "current_thinking_text": _current_thinking_text,
+                "current_text_buffer": _current_text_buffer,
             }
             # Persist SSH connection info so it can be reused on reopen
             if _ssh_info:
@@ -2002,6 +2203,10 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 store.save(session)
             except Exception as exc:
                 logger.error(f"Session save failed: {exc}")
+
+    # Register this save function globally so shutdown handler can call it
+    if session and session.session_id:
+        _active_save_fns[session.session_id] = save_session
 
     # State machine — restore from session if reconnecting
     pending_task: Optional[str] = _restored_ui_state.get("pending_task")
@@ -2022,6 +2227,63 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
     # ------------------------------------------------------------------
     # History replay — rebuild chat from persisted history
     # ------------------------------------------------------------------
+
+    # Known internal XML tags injected by the agent or auto-context into user messages.
+    _INTERNAL_XML_TAGS = [
+        "codebase_context", "approved_plan", "plan_decomposition",
+        "manager_worker_insights", "project_context", "current_plan",
+        "updated_plan", "scout_context", "verification_context",
+        # Auto-context tags from build_auto_context()
+        "auto_context", "active_file", "selected_text", "modified_file",
+        "dependency_context", "git_diff", "project_structure",
+        "linter_errors", "open_files", "recent_files",
+    ]
+    _STRIP_XML_RE = re.compile(
+        r"<(" + "|".join(_INTERNAL_XML_TAGS) + r")>[\s\S]*?</\1>",
+        re.IGNORECASE,
+    )
+    _INSTRUCTION_SUFFIXES = [
+        "Execute this plan step by step.",
+        "State which step you are working on.",
+        "Work through them in order; set each to completed and the next to in_progress as you go.",
+    ]
+
+    def _strip_internal_replay_content(text: str) -> Optional[str]:
+        """Strip internal agent context from a user message for replay.
+        Returns the cleaned user-facing text, or None if the message
+        should be completely hidden."""
+        if not text or not text.strip():
+            return None
+        # Skip system-injected messages (any case)
+        if text.upper().startswith("[SYSTEM]"):
+            return None
+        # Skip compressed / trimmed markers
+        if "(earlier context compressed)" in text or "(earlier work trimmed)" in text:
+            return None
+        # Skip verification nudges
+        if text.startswith("Verification pass") or text.startswith("Quick check"):
+            return None
+        if text.startswith("You have completed all plan steps"):
+            return None
+        # If the user said "User's message: " (follow-up with plan context), extract it
+        if "<current_plan>" in text and "User's message: " in text:
+            return text.split("User's message: ", 1)[-1].strip() or None
+        # Strip all known internal XML blocks
+        cleaned = _STRIP_XML_RE.sub("", text).strip()
+        # Strip known instruction suffixes
+        for suffix in _INSTRUCTION_SUFFIXES:
+            cleaned = cleaned.replace(suffix, "").strip()
+        # Remove any remaining instructional block that starts with "Before touching files"
+        # or "For each step:" — these are agent instructions, not user text
+        for marker in [
+            "Before touching files, call TodoWrite",
+            "For each step:\n",
+            "If you discover something the plan missed",
+        ]:
+            idx = cleaned.find(marker)
+            if idx >= 0:
+                cleaned = cleaned[:idx].strip()
+        return cleaned if cleaned else None
 
     async def replay_history():
         """Walk through saved history and emit replay events so the
@@ -2069,102 +2331,43 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
             if role == "user":
                 if isinstance(content, str):
-                    # Skip system-injected messages
-                    if content.startswith("[System]"):
-                        continue
-                    # Skip compressed summaries
-                    if "(earlier context compressed)" in content or "(earlier work trimmed)" in content:
-                        continue
-                    # Skip verification pass messages
-                    if content.startswith("You have completed all plan steps"):
-                        continue
-                    # Skip codebase context wrappers — show only the user's task
-                    if "<codebase_context>" in content:
-                        # Extract the actual task after the context block
-                        parts = content.split("</codebase_context>")
-                        if len(parts) > 1:
-                            task_text = parts[-1].strip()
-                            if task_text:
-                                await ws.send_json({"type": "replay_user", "content": task_text})
-                        continue
-                    # Skip approved plan wrappers — show only the task
-                    if "<approved_plan>" in content:
-                        parts = content.split("</approved_plan>")
-                        if len(parts) > 1:
-                            task_text = parts[-1].strip()
-                            # Remove the "Execute this plan..." instruction suffix
-                            for suffix in ["Execute this plan step by step.", "State which step you are working on."]:
-                                task_text = task_text.replace(suffix, "").strip()
-                            if task_text:
-                                await ws.send_json({"type": "replay_user", "content": task_text})
-                        continue
-                    # Follow-up with current plan in context — show only the user's message
-                    if "<current_plan>" in content and "User's message: " in content:
-                        task_text = content.split("User's message: ", 1)[-1].strip()
-                        if task_text:
-                            await ws.send_json({"type": "replay_user", "content": task_text})
-                        continue
-                    await ws.send_json({"type": "replay_user", "content": content})
+                    cleaned = _strip_internal_replay_content(content)
+                    if cleaned:
+                        await wsr.send_json({"type": "replay_user", "content": cleaned})
                 elif isinstance(content, list):
-                    # Tool result blocks are handled via pairing below
                     image_count = 0
                     for block in content:
                         if block.get("type") == "text":
-                            text = block.get("text", "")
-                            # Skip system hints
-                            if text.startswith("[System]"):
-                                continue
-                            if "(earlier context compressed)" in text or "(earlier work trimmed)" in text:
-                                continue
-                            if text.startswith("You have completed all plan steps"):
-                                continue
-                            if "<project_context>" in text:
-                                parts = text.split("</project_context>")
-                                text = parts[-1].strip() if len(parts) > 1 else text
-                            if "<codebase_context>" in text:
-                                parts = text.split("</codebase_context>")
-                                text = parts[-1].strip() if len(parts) > 1 else text
-                            if "<approved_plan>" in text:
-                                parts = text.split("</approved_plan>")
-                                if len(parts) > 1:
-                                    text = parts[-1].strip()
-                                    for suffix in ["Execute this plan step by step.", "State which step you are working on."]:
-                                        text = text.replace(suffix, "").strip()
-                            if "<current_plan>" in text and "User's message: " in text:
-                                text = text.split("User's message: ", 1)[-1].strip()
-                            if text.strip():
-                                await ws.send_json({"type": "replay_user", "content": text})
+                            cleaned = _strip_internal_replay_content(block.get("text", ""))
+                            if cleaned:
+                                await wsr.send_json({"type": "replay_user", "content": cleaned})
                         elif block.get("type") == "image":
                             image_count += 1
                     if image_count > 0:
-                        await ws.send_json({
+                        await wsr.send_json({
                             "type": "replay_user",
                             "content": f"📷 {image_count} image attachment{'s' if image_count != 1 else ''}",
                         })
 
             elif role == "assistant":
                 if isinstance(content, str):
-                    # Strip <updated_plan> tags from displayed assistant text
-                    _display = re.sub(r"<updated_plan>[\s\S]*?</updated_plan>", "", content).strip()
+                    _display = _STRIP_XML_RE.sub("", content).strip()
                     if _display:
-                        await ws.send_json({"type": "replay_text", "content": _display})
+                        await wsr.send_json({"type": "replay_text", "content": _display})
                 elif isinstance(content, list):
                     for block in content:
                         btype = block.get("type", "")
                         if btype == "thinking":
                             thinking_text = block.get("thinking", "")
-                            # Skip compressed thinking placeholders
                             if thinking_text and thinking_text != "...":
-                                await ws.send_json({"type": "replay_thinking", "content": thinking_text})
+                                await wsr.send_json({"type": "replay_thinking", "content": thinking_text})
                         elif btype == "text":
-                            text = block.get("text", "")
-                            # Strip <updated_plan> tags from displayed assistant text
-                            text = re.sub(r"<updated_plan>[\s\S]*?</updated_plan>", "", text).strip()
+                            text = _STRIP_XML_RE.sub("", block.get("text", "")).strip()
                             if text:
-                                await ws.send_json({"type": "replay_text", "content": text})
+                                await wsr.send_json({"type": "replay_text", "content": text})
                         elif btype == "tool_use":
                             tool_id = block.get("id", "")
-                            await ws.send_json({
+                            await wsr.send_json({
                                 "type": "replay_tool_call",
                                 "data": {
                                     "name": block.get("name", ""),
@@ -2175,14 +2378,14 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                             # Immediately pair with its result if available
                             if tool_id in tool_results_map:
                                 tr = tool_results_map[tool_id]
-                                await ws.send_json({
+                                await wsr.send_json({
                                     "type": "replay_tool_result",
                                     "content": tr["content"],
                                     "data": {"tool_use_id": tool_id, "success": tr["success"]},
                                 })
                                 emitted_tool_results.add(tool_id)
 
-        await ws.send_json({"type": "replay_done"})
+        await wsr.send_json({"type": "replay_done"})
 
         # Send UI state so frontend can restore interactive elements
         # (plan buttons, keep/revert bar, etc.)
@@ -2225,7 +2428,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             if diffs:
                 state_msg["has_diffs"] = True
                 state_msg["diffs"] = diffs
-        await ws.send_json(state_msg)
+        await wsr.send_json(state_msg)
 
     # ------------------------------------------------------------------
     # Event bridge: AgentEvent → WebSocket JSON
@@ -2233,9 +2436,25 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
     async def on_event(event: AgentEvent):
         nonlocal awaiting_keep_revert, _last_save_time, _cancel_ack_sent
+        nonlocal _current_thinking_text, _current_text_buffer
         # Skip agent's own cancelled event if we already sent one from the cancel handler
         if event.type == "cancelled" and _cancel_ack_sent:
             return
+
+        # Track in-progress thinking/text so reconnects can resume blocks
+        if event.type == "thinking_start":
+            _current_thinking_text = ""
+        elif event.type == "thinking":
+            _current_thinking_text += (event.content or "")
+        elif event.type == "thinking_end":
+            _current_thinking_text = ""
+        elif event.type == "text_start":
+            _current_text_buffer = ""
+        elif event.type == "text":
+            _current_text_buffer += (event.content or "")
+        elif event.type in ("text_end", "done", "error", "cancelled"):
+            _current_text_buffer = ""
+
         msg: Dict[str, Any] = {"type": event.type}
 
         if event.content:
@@ -2261,15 +2480,17 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 "plan_text": plan_text,
             }
 
-        await ws.send_json(msg)
+        await wsr.send_json(msg)
 
-        # ── Periodic auto-save: save after tool results or every 30s ──
+        # ── Periodic auto-save: save after key events or every 5s during streaming ──
         now = time.time()
         should_save = False
-        if event.type == "tool_result":
-            should_save = True  # tool completions are natural save points
-        elif now - _last_save_time >= 30:
-            should_save = True  # time-based fallback
+        if event.type in ("tool_result", "thinking_end", "text_end", "done"):
+            should_save = True  # natural save points
+        elif event.type in ("thinking", "text") and now - _last_save_time >= 5:
+            should_save = True  # save mid-stream every 5s so kills lose minimal content
+        elif now - _last_save_time >= 10:
+            should_save = True  # general time-based fallback
         if should_save:
             _last_save_time = now
             try:
@@ -2316,7 +2537,10 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 except FileNotFoundError:
                     new_content = ""
             new_lines = new_content.splitlines(keepends=True)
-            old_lines = (original or "").splitlines(keepends=True)
+            # Resolve original content: dict means "created file", None means "new file"
+            is_created = original is None or (isinstance(original, dict) and original.get("created"))
+            old_text = "" if is_created else (original if isinstance(original, str) else "")
+            old_lines = old_text.splitlines(keepends=True)
 
             diff_lines = list(difflib.unified_diff(
                 old_lines, new_lines,
@@ -2326,7 +2550,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             additions = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++"))
             deletions = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---"))
 
-            label = "new file" if original is None else "modified"
+            label = "new file" if is_created else "modified"
 
             diffs.append({
                 "path": rel,
@@ -2344,15 +2568,264 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
     _watcher_task = None
     _save_interval_task: Optional[asyncio.Task] = None
+    _pending_question: Dict[str, Any] = {"future": None, "tool_use_id": None}
+    # Buffer in-progress thinking/text so they survive reconnects AND server restarts.
+    # Populated by streaming events; cleared when the block ends.
+    # Restored from session extra_state if the server was killed mid-stream.
+    _current_thinking_text: str = _restored_ui_state.get("current_thinking_text", "") or ""
+    _current_text_buffer: str = _restored_ui_state.get("current_text_buffer", "") or ""
 
     async def _periodic_save_loop():
-        """Save session every 30s so reconnects/kills don't lose conversation."""
+        """Save session every 10s so kills/crashes lose minimal state."""
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
             try:
                 await asyncio.to_thread(save_session)
             except Exception:
                 pass
+
+
+    async def _message_loop():
+        """Read and dispatch incoming WS messages. Extracted as a reusable
+        closure so it can be re-entered after a reconnect."""
+        nonlocal _cancel_ack_sent, _agent_task, awaiting_keep_revert
+        nonlocal awaiting_build, pending_task, pending_plan, pending_images
+        nonlocal session
+        while True:
+            raw = await ws.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                await wsr.send_json({"type": "error", "content": "Invalid JSON"})
+                continue
+
+            msg_type = data.get("type", "")
+
+            # ── User answer to clarifying question (plan phase) ───
+            if msg_type == "user_answer":
+                if _pending_question["future"] and data.get("tool_use_id") == _pending_question["tool_use_id"]:
+                    try:
+                        _pending_question["future"].set_result(data.get("answer", ""))
+                    except asyncio.InvalidStateError:
+                        pass
+                continue
+
+            # ── Cancel ─────────────────────────────────────────────
+            if msg_type == "cancel":
+                _cancel_ack_sent = True
+                agent.cancel()  # sets flag + kills running subprocess
+                if _agent_task and not _agent_task.done():
+                    # Give the agent task a moment to wind down gracefully
+                    try:
+                        await asyncio.wait_for(asyncio.shield(_agent_task), timeout=3.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                        _agent_task.cancel()
+                _agent_task = None
+                await wsr.send_json({"type": "cancelled"})
+                # Show keep/revert bar if the agent modified files before being stopped
+                if agent._file_snapshots:
+                    awaiting_keep_revert = True
+                    diffs = generate_diffs()
+                    if diffs:
+                        await wsr.send_json({"type": "diff", "files": diffs, "cumulative": True})
+                continue
+
+            # ── Keep / Revert ──────────────────────────────────────
+            if msg_type == "keep" and awaiting_keep_revert:
+                # Record which files were kept so the agent knows its changes were accepted
+                kept_paths = [os.path.relpath(p, wd) for p in agent.modified_files]
+                agent.clear_snapshots()
+                awaiting_keep_revert = False
+                feedback = "[System] The user accepted your changes."
+                if kept_paths:
+                    feedback += f" The following files were kept: {', '.join(kept_paths[:20])}"
+                    if len(kept_paths) > 20:
+                        feedback += f" (and {len(kept_paths) - 20} more)"
+                agent.history.append({"role": "user", "content": feedback})
+                save_session()
+                await wsr.send_json({"type": "kept"})
+                continue
+
+            if msg_type == "revert" and awaiting_keep_revert:
+                reverted = agent.revert_all()
+                reverted_rel = [os.path.relpath(p, wd) for p in reverted]
+                awaiting_keep_revert = False
+                feedback = "[System] The user reverted your changes. The following files were reverted to their previous state: "
+                feedback += ", ".join(reverted_rel[:20]) if reverted_rel else "(none)"
+                if len(reverted_rel) > 20:
+                    feedback += f" (and {len(reverted_rel) - 20} more)"
+                agent.history.append({"role": "user", "content": feedback})
+                save_session()
+                await wsr.send_json({
+                    "type": "reverted",
+                    "files": reverted_rel,
+                })
+                continue
+
+            # ── Revert to specific plan step ──────────────────────
+            if msg_type == "revert_to_step":
+                try:
+                    step = int(data.get("step", 0) or 0)
+                except (TypeError, ValueError):
+                    step = 0
+                if step < 1:
+                    await wsr.send_json({
+                        "type": "error",
+                        "content": "Invalid step for revert (must be at least 1).",
+                    })
+                    continue
+                had_checkpoint = step in getattr(agent, "_step_checkpoints", {})
+                reverted = agent.revert_to_step(step)
+                reverted_rel = [os.path.relpath(p, wd) for p in reverted]
+                feedback = f"[System] The user reverted to step {step}. The following files were reverted: "
+                feedback += ", ".join(reverted_rel[:20]) if reverted_rel else "(none)"
+                if len(reverted_rel) > 20:
+                    feedback += f" (and {len(reverted_rel) - 20} more)"
+                agent.history.append({"role": "user", "content": feedback})
+                save_session()
+                await wsr.send_json({
+                    "type": "reverted_to_step",
+                    "step": step,
+                    "files": reverted_rel,
+                    "no_checkpoint": not had_checkpoint and len(reverted_rel) == 0,
+                })
+                continue
+
+            # ── Add todo (user adds a task in real time; agent sees it on next TodoRead) ───
+            if msg_type == "add_todo":
+                content = (data.get("content") or "").strip()
+                if content:
+                    existing_ids = []
+                    for t in agent._todos:
+                        tid = t.get("id")
+                        if isinstance(tid, int):
+                            existing_ids.append(tid)
+                        elif isinstance(tid, str) and tid.isdigit():
+                            existing_ids.append(int(tid))
+                    next_id = str(max(existing_ids, default=0) + 1)
+                    agent._todos.append({"id": next_id, "content": content, "status": "pending"})
+                    save_session()
+                    await wsr.send_json({"type": "todos_updated", "todos": list(agent._todos)})
+                continue
+
+            # ── Remove todo (user removes a task; agent sees updated list on next TodoRead) ───
+            if msg_type == "remove_todo":
+                todo_id = data.get("id")
+                if todo_id is not None:
+                    before = len(agent._todos)
+                    agent._todos = [t for t in agent._todos if str(t.get("id")) != str(todo_id)]
+                    if len(agent._todos) != before:
+                        save_session()
+                    await wsr.send_json({"type": "todos_updated", "todos": list(agent._todos)})
+                continue
+
+            # ── Build (approve plan) ───────────────────────────────
+            if msg_type == "build" and awaiting_build:
+                awaiting_build = False
+                edited_steps = data.get("steps") or pending_plan or []
+                _cancel_ack_sent = False
+                _agent_task = asyncio.create_task(
+                    _run_build_bg(pending_task or "", edited_steps, pending_images or [])
+                )
+                continue
+
+            # ── Reject plan ────────────────────────────────────────
+            if msg_type == "reject_plan" and awaiting_build:
+                awaiting_build = False
+                pending_task = None
+                pending_plan = None
+                pending_images = []
+                await wsr.send_json({"type": "plan_rejected"})
+                continue
+
+            # ── Re-plan with feedback ──────────────────────────────
+            if msg_type == "replan" and awaiting_build:
+                feedback = data.get("content", "")
+                task = f"{pending_task}\n\nUser feedback: {feedback}" if pending_task else feedback
+                awaiting_build = False
+                pending_task = task
+                pending_plan = None
+
+                # Fall through to task handling below
+                msg_type = "task"
+                data["content"] = task
+                data["images"] = pending_images
+
+            # ── Reset ──────────────────────────────────────────────
+            if msg_type == "reset":
+                if _agent_task and not _agent_task.done():
+                    agent.cancel()
+                    _agent_task.cancel()
+                    _agent_task = None
+                agent.reset()
+                session = store.create_session(wd, model_config.model_id)
+                save_session()
+                await wsr.send_json({
+                    "type": "reset_done",
+                    "session_id": session.session_id,
+                    "session_name": session.name,
+                })
+                continue
+
+            # ── New task ───────────────────────────────────────────
+            if msg_type == "task":
+                task_text = data.get("content", "").strip()
+                try:
+                    task_images = _normalize_user_images(data.get("images") or [])
+                except ValueError as ve:
+                    await wsr.send_json({"type": "error", "content": f"Image upload error: {ve}"})
+                    continue
+
+                if not task_text and not task_images:
+                    continue
+                if not task_text and task_images:
+                    task_text = "Analyze the attached image(s) and help me with the request."
+
+                # Don't start a new task while one is running
+                if _agent_task and not _agent_task.done():
+                    await wsr.send_json({"type": "error", "content": "Agent is already running. Cancel first."})
+                    continue
+
+                # When user has uncommitted changes and sends a new task: preserve snapshots so
+                # diff/revert keep growing (cumulative). Don't clear the keep/revert UI.
+                preserve_snapshots = bool(awaiting_keep_revert and agent._file_snapshots)
+
+                # Name session from first task — use LLM for smart titles
+                if session and session.name == "default" and not agent.history:
+                    if task_text:
+                        # Set a quick placeholder immediately so UI isn't blank
+                        words = task_text.split()[:6]
+                        session.name = " ".join(words) + ("..." if len(task_text.split()) > 6 else "")
+                        # Fire-and-forget: generate a proper title in background
+                        _title_source = task_text
+
+                        async def _generate_session_title(source_text: str):
+                            try:
+                                loop = asyncio.get_event_loop()
+                                title = await loop.run_in_executor(
+                                    None, bedrock_service.generate_title, source_text
+                                )
+                                if title and session:
+                                    session.name = title
+                                    save_session()
+                                    try:
+                                        await wsr.send_json({
+                                            "type": "session_name_update",
+                                            "session_name": title,
+                                        })
+                                    except Exception:
+                                        pass  # WS may have closed
+                            except Exception as e:
+                                logger.debug(f"Background title generation failed: {e}")
+
+                        asyncio.create_task(_generate_session_title(_title_source))
+                    else:
+                        session.name = "Image prompt"
+
+                editor_context = data.get("context")
+                _cancel_ack_sent = False
+                _agent_task = asyncio.create_task(_run_task_bg(task_text, task_images, preserve_snapshots, editor_context=editor_context))
+                continue
 
     try:
         # Send initial info
@@ -2362,7 +2835,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             display_wd = f"{_ssh_info['user']}@{_ssh_info['host']}:{_ssh_info['directory']}"
         else:
             display_wd = wd
-        await ws.send_json({
+        await wsr.send_json({
             "type": "init",
             "model_name": get_model_name(model_config.model_id),
             "working_directory": display_wd,
@@ -2382,6 +2855,15 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         # Replay conversation history so frontend rebuilds the chat
         await replay_history()
 
+        # If the server was killed mid-stream, restore the in-progress
+        # thinking/text block so the user sees what was accumulated.
+        if _current_thinking_text:
+            await wsr.send_json({"type": "replay_thinking", "content": _current_thinking_text})
+            _current_thinking_text = ""  # consumed — don't re-send
+        if _current_text_buffer:
+            await wsr.send_json({"type": "replay_text", "content": _current_text_buffer})
+            _current_text_buffer = ""  # consumed
+
         # Start periodic save so SSH disconnect/kill doesn't lose conversation
         _save_interval_task = asyncio.create_task(_periodic_save_loop())
 
@@ -2391,7 +2873,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             try:
                 ctx_window = get_context_window(model_config.model_id)
                 ctx_est = agent._current_token_estimate() if hasattr(agent, '_current_token_estimate') else 0
-                await ws.send_json({
+                await wsr.send_json({
                     "type": "status",
                     "tokens": agent.total_tokens,
                     "input_tokens": agent._total_input_tokens,
@@ -2405,9 +2887,6 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
         # Send status so token badge and context gauge are correct after connect (not stale 0 / yellow)
         await _send_status()
-
-        # State for Cursor-style clarifying questions (plan phase asks user, we wait for answer)
-        _pending_question = {"future": None, "tool_use_id": None}
 
         async def _request_question_answer(
             question: str,
@@ -2427,7 +2906,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 }
                 if options:
                     payload["options"] = options
-                await ws.send_json(payload)
+                await wsr.send_json(payload)
                 return await asyncio.wait_for(_pending_question["future"], timeout=300.0)  # 5 min max
             finally:
                 _pending_question["future"] = None
@@ -2475,7 +2954,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             ag._plan_text = plan_text_full
 
             # Emit updated plan event to frontend
-            await ws.send_json({
+            await wsr.send_json({
                 "type": "updated_plan",
                 "steps": new_steps,
                 "plan_text": plan_text_full,
@@ -2488,7 +2967,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 for i, s in enumerate(new_steps)
             ]
             ag._todos = todos
-            await ws.send_json({"type": "todos_updated", "todos": todos})
+            await wsr.send_json({"type": "todos_updated", "todos": todos})
 
         async def _run_task_bg(task_text: str, task_images: Optional[List[Dict[str, Any]]] = None, preserve_snapshots: bool = False, editor_context: Optional[Dict[str, Any]] = None):
             """Run a task (plan or direct mode) in the background. preserve_snapshots=True keeps diff/revert cumulative."""
@@ -2536,7 +3015,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                         return
 
                     elapsed = round(time.time() - task_start, 1)
-                    await ws.send_json({"type": "phase_end", "content": "plan", "elapsed": elapsed})
+                    await wsr.send_json({"type": "phase_end", "content": "plan", "elapsed": elapsed})
 
                     if plan_steps:
                         pending_task = task_text
@@ -2548,7 +3027,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                         except Exception:
                             pass  # don't break on save failure; replay will still send plan from agent state
                     else:
-                        await ws.send_json({"type": "no_plan"})
+                        await wsr.send_json({"type": "no_plan"})
                 else:
                     # Direct mode — pass scout decision from intent classification
                     # If user has a pending plan (didn't press Build), inject plan into context so
@@ -2592,7 +3071,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                         enable_scout = False
                         logger.info("Smart scout skip: auto-context provides sufficient file context")
 
-                    await ws.send_json({"type": "phase_start", "content": "direct"})
+                    await wsr.send_json({"type": "phase_start", "content": "direct"})
                     try:
                         await agent.run(
                             task=task_for_run,
@@ -2601,6 +3080,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                             enable_scout=enable_scout,
                             user_images=task_images or [],
                             preserve_snapshots=preserve_snapshots,
+                            request_question_answer=_request_question_answer,
                         )
                     finally:
                         # Always restore the original model
@@ -2613,21 +3093,21 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                         _detect_and_apply_plan_update(agent, pending_plan)
 
                     elapsed = round(time.time() - task_start, 1)
-                    await ws.send_json({"type": "phase_end", "content": "direct", "elapsed": elapsed})
-                    await ws.send_json({"type": "done"})
+                    await wsr.send_json({"type": "phase_end", "content": "direct", "elapsed": elapsed})
+                    await wsr.send_json({"type": "done"})
 
                     # Show cumulative diff and Keep/Revert bar for ALL accumulated changes
                     if agent.modified_files:
                         awaiting_keep_revert = True
                         diffs = generate_diffs()
                         if diffs:
-                            await ws.send_json({"type": "diff", "files": diffs, "cumulative": True})
+                            await wsr.send_json({"type": "diff", "files": diffs, "cumulative": True})
             except asyncio.CancelledError:
                 return
             except Exception as exc:
                 logger.exception("Task error")
                 try:
-                    await ws.send_json({"type": "error", "content": str(exc)})
+                    await wsr.send_json({"type": "error", "content": str(exc)})
                 except Exception:
                     pass
             finally:
@@ -2644,9 +3124,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     {"id": str(i + 1), "content": s, "status": "pending"}
                     for i, s in enumerate(steps)
                 ]
-                await ws.send_json({"type": "todos_updated", "todos": list(agent._todos)})
+                await wsr.send_json({"type": "todos_updated", "todos": list(agent._todos)})
 
-                await ws.send_json({"type": "phase_start", "content": "build"})
+                await wsr.send_json({"type": "phase_start", "content": "build"})
                 await agent.run_build(
                     task=task_text,
                     plan_steps=steps,
@@ -2659,21 +3139,21 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     return
 
                 elapsed = round(time.time() - task_start, 1)
-                await ws.send_json({"type": "phase_end", "content": "build", "elapsed": elapsed})
-                await ws.send_json({"type": "done"})
+                await wsr.send_json({"type": "phase_end", "content": "build", "elapsed": elapsed})
+                await wsr.send_json({"type": "done"})
 
                 # Show cumulative diff and Keep/Revert bar for ALL accumulated changes
                 if agent.modified_files:
                     awaiting_keep_revert = True
                     diffs = generate_diffs()
                     if diffs:
-                        await ws.send_json({"type": "diff", "files": diffs, "cumulative": True})
+                        await wsr.send_json({"type": "diff", "files": diffs, "cumulative": True})
             except asyncio.CancelledError:
                 return
             except Exception as exc:
                 logger.exception("Build error")
                 try:
-                    await ws.send_json({"type": "error", "content": str(exc)})
+                    await wsr.send_json({"type": "error", "content": str(exc)})
                 except Exception:
                     pass
             finally:
@@ -2699,6 +3179,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
                 while True:
                     await asyncio.sleep(POLL_INTERVAL)
+                    agent_busy = _agent_task is not None and not _agent_task.done()
                     changed = []
                     for root, dirs, files in os.walk(wd):
                         dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith(".")]
@@ -2709,14 +3190,14 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                                 prev = _file_mtimes.get(fpath)
                                 if prev is None or mtime > prev + 0.1:
                                     _file_mtimes[fpath] = mtime
-                                    if prev is not None:  # don't report new files on first scan
+                                    if not agent_busy and prev is not None:
                                         changed.append(os.path.relpath(fpath, wd))
                             except OSError:
                                 pass
 
                     for rel in changed[:10]:  # cap events per poll
                         try:
-                            await ws.send_json({"type": "file_changed", "path": rel})
+                            await wsr.send_json({"type": "file_changed", "path": rel})
                         except Exception:
                             return
             except asyncio.CancelledError:
@@ -2729,222 +3210,117 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             _watcher_task = asyncio.create_task(_file_watcher())
 
         # ── Message loop ───────────────────────────────────────
-        while True:
-            raw = await ws.receive_text()
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                await ws.send_json({"type": "error", "content": "Invalid JSON"})
-                continue
-
-            msg_type = data.get("type", "")
-
-            # ── User answer to clarifying question (plan phase) ───
-            if msg_type == "user_answer":
-                if _pending_question["future"] and data.get("tool_use_id") == _pending_question["tool_use_id"]:
-                    try:
-                        _pending_question["future"].set_result(data.get("answer", ""))
-                    except asyncio.InvalidStateError:
-                        pass
-                continue
-
-            # ── Cancel ─────────────────────────────────────────────
-            if msg_type == "cancel":
-                _cancel_ack_sent = True
-                agent.cancel()  # sets flag + kills running subprocess
-                if _agent_task and not _agent_task.done():
-                    # Give the agent task a moment to wind down gracefully
-                    try:
-                        await asyncio.wait_for(asyncio.shield(_agent_task), timeout=3.0)
-                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                        _agent_task.cancel()
-                _agent_task = None
-                await ws.send_json({"type": "cancelled"})
-                continue
-
-            # ── Keep / Revert ──────────────────────────────────────
-            if msg_type == "keep" and awaiting_keep_revert:
-                # Record which files were kept so the agent knows its changes were accepted
-                kept_paths = [os.path.relpath(p, wd) for p in agent.modified_files]
-                agent.clear_snapshots()
-                awaiting_keep_revert = False
-                feedback = "[System] The user accepted your changes."
-                if kept_paths:
-                    feedback += f" The following files were kept: {', '.join(kept_paths[:20])}"
-                    if len(kept_paths) > 20:
-                        feedback += f" (and {len(kept_paths) - 20} more)"
-                agent.history.append({"role": "user", "content": feedback})
-                save_session()
-                await ws.send_json({"type": "kept"})
-                continue
-
-            if msg_type == "revert" and awaiting_keep_revert:
-                reverted = agent.revert_all()
-                reverted_rel = [os.path.relpath(p, wd) for p in reverted]
-                awaiting_keep_revert = False
-                feedback = "[System] The user reverted your changes. The following files were reverted to their previous state: "
-                feedback += ", ".join(reverted_rel[:20]) if reverted_rel else "(none)"
-                if len(reverted_rel) > 20:
-                    feedback += f" (and {len(reverted_rel) - 20} more)"
-                agent.history.append({"role": "user", "content": feedback})
-                save_session()
-                await ws.send_json({
-                    "type": "reverted",
-                    "files": reverted_rel,
-                })
-                continue
-
-            # ── Revert to specific plan step ──────────────────────
-            if msg_type == "revert_to_step":
-                try:
-                    step = int(data.get("step", 0) or 0)
-                except (TypeError, ValueError):
-                    step = 0
-                if step < 1:
-                    await ws.send_json({
-                        "type": "error",
-                        "content": "Invalid step for revert (must be at least 1).",
-                    })
-                    continue
-                had_checkpoint = step in getattr(agent, "_step_checkpoints", {})
-                reverted = agent.revert_to_step(step)
-                reverted_rel = [os.path.relpath(p, wd) for p in reverted]
-                feedback = f"[System] The user reverted to step {step}. The following files were reverted: "
-                feedback += ", ".join(reverted_rel[:20]) if reverted_rel else "(none)"
-                if len(reverted_rel) > 20:
-                    feedback += f" (and {len(reverted_rel) - 20} more)"
-                agent.history.append({"role": "user", "content": feedback})
-                save_session()
-                await ws.send_json({
-                    "type": "reverted_to_step",
-                    "step": step,
-                    "files": reverted_rel,
-                    "no_checkpoint": not had_checkpoint and len(reverted_rel) == 0,
-                })
-                continue
-
-            # ── Add todo (user adds a task in real time; agent sees it on next TodoRead) ───
-            if msg_type == "add_todo":
-                content = (data.get("content") or "").strip()
-                if content:
-                    existing_ids = []
-                    for t in agent._todos:
-                        tid = t.get("id")
-                        if isinstance(tid, int):
-                            existing_ids.append(tid)
-                        elif isinstance(tid, str) and tid.isdigit():
-                            existing_ids.append(int(tid))
-                    next_id = str(max(existing_ids, default=0) + 1)
-                    agent._todos.append({"id": next_id, "content": content, "status": "pending"})
-                    save_session()
-                    await ws.send_json({"type": "todos_updated", "todos": list(agent._todos)})
-                continue
-
-            # ── Remove todo (user removes a task; agent sees updated list on next TodoRead) ───
-            if msg_type == "remove_todo":
-                todo_id = data.get("id")
-                if todo_id is not None:
-                    before = len(agent._todos)
-                    agent._todos = [t for t in agent._todos if str(t.get("id")) != str(todo_id)]
-                    if len(agent._todos) != before:
-                        save_session()
-                    await ws.send_json({"type": "todos_updated", "todos": list(agent._todos)})
-                continue
-
-            # ── Build (approve plan) ───────────────────────────────
-            if msg_type == "build" and awaiting_build:
-                awaiting_build = False
-                edited_steps = data.get("steps") or pending_plan or []
-                _cancel_ack_sent = False
-                _agent_task = asyncio.create_task(
-                    _run_build_bg(pending_task or "", edited_steps, pending_images or [])
-                )
-                continue
-
-            # ── Reject plan ────────────────────────────────────────
-            if msg_type == "reject_plan" and awaiting_build:
-                awaiting_build = False
-                pending_task = None
-                pending_plan = None
-                pending_images = []
-                await ws.send_json({"type": "plan_rejected"})
-                continue
-
-            # ── Re-plan with feedback ──────────────────────────────
-            if msg_type == "replan" and awaiting_build:
-                feedback = data.get("content", "")
-                task = f"{pending_task}\n\nUser feedback: {feedback}" if pending_task else feedback
-                awaiting_build = False
-                pending_task = task
-                pending_plan = None
-
-                # Fall through to task handling below
-                msg_type = "task"
-                data["content"] = task
-                data["images"] = pending_images
-
-            # ── Reset ──────────────────────────────────────────────
-            if msg_type == "reset":
-                if _agent_task and not _agent_task.done():
-                    agent.cancel()
-                    _agent_task.cancel()
-                    _agent_task = None
-                agent.reset()
-                session = store.create_session(wd, model_config.model_id)
-                save_session()
-                await ws.send_json({
-                    "type": "reset_done",
-                    "session_id": session.session_id,
-                    "session_name": session.name,
-                })
-                continue
-
-            # ── New task ───────────────────────────────────────────
-            if msg_type == "task":
-                task_text = data.get("content", "").strip()
-                try:
-                    task_images = _normalize_user_images(data.get("images") or [])
-                except ValueError as ve:
-                    await ws.send_json({"type": "error", "content": f"Image upload error: {ve}"})
-                    continue
-
-                if not task_text and not task_images:
-                    continue
-                if not task_text and task_images:
-                    task_text = "Analyze the attached image(s) and help me with the request."
-
-                # Don't start a new task while one is running
-                if _agent_task and not _agent_task.done():
-                    await ws.send_json({"type": "error", "content": "Agent is already running. Cancel first."})
-                    continue
-
-                # When user has uncommitted changes and sends a new task: preserve snapshots so
-                # diff/revert keep growing (cumulative). Don't clear the keep/revert UI.
-                preserve_snapshots = bool(awaiting_keep_revert and agent._file_snapshots)
-
-                # Name session from first task
-                if session and session.name == "default" and not agent.history:
-                    if task_text:
-                        words = task_text.split()[:6]
-                        session.name = " ".join(words) + ("..." if len(task_text.split()) > 6 else "")
-                    else:
-                        session.name = "Image prompt"
-
-                editor_context = data.get("context")
-                _cancel_ack_sent = False
-                _agent_task = asyncio.create_task(_run_task_bg(task_text, task_images, preserve_snapshots, editor_context=editor_context))
-                continue
+        await _message_loop()
 
     except WebSocketDisconnect:
+        # Cancel disposable background tasks
         if _save_interval_task and not _save_interval_task.done():
             _save_interval_task.cancel()
         if _watcher_task and not _watcher_task.done():
             _watcher_task.cancel()
+
         if _agent_task and not _agent_task.done():
-            agent.cancel()
-            _agent_task.cancel()
-        save_session()
-        logger.info("WebSocket disconnected")
+            # ── Agent still running: wait for client to reconnect ──
+            wsr.ws = None  # sends become silent no-ops while disconnected
+            _rc_future: asyncio.Future = asyncio.get_event_loop().create_future()
+            _reconnect_sessions[session.session_id] = {"future": _rc_future}
+            save_session()
+            logger.info("WS disconnected — agent still running (session %s). Waiting for reconnect…", session.session_id)
+
+            _new_ws = None
+            _done_event = None
+            try:
+                _new_ws, _done_event = await asyncio.wait_for(_rc_future, timeout=300)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.info("Reconnect timeout / cancelled (session %s) — cleaning up", session.session_id)
+                agent.cancel()
+                if _agent_task and not _agent_task.done():
+                    _agent_task.cancel()
+                save_session()
+                _reconnect_sessions.pop(session.session_id, None)
+                _active_agent = None
+                return
+
+            # Reconnected!
+            _reconnect_sessions.pop(session.session_id, None)
+            ws = _new_ws
+            wsr.ws = _new_ws
+            logger.info("WS reconnected (session %s)", session.session_id)
+
+            try:
+                # Re-send init + replay so the frontend rebuilds the chat
+                mcfg = get_model_config(model_config.model_id)
+                if is_ssh and _ssh_info:
+                    display_wd = f"{_ssh_info['user']}@{_ssh_info['host']}:{_ssh_info['directory']}"
+                else:
+                    display_wd = wd
+                await wsr.send_json({
+                    "type": "init",
+                    "model_name": get_model_name(model_config.model_id),
+                    "working_directory": display_wd,
+                    "context_window": mcfg.get("context_window", 0),
+                    "thinking": supports_thinking(model_config.model_id),
+                    "caching": supports_caching(model_config.model_id),
+                    "session_id": session.session_id if session else "",
+                    "session_name": session.name if session else "default",
+                    "message_count": session.message_count if session else 0,
+                    "total_tokens": agent.total_tokens,
+                    "input_tokens": getattr(agent, "_total_input_tokens", 0),
+                    "output_tokens": getattr(agent, "_total_output_tokens", 0),
+                    "cache_read": getattr(agent, "_cache_read_tokens", 0),
+                    "is_ssh": is_ssh,
+                })
+                await replay_history()
+                _agent_running = _agent_task is not None and not _agent_task.done()
+
+                # If the agent was mid-stream when we disconnected, replay
+                # the buffered content so the frontend picks up where it left off.
+                if _agent_running:
+                    if _current_thinking_text:
+                        await wsr.send_json({"type": "thinking_start", "content": ""})
+                        await wsr.send_json({"type": "thinking", "content": _current_thinking_text})
+                    if _current_text_buffer:
+                        await wsr.send_json({"type": "text_start", "content": ""})
+                        await wsr.send_json({"type": "text", "content": _current_text_buffer})
+
+                await wsr.send_json({"type": "resumed", "agent_running": _agent_running})
+                await _send_status()
+
+                # Restart disposable tasks
+                _save_interval_task = asyncio.create_task(_periodic_save_loop())
+                if isinstance(backend, LocalBackend):
+                    _watcher_task = asyncio.create_task(_file_watcher())
+
+                # Re-enter message loop with the new WebSocket
+                await _message_loop()
+
+            except WebSocketDisconnect:
+                # Second disconnect — clean up normally
+                if _save_interval_task and not _save_interval_task.done():
+                    _save_interval_task.cancel()
+                if _watcher_task and not _watcher_task.done():
+                    _watcher_task.cancel()
+                if _agent_task and not _agent_task.done():
+                    agent.cancel()
+                    _agent_task.cancel()
+                save_session()
+                logger.info("WS disconnected again after reconnect")
+            except Exception as exc:
+                if _agent_task and not _agent_task.done():
+                    agent.cancel()
+                    _agent_task.cancel()
+                logger.exception("WS error after reconnect: %s", exc)
+                save_session()
+            finally:
+                if _done_event:
+                    _done_event.set()
+        else:
+            # No running task — normal disconnect
+            save_session()
+            logger.info("WebSocket disconnected")
+        _active_agent = None
+        if session and session.session_id:
+            _active_save_fns.pop(session.session_id, None)
     except Exception as e:
         if _save_interval_task and not _save_interval_task.done():
             _save_interval_task.cancel()
@@ -2953,7 +3329,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             _agent_task.cancel()
         logger.exception(f"WebSocket error: {e}")
         save_session()
-
+        _active_agent = None
+        if session and session.session_id:
+            _active_save_fns.pop(session.session_id, None)
 
 # ============================================================
 # Entry point

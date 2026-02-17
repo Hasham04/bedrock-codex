@@ -4,7 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Bedrock Codex</title>
-    <link rel="stylesheet" href="/static/style.css?v=11">
+    <!-- Geist font family (Vercel / Cursor aesthetic) -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-sans/style.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=12">
     <!-- Markdown rendering -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <!-- Syntax highlighting for chat code blocks -->
@@ -395,6 +398,20 @@
             require(['vs/editor/editor.main'], function () { resolve(monaco); });
         });
     </script>
+    <!-- Explorer context menu (positioned absolutely, hidden by default) -->
+    <div id="explorer-ctx-menu" class="ctx-menu hidden" role="menu">
+        <button class="ctx-menu-item" data-action="new-file"><span class="ctx-icon">📄</span> New File</button>
+        <button class="ctx-menu-item" data-action="new-folder"><span class="ctx-icon">📁</span> New Folder</button>
+        <div class="ctx-menu-sep"></div>
+        <button class="ctx-menu-item" data-action="rename"><span class="ctx-icon">✏️</span> Rename</button>
+        <button class="ctx-menu-item" data-action="delete"><span class="ctx-icon">🗑</span> Delete</button>
+        <div class="ctx-menu-sep"></div>
+        <button class="ctx-menu-item" data-action="copy-path"><span class="ctx-icon">📋</span> Copy Path</button>
+        <button class="ctx-menu-item" data-action="copy-relative"><span class="ctx-icon">📎</span> Copy Relative Path</button>
+        <div class="ctx-menu-sep"></div>
+        <button class="ctx-menu-item" data-action="refresh"><span class="ctx-icon">🔄</span> Refresh</button>
+    </div>
+
     <script src="/static/app.js?v=8"></script>
 </body>
 </html>

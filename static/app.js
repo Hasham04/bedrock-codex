@@ -382,15 +382,43 @@
         return map[ext?.toLowerCase()] || "plaintext";
     }
 
-    // ── File Changes Tracking ─────────────────────────────────
-    function trackFileChange(path, edits = 0, deletions = 0) {
+    // ── File Changes Tracking (line counts) ────────────────────
+    function trackFileChange(path, linesAdded = 0, linesDeleted = 0) {
         if (!path) return;
         const current = fileChangesThisSession.get(path) || { edits: 0, deletions: 0 };
         fileChangesThisSession.set(path, {
-            edits: current.edits + edits,
-            deletions: current.deletions + deletions
+            edits: current.edits + linesAdded,
+            deletions: current.deletions + linesDeleted
         });
         updateFileChangesDropdown();
+    }
+    function untrackFileChange(path) {
+        if (!path) return;
+        const hadEntry = fileChangesThisSession.has(path);
+        fileChangesThisSession.delete(path);
+        modifiedFiles.delete(path);
+        if (hadEntry) {
+            updateFileChangesDropdown();
+            updateModifiedFilesBar();
+        }
+    }
+    function detectFileDeletesFromBash(command, output) {
+        if (!command) return;
+        const cmd = command.trim();
+        // Match rm commands that target tracked files
+        const rmMatch = cmd.match(/\brm\s+(?:-[rfiv]+\s+)*(.+)/);
+        if (rmMatch) {
+            const targets = rmMatch[1].split(/\s+/).filter(t => t && !t.startsWith("-"));
+            for (const t of targets) {
+                const cleaned = t.replace(/["']/g, "");
+                // Check if any tracked path ends with this target
+                for (const [trackedPath] of fileChangesThisSession) {
+                    if (trackedPath.endsWith(cleaned) || trackedPath.endsWith("/" + cleaned)) {
+                        untrackFileChange(trackedPath);
+                    }
+                }
+            }
+        }
     }
 
     function getFileIcon(path) {
@@ -462,12 +490,12 @@
                     if (delEl) delEl.textContent = "\u2212" + totalDel;
                 }
                 if ($chatComposerFiles) $chatComposerFiles.textContent = filesLabel;
-                if ($chatComposerEdits) $chatComposerEdits.textContent = "\u2009\u22c5\u2009" + (totalEdits === 1 ? "1 edit" : totalEdits + " edits");
+                if ($chatComposerEdits) $chatComposerEdits.textContent = "\u2009\u22c5\u2009" + totalEdits + " line" + (totalEdits !== 1 ? "s" : "");
                 if ($chatComposerFilesDropup) {
                     $chatComposerFilesDropup.innerHTML = changes.map(([path, stats]) => {
                         const icon = fileTypeIcon(path, 14);
-                        const add = stats.edits > 0 ? `<span class="add">+${stats.edits}</span>` : "";
-                        const del = stats.deletions > 0 ? `<span class="del">−${stats.deletions}</span>` : "";
+                        const add = stats.edits > 0 ? `<span class="add">+${stats.edits}L</span>` : "";
+                        const del = stats.deletions > 0 ? `<span class="del">\u2212${stats.deletions}L</span>` : "";
                         return `<div class="composer-file-item" data-path="${escapeHtml(path)}" title="${escapeHtml(path)}">
                             <span class="file-icon">${icon}</span>
                             <span class="file-path">${escapeHtml(path)}</span>
@@ -624,6 +652,265 @@
         }
     }
 
+    // ── Explorer context menu (right-click) ────────────────────
+    const $ctxMenu = document.getElementById("explorer-ctx-menu");
+    let _ctxTarget = null;   // { path, type: "file"|"dir"|null }
+
+    function _showCtxMenu(x, y, target) {
+        if (!$ctxMenu) return;
+        _ctxTarget = target;
+        // Show/hide items based on context
+        const hasPath = target && target.path;
+        $ctxMenu.querySelector('[data-action="rename"]').style.display = hasPath ? "" : "none";
+        $ctxMenu.querySelector('[data-action="delete"]').style.display = hasPath ? "" : "none";
+        $ctxMenu.querySelector('[data-action="copy-path"]').style.display = hasPath ? "" : "none";
+        $ctxMenu.querySelector('[data-action="copy-relative"]').style.display = hasPath ? "" : "none";
+        // separators — hide the 2nd group separator when no path
+        const seps = $ctxMenu.querySelectorAll(".ctx-menu-sep");
+        if (seps[0]) seps[0].style.display = hasPath ? "" : "none";
+        if (seps[1]) seps[1].style.display = hasPath ? "" : "none";
+
+        $ctxMenu.classList.remove("hidden");
+        // Position: keep inside viewport
+        const rect = $ctxMenu.getBoundingClientRect();
+        const mx = Math.min(x, window.innerWidth - rect.width - 8);
+        const my = Math.min(y, window.innerHeight - rect.height - 8);
+        $ctxMenu.style.left = mx + "px";
+        $ctxMenu.style.top = my + "px";
+    }
+
+    function _hideCtxMenu() {
+        if ($ctxMenu) $ctxMenu.classList.add("hidden");
+        _ctxTarget = null;
+    }
+
+    // Close on any outside click or Escape
+    document.addEventListener("click", _hideCtxMenu);
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") _hideCtxMenu(); });
+
+    // Right-click on file tree items
+    $fileTree.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        const treeItem = e.target.closest(".tree-item");
+        if (treeItem) {
+            const path = treeItem.dataset.path || "";
+            const type = treeItem.dataset.type === "dir" ? "dir" : "file";
+            _showCtxMenu(e.clientX, e.clientY, { path, type });
+        } else {
+            // Right-clicked on empty space in explorer
+            _showCtxMenu(e.clientX, e.clientY, { path: null, type: null });
+        }
+    });
+
+    // Also allow right-click on the explorer body background
+    const $explorerBody = document.querySelector(".explorer-body");
+    if ($explorerBody) {
+        $explorerBody.addEventListener("contextmenu", (e) => {
+            if (e.target === $explorerBody || e.target === $fileTree) {
+                e.preventDefault();
+                _showCtxMenu(e.clientX, e.clientY, { path: null, type: null });
+            }
+        });
+    }
+
+    // ── Inline rename input helper ───────────────────────────────
+    function _startInlineRename(treeItem, currentName, onCommit) {
+        const nameEl = treeItem.querySelector(".tree-file-name");
+        if (!nameEl) return;
+        const original = nameEl.textContent;
+        const input = document.createElement("input");
+        input.type = "text";
+        input.className = "tree-rename-input";
+        input.value = currentName;
+        nameEl.textContent = "";
+        nameEl.appendChild(input);
+        input.focus();
+        // Select filename without extension
+        const dotIdx = currentName.lastIndexOf(".");
+        input.setSelectionRange(0, dotIdx > 0 ? dotIdx : currentName.length);
+
+        let committed = false;
+        function commit() {
+            if (committed) return;
+            committed = true;
+            const newName = input.value.trim();
+            if (input.parentNode) input.remove();
+            nameEl.textContent = original;
+            if (newName && newName !== currentName) {
+                onCommit(newName);
+            }
+        }
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { e.preventDefault(); commit(); }
+            if (e.key === "Escape") { committed = true; if (input.parentNode) input.remove(); nameEl.textContent = original; }
+            e.stopPropagation();
+        });
+        input.addEventListener("blur", commit);
+        input.addEventListener("click", (e) => e.stopPropagation());
+    }
+
+    // ── Inline new-file/folder input at top of tree or inside a dir ──
+    function _startInlineCreate(parentPath, isFolder) {
+        // Find the container to insert the input row into
+        let container = $fileTree;
+        if (parentPath) {
+            // Find the tree-children container for this directory
+            const dirItem = $fileTree.querySelector(`.tree-item[data-path="${CSS.escape(parentPath)}"][data-type="dir"]`);
+            if (dirItem) {
+                const wrapper = dirItem.parentElement;
+                const children = wrapper?.querySelector(".tree-children");
+                if (children) {
+                    // Expand the directory if collapsed
+                    if (children.style.display === "none") {
+                        children.style.display = "";
+                        const chevron = wrapper.querySelector(".tree-chevron");
+                        if (chevron) chevron.classList.add("open");
+                        treeState[parentPath] = true;
+                    }
+                    container = children;
+                }
+            }
+        }
+        const depth = parentPath ? parentPath.split("/").length : 0;
+        const row = document.createElement("div");
+        row.innerHTML = `
+            <div class="tree-item" style="padding-left:${8 + depth * 16 + (isFolder ? 0 : 16)}px">
+                <span class="tree-icon">${isFolder ? "📁" : "📄"}</span>
+                <span class="tree-file-name"><input type="text" class="tree-rename-input" placeholder="${isFolder ? "folder name" : "filename"}" /></span>
+            </div>
+        `;
+        const input = row.querySelector("input");
+        container.insertBefore(row, container.firstChild);
+        input.focus();
+
+        let committed = false;
+        function commit() {
+            if (committed) return;
+            committed = true;
+            const name = input.value.trim();
+            row.remove();
+            if (!name) return;
+            const fullPath = parentPath ? parentPath + "/" + name : name;
+            if (isFolder) {
+                fetch("/api/file/mkdir", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ path: fullPath })
+                }).then(() => refreshTree());
+            } else {
+                fetch("/api/file", {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ path: fullPath, content: "" })
+                }).then(() => { refreshTree(); openFile(fullPath); });
+            }
+        }
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { e.preventDefault(); commit(); }
+            if (e.key === "Escape") { committed = true; row.remove(); }
+            e.stopPropagation();
+        });
+        input.addEventListener("blur", commit);
+        input.addEventListener("click", (e) => e.stopPropagation());
+    }
+
+    // ── Context menu action handler ──────────────────────────────
+    if ($ctxMenu) {
+        $ctxMenu.addEventListener("click", async (e) => {
+            const btn = e.target.closest(".ctx-menu-item");
+            if (!btn) return;
+            e.stopPropagation();
+            const action = btn.dataset.action;
+            const target = _ctxTarget;
+            _hideCtxMenu();
+            if (!action) return;
+
+            // Determine the parent directory for new file/folder creation
+            const parentDir = target?.type === "dir" ? target.path
+                            : target?.path ? target.path.replace(/\/[^/]+$/, "") || ""
+                            : "";
+
+            switch (action) {
+                case "new-file":
+                    _startInlineCreate(parentDir, false);
+                    break;
+
+                case "new-folder":
+                    _startInlineCreate(parentDir, true);
+                    break;
+
+                case "rename": {
+                    if (!target?.path) break;
+                    const treeItem = $fileTree.querySelector(`.tree-item[data-path="${CSS.escape(target.path)}"]`);
+                    if (!treeItem) break;
+                    const oldName = target.path.split("/").pop();
+                    _startInlineRename(treeItem, oldName, async (newName) => {
+                        const dir = target.path.replace(/\/[^/]+$/, "");
+                        const newPath = dir ? dir + "/" + newName : newName;
+                        try {
+                            const res = await fetch("/api/file/rename", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ old_path: target.path, new_path: newPath })
+                            });
+                            if (res.ok) {
+                                refreshTree();
+                                // Update any open tab for this file
+                                const tab = $tabBar.querySelector(`.tab[data-path="${CSS.escape(target.path)}"]`);
+                                if (tab) {
+                                    tab.dataset.path = newPath;
+                                    const nameEl = tab.querySelector(".tab-name");
+                                    if (nameEl) nameEl.textContent = newName;
+                                }
+                            }
+                        } catch {}
+                    });
+                    break;
+                }
+
+                case "delete": {
+                    if (!target?.path) break;
+                    const name = target.path.split("/").pop();
+                    const kind = target.type === "dir" ? "folder" : "file";
+                    if (!confirm(`Delete ${kind} "${name}"?`)) break;
+                    try {
+                        const res = await fetch("/api/file/delete", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ path: target.path })
+                        });
+                        if (res.ok) {
+                            refreshTree();
+                            // Close tab if the file was open
+                            const tab = $tabBar.querySelector(`.tab[data-path="${CSS.escape(target.path)}"]`);
+                            if (tab) {
+                                const closeBtn = tab.querySelector(".tab-close");
+                                if (closeBtn) closeBtn.click();
+                            }
+                        }
+                    } catch {}
+                    break;
+                }
+
+                case "copy-path": {
+                    if (!target?.path) break;
+                    try { await navigator.clipboard.writeText(target.path); } catch {}
+                    break;
+                }
+
+                case "copy-relative": {
+                    if (!target?.path) break;
+                    try { await navigator.clipboard.writeText(target.path); } catch {}
+                    break;
+                }
+
+                case "refresh":
+                    refreshTree();
+                    break;
+            }
+        });
+    }
+
     // ── File-type-aware icons (VS Code / Cursor style) ────────
     const _ftColors = {
         py:"#3572A5",js:"#f1e05a",ts:"#3178c6",jsx:"#61dafb",tsx:"#61dafb",
@@ -697,12 +984,30 @@
         if (tab) tab.classList.add("modified");
     }
 
-    async function refreshTree() {
+    let _refreshTreeTimer = null;
+    let _refreshTreePromise = null;
+
+    async function _doRefreshTree() {
         await fetchGitStatus();
         $fileTree.innerHTML = "";
         if ($fileFilter) $fileFilter.value = "";
         loadTree();
         updateModifiedFilesBar();
+    }
+
+    function refreshTree() {
+        if (_refreshTreeTimer) clearTimeout(_refreshTreeTimer);
+        if (!_refreshTreePromise) {
+            _refreshTreePromise = _doRefreshTree().finally(() => { _refreshTreePromise = null; });
+            return _refreshTreePromise;
+        }
+        return new Promise(resolve => {
+            _refreshTreeTimer = setTimeout(() => {
+                _refreshTreeTimer = null;
+                _refreshTreePromise = _doRefreshTree().finally(() => { _refreshTreePromise = null; });
+                _refreshTreePromise.then(resolve);
+            }, 300);
+        });
     }
 
     /* ── File filter: fuzzy search in explorer tree ─────────────── */
@@ -2385,9 +2690,9 @@
         const titleEl = block.querySelector(".thinking-title");
         if (titleEl) {
             if (done) {
-                titleEl.textContent = `Thought for ${elapsed}s`;
+                titleEl.textContent = elapsed > 0 ? `Reasoned for ${elapsed}s` : "Reasoning";
             } else {
-                titleEl.textContent = elapsed > 0 ? `Thinking\u2026 ${elapsed}s` : "Thinking\u2026";
+                titleEl.textContent = elapsed > 0 ? `Reasoning\u2026 ${elapsed}s` : "Reasoning\u2026";
             }
         }
         if (done) {
@@ -2412,7 +2717,7 @@
                             <path d="M9 19h6"/><path d="M10 22h4"/>
                         </svg>
                     </span>
-                    <span class="thinking-title">Thinking\u2026</span>
+                    <span class="thinking-title">Reasoning\u2026</span>
                 </div>
                 <div class="thinking-right">
                     <span class="thinking-spinner spinner"></span>
@@ -2465,8 +2770,9 @@
         const block = el.closest(".thinking-block"); if (!block) return;
         updateThinkingHeader(block, true);
         const spinner = block.querySelector(".thinking-spinner"); if (spinner) spinner.remove();
-        // Collapse only if thinking was long OR user didn't manually interact
-        if (!_thinkingUserCollapsed) {
+        // Only auto-collapse trivially short thinking (< 50 chars) — keep substantial reasoning visible
+        const contentLen = (_thinkingBuffer || el.textContent || "").length;
+        if (contentLen < 50) {
             block.classList.add("collapsed");
         }
         const header = block.querySelector(".thinking-header");
@@ -2544,26 +2850,28 @@
     }
     function buildEditPreviewDiff(name, input) {
         const path = input?.path || "(unknown)";
+        const MAX_PREVIEW = 80; // show up to 80 lines for streaming preview
         if (name === "Write") {
             const lines = String(input?.content || "").split("\n");
-            const added = lines.slice(0, 16).map(l => `+${l}`);
-            if (lines.length > 16) added.push(`+... (${lines.length - 16} more lines)`);
-            return `+++ ${path}\n@@ new content preview @@\n${added.join("\n")}`;
+            const show = lines.slice(0, MAX_PREVIEW);
+            const added = show.map(l => `+${l}`);
+            if (lines.length > MAX_PREVIEW) added.push(`+... (${lines.length - MAX_PREVIEW} more lines)`);
+            return `+++ ${path}\n@@ new file @@\n${added.join("\n")}`;
         }
         if (name === "Edit") {
             const oldLines = String(input?.old_string || "").split("\n");
             const newLines = String(input?.new_string || "").split("\n");
-            const removed = oldLines.slice(0, 8).map(l => `-${l}`);
-            const added = newLines.slice(0, 8).map(l => `+${l}`);
-            if (oldLines.length > 8) removed.push(`-... (${oldLines.length - 8} more lines)`);
-            if (newLines.length > 8) added.push(`+... (${newLines.length - 8} more lines)`);
-            return `--- ${path}\n+++ ${path}\n@@ edit preview @@\n${removed.join("\n")}\n${added.join("\n")}`;
+            const removed = oldLines.slice(0, MAX_PREVIEW).map(l => `-${l}`);
+            const added = newLines.slice(0, MAX_PREVIEW).map(l => `+${l}`);
+            if (oldLines.length > MAX_PREVIEW) removed.push(`-... (${oldLines.length - MAX_PREVIEW} more lines)`);
+            if (newLines.length > MAX_PREVIEW) added.push(`+... (${newLines.length - MAX_PREVIEW} more lines)`);
+            return `--- ${path}\n+++ ${path}\n@@ edit @@\n${removed.join("\n")}\n${added.join("\n")}`;
         }
         if (name === "symbol_edit") {
             const symbol = input?.symbol || "(symbol)";
             const newLines = String(input?.new_string || "").split("\n");
-            const added = newLines.slice(0, 12).map(l => `+${l}`);
-            if (newLines.length > 12) added.push(`+... (${newLines.length - 12} more lines)`);
+            const added = newLines.slice(0, MAX_PREVIEW).map(l => `+${l}`);
+            if (newLines.length > MAX_PREVIEW) added.push(`+... (${newLines.length - MAX_PREVIEW} more lines)`);
             return `--- ${path}\n+++ ${path}\n@@ symbol ${symbol} (${input?.kind || "all"}) @@\n${added.join("\n")}`;
         }
         return "";
@@ -2629,14 +2937,7 @@
         try {
             const parsed = JSON.parse(str);
             if (parsed && typeof parsed === "object") {
-                const pretty = JSON.stringify(parsed, null, 2);
-                const wrap = document.createElement("div");
-                wrap.className = "tool-result-body-wrap";
-                const pre = document.createElement("pre");
-                pre.className = "tool-result-body tool-result-json";
-                pre.textContent = pretty;
-                wrap.appendChild(pre);
-                return wrap;
+                return renderStructuredOutput(parsed);
             }
         } catch (_) {}
         if (str.length > 4000) return makeProgressiveBody(str, "", 4000);
@@ -2645,6 +2946,84 @@
         pre.className = "tool-result-body";
         pre.textContent = str;
         wrap.appendChild(pre);
+        return wrap;
+    }
+    function renderStructuredOutput(obj) {
+        const wrap = document.createElement("div");
+        wrap.className = "tool-structured-output";
+        if (Array.isArray(obj)) {
+            if (obj.length === 0) {
+                wrap.innerHTML = `<span class="tool-output-empty">No results</span>`;
+                return wrap;
+            }
+            const isStringArray = obj.every(v => typeof v === "string");
+            if (isStringArray && obj.length <= 50) {
+                const list = document.createElement("div");
+                list.className = "tool-output-list";
+                obj.forEach(item => {
+                    const row = document.createElement("div");
+                    row.className = "tool-output-list-item";
+                    row.textContent = item;
+                    list.appendChild(row);
+                });
+                wrap.appendChild(list);
+                return wrap;
+            }
+            obj.slice(0, 30).forEach((item, i) => {
+                if (typeof item === "object" && item !== null) {
+                    const card = document.createElement("div");
+                    card.className = "tool-output-card";
+                    Object.entries(item).forEach(([k, v]) => {
+                        const row = document.createElement("div");
+                        row.className = "tool-output-row";
+                        const key = document.createElement("span");
+                        key.className = "tool-output-key";
+                        key.textContent = k;
+                        const val = document.createElement("span");
+                        val.className = "tool-output-val";
+                        val.textContent = typeof v === "object" ? JSON.stringify(v) : String(v);
+                        row.appendChild(key);
+                        row.appendChild(val);
+                        card.appendChild(row);
+                    });
+                    wrap.appendChild(card);
+                } else {
+                    const row = document.createElement("div");
+                    row.className = "tool-output-list-item";
+                    row.textContent = String(item);
+                    wrap.appendChild(row);
+                }
+            });
+            if (obj.length > 30) {
+                const more = document.createElement("div");
+                more.className = "tool-output-more";
+                more.textContent = `... and ${obj.length - 30} more items`;
+                wrap.appendChild(more);
+            }
+            return wrap;
+        }
+        // Plain object: render as key-value pairs
+        Object.entries(obj).forEach(([k, v]) => {
+            const row = document.createElement("div");
+            row.className = "tool-output-row";
+            const key = document.createElement("span");
+            key.className = "tool-output-key";
+            key.textContent = k;
+            const val = document.createElement("span");
+            val.className = "tool-output-val";
+            if (typeof v === "object" && v !== null) {
+                val.textContent = JSON.stringify(v, null, 2);
+                val.classList.add("tool-output-val-complex");
+            } else if (typeof v === "string" && v.length > 200) {
+                val.textContent = v.slice(0, 200) + "…";
+                val.title = v;
+            } else {
+                val.textContent = String(v ?? "");
+            }
+            row.appendChild(key);
+            row.appendChild(val);
+            wrap.appendChild(row);
+        });
         return wrap;
     }
     function makeLocationList(rawText) {
@@ -2825,7 +3204,7 @@
         if (body) body.scrollTop = body.scrollHeight;
         scrollChat();
     }
-    function addToolCall(name, input, toolUseId = null) {
+    function addToolCall(name, input, toolUseId = null, { stream = true } = {}) {
         name = normalizedToolName(name);
         const bubble = getOrCreateBubble();
         const isCmd = name === "Bash";
@@ -2847,8 +3226,8 @@
             const statusEl = group.querySelector(".tool-status");
             if (statusEl) {
                 statusEl.outerHTML = isCmd
-                    ? `<span class="tool-status tool-status-running" title="Running"><span class="tool-spinner"></span></span>`
-                    : `<span class="tool-status tool-status-pending" title="Pending">${toolActionIcon("pending")}</span>`;
+                    ? `<span class="tool-status tool-status-running" title="Running"><span class="tool-status-dot"></span></span>`
+                    : `<span class="tool-status tool-status-pending" title="Pending"><span class="tool-status-dot"></span></span>`;
             }
             if (name === "TodoWrite" && input?.todos && Array.isArray(input.todos)) {
                 const normalized = input.todos.map((t, i) => ({
@@ -2874,8 +3253,8 @@
             group.dataset.follow = "1";
             if (input?.path) group.dataset.path = input.path;
             const statusHtml = isCmd
-                ? `<span class="tool-status tool-status-running" title="Running"><span class="tool-spinner"></span></span>`
-                : `<span class="tool-status tool-status-pending" title="Pending">${toolActionIcon("pending")}</span>`;
+                ? `<span class="tool-status tool-status-running" title="Running"><span class="tool-status-dot"></span></span>`
+                : `<span class="tool-status tool-status-pending" title="Pending"><span class="tool-status-dot"></span></span>`;
 
             const summaryText = headerDesc ? `${toolTitle(name)} ${headerDesc}` : toolTitle(name);
             const fileToolWithPath = (name === "Read" || name === "Write" || name === "Edit" || name === "symbol_edit" || name === "lint_file") && input?.path;
@@ -2990,22 +3369,88 @@
         run.dataset.toolName = name;
         if (toolUseId) run.dataset.toolUseId = String(toolUseId);
         if (input?.path) run.dataset.path = input.path;
+        run._toolInput = input || {};
         run.innerHTML = `
             <div class="tool-run-header">
                 <span class="tool-run-index">Run ${runIndex}</span>
                 <span class="tool-run-time">${formatClock(now)}</span>
             </div>
-            <div class="tool-section-label">${isCmd ? "Command" : "Input"}</div>`;
-        const inputText = isCmd ? (input?.command || JSON.stringify(input, null, 2)) : JSON.stringify(input, null, 2);
-        run.appendChild(makeProgressiveBody(inputText || "{}", isCmd ? "tool-input tool-input-cmd" : "tool-input", isCmd ? 2800 : 1800));
-        // For Write/Edit: show instant preview diff from input so user sees changes immediately
+            `;
+        // Human-readable input display (replaces raw JSON)
+        const formattedInput = formatToolInput(name, input);
+        if (formattedInput) {
+            run.appendChild(formattedInput);
+        } else {
+            // Fallback for tools with no special formatting
+            const inputText = isCmd ? (input?.command || JSON.stringify(input, null, 2)) : JSON.stringify(input, null, 2);
+            run.appendChild(makeProgressiveBody(inputText || "{}", isCmd ? "tool-input tool-input-cmd" : "tool-input", isCmd ? 2800 : 1800));
+        }
+        // For Write/Edit: stream the diff lines progressively (Cursor-style)
         if (name === "Write" || name === "Edit" || name === "symbol_edit") {
             const previewDiff = buildEditPreviewDiff(name, input);
             if (previewDiff) {
                 const previewWrap = document.createElement("div");
                 previewWrap.className = "tool-edit-preview";
-                previewWrap.innerHTML = `<div class="tool-section-label">Changes</div><div class="tool-mini-diff">${renderDiff(previewDiff)}</div>`;
+                const label = document.createElement("div");
+                label.className = "tool-section-label";
+                label.textContent = "Changes";
+                const miniDiff = document.createElement("div");
+                miniDiff.className = "tool-mini-diff";
+                previewWrap.appendChild(label);
+                previewWrap.appendChild(miniDiff);
                 run.appendChild(previewWrap);
+
+                if (stream) {
+                    // Stream diff lines with a typing effect
+                    const diffLines = previewDiff.split("\n");
+                    let lineIdx = 0;
+                    const LINES_PER_TICK = 3;   // reveal 3 lines per frame for speed
+                    const TICK_MS = 18;         // ~18ms between ticks (~55fps)
+
+                    // Blinking write cursor at the bottom of the diff
+                    const cursor = document.createElement("div");
+                    cursor.className = "diff-stream-cursor";
+                    miniDiff.appendChild(cursor);
+
+                    function _streamNextLines() {
+                        if (lineIdx >= diffLines.length) {
+                            cursor.remove(); // done streaming — remove cursor
+                            return;
+                        }
+                        const frag = document.createDocumentFragment();
+                        const end = Math.min(lineIdx + LINES_PER_TICK, diffLines.length);
+                        for (let i = lineIdx; i < end; i++) {
+                            const l = diffLines[i];
+                            const div = document.createElement("div");
+                            let c = "ctx";
+                            if (l.startsWith("+++") || l.startsWith("---")) c = "hunk";
+                            else if (l.startsWith("@@")) c = "hunk";
+                            else if (l.startsWith("+")) c = "add";
+                            else if (l.startsWith("-")) c = "del";
+                            div.className = "diff-line " + c;
+                            div.textContent = l;
+                            frag.appendChild(div);
+                        }
+                        // Insert lines before the cursor so cursor stays at the end
+                        miniDiff.insertBefore(frag, cursor);
+                        lineIdx = end;
+                        // Auto-scroll the diff container to follow the latest lines
+                        miniDiff.scrollTop = miniDiff.scrollHeight;
+                        // Auto-scroll the chat to follow the streaming code
+                        if (group.dataset.follow === "1") scrollChat();
+                        if (lineIdx < diffLines.length) {
+                            setTimeout(_streamNextLines, TICK_MS);
+                        } else {
+                            cursor.remove(); // done streaming — remove cursor
+                        }
+                    }
+                    // Kick off the streaming after a micro-delay so the tool header paints first
+                    setTimeout(_streamNextLines, 30);
+                } else {
+                    // Instant render (replay / history restore)
+                    miniDiff.classList.add("no-animate");
+                    miniDiff.innerHTML = renderDiff(previewDiff);
+                }
             }
         }
         runList.appendChild(run);
@@ -3313,6 +3758,103 @@
     }
 
     // ================================================================
+    // TOOL INPUT FORMATTING — Human-readable, no raw JSON
+    // ================================================================
+
+    function formatToolInput(name, input) {
+        if (!input || typeof input !== "object") return null;
+        const wrap = document.createElement("div");
+        wrap.className = "tool-input-formatted";
+
+        function chip(val, cls) {
+            const s = document.createElement("span");
+            s.className = "tool-input-chip" + (cls ? " " + cls : "");
+            s.textContent = val;
+            s.title = val;
+            return s;
+        }
+        function kvChip(key, val) {
+            const s = document.createElement("span");
+            s.className = "tool-input-chip";
+            s.innerHTML = `<span class="chip-key">${escapeHtml(key)}</span> <span class="chip-val">${escapeHtml(String(val).slice(0, 120))}</span>`;
+            s.title = String(val);
+            return s;
+        }
+
+        switch (name) {
+            case "Read":
+                if (input.path) wrap.appendChild(chip(input.path, "chip-path"));
+                if (input.offset) wrap.appendChild(kvChip("from", `line ${input.offset}`));
+                if (input.limit) wrap.appendChild(kvChip("lines", input.limit));
+                break;
+            case "Write":
+                if (input.path) wrap.appendChild(chip(input.path, "chip-path"));
+                if (input.content) {
+                    const lc = (input.content.match(/\n/g) || []).length + 1;
+                    wrap.appendChild(kvChip("lines", lc));
+                }
+                break;
+            case "Edit":
+            case "symbol_edit":
+                if (input.path) wrap.appendChild(chip(input.path, "chip-path"));
+                if (input.symbol) wrap.appendChild(kvChip("symbol", input.symbol));
+                if (input.old_string) {
+                    const preview = input.old_string.split("\n")[0].slice(0, 60);
+                    wrap.appendChild(kvChip("find", preview + (input.old_string.length > 60 ? "..." : "")));
+                }
+                if (input.replace_all) wrap.appendChild(kvChip("mode", "replace all"));
+                break;
+            case "Bash":
+                if (input.command) wrap.appendChild(chip(input.command, "chip-cmd"));
+                if (input.timeout) wrap.appendChild(kvChip("timeout", input.timeout + "s"));
+                break;
+            case "search":
+                if (input.pattern) wrap.appendChild(chip(input.pattern, "chip-cmd"));
+                if (input.path) wrap.appendChild(kvChip("in", input.path));
+                if (input.include) wrap.appendChild(kvChip("filter", input.include));
+                break;
+            case "find_symbol":
+                if (input.symbol) wrap.appendChild(chip(input.symbol, "chip-path"));
+                if (input.kind) wrap.appendChild(kvChip("kind", input.kind));
+                if (input.path) wrap.appendChild(kvChip("in", input.path));
+                break;
+            case "semantic_retrieve":
+                if (input.query) wrap.appendChild(chip(input.query, "chip-cmd"));
+                break;
+            case "Glob":
+                if (input.pattern) wrap.appendChild(chip(input.pattern, "chip-cmd"));
+                break;
+            case "project_tree":
+                wrap.appendChild(chip(input.focus_path || "full tree", "chip-path"));
+                break;
+            case "lint_file":
+                if (input.path) wrap.appendChild(chip(input.path, "chip-path"));
+                break;
+            case "list_directory":
+                wrap.appendChild(chip(input.path || ".", "chip-path"));
+                break;
+            case "WebFetch":
+                if (input.url) wrap.appendChild(chip(input.url, "chip-cmd"));
+                break;
+            case "WebSearch":
+                if (input.query) wrap.appendChild(chip(input.query, "chip-cmd"));
+                break;
+            case "TodoWrite":
+                if (input.todos && Array.isArray(input.todos)) {
+                    wrap.appendChild(kvChip("items", input.todos.length));
+                }
+                break;
+            default:
+                // Generic: show first 2 key-value pairs
+                const keys = Object.keys(input).slice(0, 2);
+                for (const k of keys) {
+                    wrap.appendChild(kvChip(k, input[k]));
+                }
+        }
+        return wrap.children.length > 0 ? wrap : null;
+    }
+
+    // ================================================================
     // CHAT — Editable Plan
     // ================================================================
 
@@ -3533,8 +4075,8 @@
 
         const fileCount = files.length;
         showActionBar([
-            { label: `\u2713 Keep All (${fileCount} file${fileCount !== 1 ? "s" : ""})`, cls: "success", onClick: async () => { hideActionBar(); send({type:"keep"}); showInfo("\u2713 Changes kept."); clearAllDiffDecorations(); modifiedFiles.clear(); const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); await refreshTree(); await fetchGitStatus(); if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); }},
-            { label: `\u2715 Revert All (${fileCount} file${fileCount !== 1 ? "s" : ""})`, cls: "danger", onClick: async () => { hideActionBar(); send({type:"revert"}); showInfo("\u21A9 Reverted " + fileCount + " file(s)."); clearAllDiffDecorations(); modifiedFiles.clear(); const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); await refreshTree(); await fetchGitStatus(); if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); reloadAllModifiedFiles(); }},
+            { label: `Keep`, cls: "success", onClick: async () => { hideActionBar(); send({type:"keep"}); showInfo("\u2713 Changes kept."); clearAllDiffDecorations(); modifiedFiles.clear(); fileChangesThisSession.clear(); const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); await refreshTree(); await fetchGitStatus(); if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); updateFileChangesDropdown(); }},
+            { label: `Revert`, cls: "danger", onClick: async () => { hideActionBar(); send({type:"revert"}); showInfo("\u21A9 Reverted " + fileCount + " file(s)."); clearAllDiffDecorations(); modifiedFiles.clear(); fileChangesThisSession.clear(); const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); await refreshTree(); await fetchGitStatus(); if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); updateFileChangesDropdown(); reloadAllModifiedFiles(); }},
         ]);
         scrollChat();
     }
@@ -3596,29 +4138,43 @@
         ta.focus();
     }
     function showPhase(name) {
+        if (name === "direct") return; // no indicator needed — output speaks for itself
         const bubble = getOrCreateBubble();
         const div = document.createElement("div"); div.className = "phase-indicator"; div.id = `phase-${name}`;
-        div.innerHTML = `<div class="spinner"></div><span>${escapeHtml(phaseLabel(name))}</span>`;
+        div.innerHTML = `<span class="phase-label">${escapeHtml(phaseLabel(name))}</span>`;
         bubble.appendChild(div);
         scrollChat();
     }
     function endPhase(name, elapsed) {
         const el = document.getElementById(`phase-${name}`);
-        if (el) { el.classList.add("done"); el.querySelector("span").textContent = `${phaseLabel(name)} \u2014 ${elapsed}s`; }
+        if (el) {
+            el.classList.add("done");
+            const lbl = el.querySelector(".phase-label");
+            if (lbl) lbl.textContent = `${phaseDoneLabel(name)} \u2014 ${elapsed}s`;
+        }
     }
     function phaseLabel(n) { return {plan:"Planning\u2026",build:"Building\u2026",direct:"Running\u2026"}[n]||n; }
+    function phaseDoneLabel(n) { return {plan:"Planned",build:"Built",direct:"Completed"}[n]||n; }
 
     function showScoutProgress(text) {
         if (!scoutEl) {
             const bubble = getOrCreateBubble();
             scoutEl = document.createElement("div"); scoutEl.className = "scout-block";
-            scoutEl.innerHTML = `<div class="spinner"></div><span></span>`;
+            scoutEl.innerHTML = `<span class="scout-text"></span>`;
             bubble.appendChild(scoutEl);
         }
-        scoutEl.querySelector("span").textContent = text || "Scanning\u2026";
+        const textEl = scoutEl.querySelector(".scout-text");
+        if (textEl) textEl.textContent = text || "Scanning\u2026";
         scrollChat();
     }
-    function endScout() { if (scoutEl) { scoutEl.querySelector(".spinner")?.remove(); scoutEl.querySelector("span").textContent = "\u2713 Scan complete"; scoutEl = null; } }
+    function endScout() {
+        if (scoutEl) {
+            scoutEl.classList.add("scout-done");
+            const textEl = scoutEl.querySelector(".scout-text");
+            if (textEl) textEl.textContent = "\u2713 Scan complete";
+            scoutEl = null;
+        }
+    }
 
     // ================================================================
     // WEBSOCKET — with exponential backoff and reconnect banner
@@ -3638,14 +4194,17 @@
         return delay + jitter;
     }
 
-    function _showReconnectBanner() {
+    function _showReconnectBanner(msg) {
         let banner = document.getElementById("reconnect-banner");
         if (!banner) {
             banner = document.createElement("div");
             banner.id = "reconnect-banner";
-            banner.innerHTML = '<span class="reconnect-spinner"></span> Connection lost. Reconnecting...';
             $chatMessages.parentElement.insertBefore(banner, $chatMessages);
         }
+        banner.innerHTML = '<span class="reconnect-spinner"></span> ' +
+            (msg || (isRunning
+                ? "Connection lost. Reconnecting — agent is still working on the server…"
+                : "Connection lost. Reconnecting..."));
         banner.style.display = "flex";
     }
 
@@ -3732,6 +4291,10 @@
     function handleEvent(evt) {
         switch (evt.type) {
             case "init": {
+                // Always reset running state on init — if the agent is still
+                // running on the server, the "resumed" event (sent right after
+                // replay) will set it back to true.
+                setRunning(false);
                 $modelName.textContent = evt.model_name || "?";
                 currentSessionId = evt.session_id || currentSessionId;
                 persistSessionId(currentSessionId);
@@ -3847,16 +4410,24 @@
                             const path = runEl.dataset.path;
                             if (path && evt.data?.success !== false) {
                                 reloadFileInEditor(path);
+                                // Count actual lines added/deleted
+                                const inputData = runEl._toolInput || {};
                                 if (isWrite) {
-                                    trackFileChange(path, 1, 0);
+                                    const contentLines = (inputData.content || "").split('\n').length;
+                                    trackFileChange(path, contentLines, 0);
                                 } else {
-                                    const oldLines = (runEl.dataset.oldContent || "").split('\n').length;
-                                    const newLines = (runEl.dataset.newContent || "").split('\n').length;
-                                    const edits = Math.max(1, Math.abs(newLines - oldLines) || 1);
-                                    const deletions = oldLines > newLines ? oldLines - newLines : 0;
-                                    trackFileChange(path, edits, deletions);
+                                    const oldStr = inputData.old_string || "";
+                                    const newStr = inputData.new_string || "";
+                                    const oldLineCount = oldStr ? oldStr.split('\n').length : 0;
+                                    const newLineCount = newStr ? newStr.split('\n').length : 0;
+                                    trackFileChange(path, newLineCount, oldLineCount);
                                 }
                             }
+                        }
+                        // Detect file deletions from Bash commands
+                        if (tn === "Bash" && evt.data?.success !== false) {
+                            const inputData = runEl._toolInput || {};
+                            detectFileDeletesFromBash(inputData.command, evt.content || "");
                         }
                     }
                 }
@@ -3969,19 +4540,23 @@
                 hideActionBar();
                 clearAllDiffDecorations();
                 modifiedFiles.clear();
+                fileChangesThisSession.clear();
                 { const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); }
                 showInfo("\u2713 Changes kept.");
                 refreshTree();
                 fetchGitStatus().then(() => { if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); });
+                updateFileChangesDropdown();
                 break;
             case "reverted":
                 hideActionBar();
                 clearAllDiffDecorations();
                 modifiedFiles.clear();
+                fileChangesThisSession.clear();
                 { const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); }
                 showInfo("\u21A9 Reverted " + (evt.files || []).length + " file(s).");
                 refreshTree();
                 fetchGitStatus().then(() => { if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); });
+                updateFileChangesDropdown();
                 reloadAllModifiedFiles();
                 break;
             case "clear_keep_revert":
@@ -4040,6 +4615,12 @@
                 clearPendingImages();
                 hideActionBar(); modifiedFiles.clear(); refreshTree();
                 break;
+            case "session_name_update":
+                if ($conversationTitle && evt.session_name) {
+                    $conversationTitle.textContent = evt.session_name;
+                }
+                loadAgentSessions();
+                break;
             case "error": showError(evt.content || "Unknown error"); setRunning(false); break;
             case "stream_retry": case "stream_recovering": showInfo(evt.content || "Recovering\u2026"); break;
             case "stream_failed": showError(evt.content || "Stream failed."); setRunning(false); break;
@@ -4064,7 +4645,7 @@
                 break;
             case "replay_thinking": {
                 const rt = createThinkingBlock();
-                rt.textContent = evt.content || "";
+                _thinkingBuffer = evt.content || "";
                 finishThinking(rt);
                 break;
             }
@@ -4072,7 +4653,8 @@
                 lastToolBlock = addToolCall(
                     evt.data?.name || "tool",
                     evt.data?.input || {},
-                    evt.data?.id || evt.data?.tool_use_id || null
+                    evt.data?.id || evt.data?.tool_use_id || null,
+                    { stream: false }
                 );
                 break;
             case "replay_tool_result":
@@ -4084,7 +4666,21 @@
                         const isWrite = tn === "Write" || tn === "write_file";
                         const isEdit = tn === "Edit" || tn === "edit_file" || tn === "symbol_edit";
                         if ((isWrite || isEdit) && runEl.dataset.path) {
-                            trackFileChange(runEl.dataset.path, isWrite ? 1 : 1, isWrite ? 0 : 0);
+                            const inputData = runEl._toolInput || {};
+                            if (isWrite) {
+                                const contentLines = (inputData.content || "").split('\n').length;
+                                trackFileChange(runEl.dataset.path, contentLines, 0);
+                            } else {
+                                const oldStr = inputData.old_string || "";
+                                const newStr = inputData.new_string || "";
+                                const oldLineCount = oldStr ? oldStr.split('\n').length : 0;
+                                const newLineCount = newStr ? newStr.split('\n').length : 0;
+                                trackFileChange(runEl.dataset.path, newLineCount, oldLineCount);
+                            }
+                        }
+                        if (tn === "Bash") {
+                            const inputData = runEl._toolInput || {};
+                            detectFileDeletesFromBash(inputData.command, evt.content || "");
                         }
                     }
                     if (evt.data?.tool_use_id) toolRunById.delete(String(evt.data.tool_use_id));
@@ -4092,6 +4688,18 @@
                 lastToolBlock = null;
                 break;
             case "replay_done":
+                scrollChat();
+                break;
+            case "resumed":
+                // Server reconnected us to a running (or just-finished) agent session
+                _hideReconnectBanner();
+                if (evt.agent_running) {
+                    setRunning(true);
+                    showInfo("Reconnected — agent is still working…");
+                } else {
+                    setRunning(false);
+                    showInfo("Reconnected — agent has finished.");
+                }
                 scrollChat();
                 break;
             case "replay_state":
@@ -4110,8 +4718,8 @@
                         showDiffs(evt.diffs, true);
                     } else {
                         showActionBar([
-                            { label: "\u2713 Keep All", cls: "primary", onClick: () => { hideActionBar(); send({ type: "keep" }); }},
-                            { label: "\u21A9 Revert All", cls: "danger", onClick: () => { hideActionBar(); send({ type: "revert" }); }},
+                            { label: "Keep", cls: "success", onClick: () => { hideActionBar(); send({ type: "keep" }); fileChangesThisSession.clear(); updateFileChangesDropdown(); }},
+                            { label: "Revert", cls: "danger", onClick: () => { hideActionBar(); send({ type: "revert" }); fileChangesThisSession.clear(); updateFileChangesDropdown(); }},
                         ]);
                     }
                     showInfo("You have pending file changes from a previous session.");
@@ -4120,8 +4728,8 @@
 
             // ── External file changes ──
             case "file_changed":
-                // Refresh file tree entry and reload file in editor if open
-                refreshTree();
+                // Skip tree refresh while agent is running — its own tool_result events handle updates
+                if (!isRunning) refreshTree();
                 if (typeof monacoInstance !== "undefined" && monacoInstance) {
                     const model = monacoInstance.getModel();
                     if (model && evt.path && model.uri.path.endsWith(evt.path)) {

@@ -303,7 +303,36 @@ For tasks with 3+ distinct steps, use TodoWrite to create a checklist at the sta
 - Don't add code that wasn't requested (extra features, cleanup, docs).
 - Don't use Bash for file operations — use specialized tools.
 - If uncertain about the user's intent, ask via AskUserQuestion with structured options.
-</guardrails>"""
+</guardrails>
+
+<analytical_reasoning>
+When the user asks you to analyze, review, investigate, or assess something (not just write code):
+
+APPROACH:
+- Be exhaustive. Enumerate ALL findings, not just the first or most obvious one.
+- Complete the analysis BEFORE proposing action items. Diagnosis comes before prescription.
+- State what IS there, what IS NOT there, and what SHOULD be there. Gaps are as important as findings.
+
+STRUCTURE:
+- Use tables to compare items, map requirements to implementations, or show coverage gaps.
+- Use numbered lists for sequential findings or prioritized recommendations.
+- Categorize findings into clear sections (e.g. "Current State", "Gaps", "Recommendations").
+- When comparing approaches, list trade-offs explicitly — not just pros, but cons and constraints.
+
+TEST COVERAGE AND AUDITS:
+- Map each requirement or decision to the specific test/code that validates it.
+- Explicitly call out requirements with ZERO coverage — these are the most important findings.
+- Distinguish between "tested", "partially tested", and "not tested at all".
+
+COMPLETENESS:
+- If a thread or discussion raises N distinct concerns, your analysis MUST address every single one. Number them and check them off. Missing even one means the analysis is incomplete.
+- When the user shares a conversation with multiple participants, each person's concern is a separate item to address. Trace each concern to whether it's covered.
+- For multi-step workflows (e.g. import -> modify -> export), analyze EACH transition, not just the first step. Round-trip behavior and intermediate mutations are where bugs hide.
+
+QUALITY BAR:
+- Your analysis should be thorough enough that someone could act on it without asking follow-up questions.
+- If you find related issues the user didn't ask about, mention them briefly at the end.
+</analytical_reasoning>"""
 
 # --- Language-Specific Modules ---
 
@@ -510,6 +539,17 @@ def classify_intent(task: str, service=None) -> Dict[str, Any]:
         if text.startswith("```"):
             text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         import json as _json
+        # Extract first JSON object if LLM returned extra text
+        brace_start = text.find("{")
+        if brace_start >= 0:
+            depth, end = 0, brace_start
+            for i in range(brace_start, len(text)):
+                if text[i] == "{": depth += 1
+                elif text[i] == "}": depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+            text = text[brace_start:end]
         result = _json.loads(text)
         complexity = result.get("complexity", "simple")
         if complexity not in ("trivial", "simple", "complex"):
@@ -667,6 +707,7 @@ class CodingAgent:
         self._session_checkpoints = []
         self._checkpoint_counter = 0
         self._deterministic_verification_done = False
+        self._verification_gate_attempts = 0
         self._current_plan_decomposition = []
         self._plan_file_path = None
         self._plan_text = ""
@@ -1442,19 +1483,32 @@ class CodingAgent:
 
     def revert_all(self) -> List[str]:
         """Revert all modified files to their original content.
-        Returns a list of reverted file paths.
-        Snapshot keys are in backend-resolved form (absolute path); backend methods accept them as-is."""
+        - Created file (snapshot None or {created, content}): remove if present; if already
+          deleted by agent, restore the created content so 'Revert' brings the file back.
+        - Modified file (snapshot str): write back original content.
+        Returns a list of reverted file paths."""
         reverted = []
         for abs_path, original in self._file_snapshots.items():
             try:
+                created_with_content = isinstance(original, dict) and original.get("created") and "content" in original
                 if original is None:
-                    # File was created by the agent — delete it
+                    # Legacy: file was created, we don't have content — just delete if present
                     if self.backend.file_exists(abs_path):
                         self.backend.remove_file(abs_path)
                         reverted.append(abs_path)
-                else:
-                    self.backend.write_file(abs_path, original)
+                elif created_with_content:
+                    # Created file with stored content: if still exists, delete; else restore
+                    content = original["content"]
+                    if self.backend.file_exists(abs_path):
+                        self.backend.remove_file(abs_path)
+                    else:
+                        self.backend.write_file(abs_path, content)
                     reverted.append(abs_path)
+                else:
+                    # Modified file — restore original content
+                    if isinstance(original, str):
+                        self.backend.write_file(abs_path, original)
+                        reverted.append(abs_path)
             except Exception as e:
                 logger.error(f"Failed to revert {abs_path}: {e}")
         self._file_snapshots = {}
@@ -1495,7 +1549,16 @@ class CodingAgent:
         for path, content in self._file_snapshots.items():
             if content is None:
                 snapshots[path] = None  # new file marker
-            elif len(content) < 1_000_000:
+            elif isinstance(content, dict) and content.get("created") and "content" in content:
+                # Created file with content (so Revert can restore if deleted)
+                raw = content["content"]
+                if isinstance(raw, str) and len(raw) < 1_000_000:
+                    try:
+                        raw.encode("utf-8")
+                        snapshots[path] = content
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        pass
+            elif isinstance(content, str) and len(content) < 1_000_000:
                 try:
                     content.encode("utf-8")  # verify it's text
                     snapshots[path] = content
@@ -3575,6 +3638,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         if not self._file_snapshots:
             self._file_snapshots = {}  # fresh snapshot tracking per build
         self._deterministic_verification_done = False
+        self._verification_gate_attempts = 0
 
         await on_event(AgentEvent(type="phase_start", content="build"))
 
@@ -3670,66 +3734,65 @@ Keep the whole response under 300 words. If the request is already very clear an
         so the model can re-read files, run lints, and fix issues."""
         if self._cancelled:
             return
-        # Only verify if there are modified files to check
+        if self._deterministic_verification_done:
+            return
+        # Only verify if there are modified files that still exist to check
         if not self._file_snapshots:
             return
 
-        modified = list(self._file_snapshots.keys())
+        modified = [f for f in self._file_snapshots.keys() if os.path.isfile(f)]
+        if not modified:
+            # All modified files were deleted (intentionally) — nothing to verify
+            self._deterministic_verification_done = True
+            return
+
+        # Skip heavy verification for trivial changes (1-2 small files)
+        def _snap_len(v):
+            if isinstance(v, str): return len(v)
+            if isinstance(v, dict) and "content" in v: return len(v["content"])
+            return 0
+        total_snapshot_size = sum(_snap_len(self._file_snapshots.get(f)) for f in modified)
+        is_trivial = len(modified) <= 2 and total_snapshot_size < 500
+
         files_str = ", ".join(os.path.basename(f) for f in modified[:10])
         if len(modified) > 10:
             files_str += f" (+{len(modified) - 10} more)"
 
-        # ── Test impact selection for modified files ──
-        test_files_found = self._select_impacted_tests(modified)
-        test_section = ""
-        if test_files_found:
-            test_section = (
-                f"\n\nImpacted tests selected:\n"
-                + "\n".join(f"  - {tf}" for tf in test_files_found[:10])
-                + "\nRun these impacted tests first, then run broader suite if needed."
+        if is_trivial:
+            verify_msg = (
+                f"Quick verification — Modified files: {files_str}\n\n"
+                "Run lint_file on changed files. If clean, confirm the task is complete. "
+                "Do NOT re-implement or re-do anything — the task is done. "
+                "Just verify and report briefly."
             )
+            max_extra_iters = 3
+        else:
+            # ── Test impact selection for modified files ──
+            test_files_found = self._select_impacted_tests(modified)
+            test_section = ""
+            if test_files_found:
+                test_section = (
+                    f"\n\nImpacted tests selected:\n"
+                    + "\n".join(f"  - {tf}" for tf in test_files_found[:10])
+                    + "\nRun these impacted tests first, then run broader suite if needed."
+                )
 
-        verify_msg = (
-            f"🔍 **DEEP VERIFICATION PASS** — Modified files: {files_str}\n\n"
-            
-            "This is your quality gate. Think through EACH step methodically:\n\n"
-            
-            "**STEP 1: Code Review with Fresh Eyes**\n"
-            "- Re-read each modified file AS IF you didn't write it\n"
-            "- Look for: typos, missing imports, incorrect variable names, logic errors\n"
-            "- Check: does this ACTUALLY implement what the plan asked for?\n"
-            "- Trace execution paths: what happens on success vs failure?\n\n"
-            
-            "**STEP 2: Static Analysis & Linting**\n"
-            "- Run lint_file on each changed file\n"
-            "- Fix ALL errors and warnings — don't tolerate \"minor\" issues\n"
-            "- Think: what would a security-conscious reviewer flag?\n\n"
-            
-            f"**STEP 3: Test Coverage & Validation**{test_section}\n"
-            "- Run relevant tests first, then broader suite if needed\n"
-            "- Think: what edge cases am I NOT testing?\n"
-            "- Consider: backward compatibility, performance, error handling\n\n"
-            
-            "**STEP 4: Deep Reasoning Check**\n"
-            "- Review original requirement: did I solve the RIGHT problem?\n"
-            "- Check plan completeness: did I miss any steps or requirements?\n"
-            "- Think about production: what could break in real usage?\n"
-            "- Imagine you're debugging this at 2 AM — is it clear and robust?\n\n"
-            
-            "**STEP 5: Assessment & Report**\n"
-            "- Briefly report: what you verified, results, any concerns\n"
-            "- Flag anything you're uncertain about or that needs review\n"
-            "- Be honest about confidence -- it's better to flag uncertainty than hide it\n\n"
-            
-            "**THINK DEEPLY**: Use your extended thinking budget for this verification.\n"
-            "A shipped bug costs exponentially more than thorough verification now.\n"
-            "Do NOT skip steps or rush through this."
-        )
+            verify_msg = (
+                f"Verification pass — Modified files: {files_str}\n\n"
+                "1. Re-read each modified file and check for typos, missing imports, logic errors\n"
+                "2. Run lint_file on each changed file and fix any errors\n"
+                f"3. Run relevant tests if applicable{test_section}\n"
+                "4. Briefly confirm the task is complete or flag concerns\n\n"
+                "IMPORTANT: Do NOT re-implement anything. The task is done. "
+                "This is only a lint-and-review pass. If everything looks good, just say so and stop."
+            )
+            max_extra_iters = 8
+
         self.history.append({"role": "user", "content": verify_msg})
+        self._deterministic_verification_done = True
 
-        # Run one more iteration of the loop for verification
         saved_max = self.max_iterations
-        self.max_iterations = saved_max + 20  # give headroom for verify loop
+        self.max_iterations = saved_max + max_extra_iters
         await self._agent_loop(on_event, request_approval, config, request_question_answer=request_question_answer)
         self.max_iterations = saved_max
 
@@ -3746,6 +3809,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         enable_scout: bool = True,
         user_images: Optional[List[Dict[str, Any]]] = None,
         preserve_snapshots: bool = False,
+        request_question_answer: Optional[Callable[..., Awaitable[str]]] = None,
     ):
         """
         Run the agent on a task. If plan phase is enabled, this is called
@@ -3759,6 +3823,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         if not preserve_snapshots:
             self._file_snapshots = {}  # fresh snapshot tracking per run
         self._deterministic_verification_done = False
+        self._verification_gate_attempts = 0
 
         # Run scout for first message — controlled by intent classification
         scout_context = None
@@ -3780,7 +3845,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         # Add user message
         self.history.append({"role": "user", "content": self._compose_user_content(user_content, user_images)})
 
-        await self._agent_loop(on_event, request_approval, config)
+        await self._agent_loop(on_event, request_approval, config, request_question_answer=request_question_answer)
 
     def _extract_assistant_text(self, assistant_content: List[Dict[str, Any]]) -> str:
         """Concatenate assistant text blocks for lightweight output validation."""
@@ -4302,9 +4367,9 @@ Keep the whole response under 300 words. If the request is already very clear an
         4. Quality assessment (coverage, complexity, security)
         5. Confidence scoring and adaptive thresholds
         """
-        modified_abs = list(self._file_snapshots.keys())
+        modified_abs = [f for f in self._file_snapshots.keys() if os.path.isfile(f)]
         if not modified_abs:
-            return True, "No modified files."
+            return True, "No modified files (or all deleted)."
 
         # Try progressive verification first (with fallback to legacy)
         try:
@@ -4883,42 +4948,49 @@ Keep the whole response under 300 words. If the request is already very clear an
                 else:
                     reasoning_trace_repairs = 0
 
-                # Deterministic verification gate before done
+                # Deterministic verification gate before done (max 2 attempts)
+                if not hasattr(self, '_verification_gate_attempts'):
+                    self._verification_gate_attempts = 0
                 if (
                     app_config.deterministic_verification_gate
                     and self._file_snapshots
                     and not self._deterministic_verification_done
+                    and self._verification_gate_attempts < 2
                 ):
-                    gate_ok, gate_summary = await self._run_deterministic_verification_gate(on_event)
-                    if not gate_ok:
+                    # Only verify files that still exist on disk
+                    existing_snapshots = {k: v for k, v in self._file_snapshots.items() if os.path.isfile(k)}
+                    if not existing_snapshots:
+                        # All tracked files were deleted — nothing to verify
+                        self._deterministic_verification_done = True
+                    else:
+                        gate_ok, gate_summary = await self._run_deterministic_verification_gate(on_event)
+                        self._verification_gate_attempts += 1
+                        if not gate_ok and self._verification_gate_attempts < 2:
+                            self.history.append({
+                                "role": "user",
+                                "content": (
+                                    "[SYSTEM] Verification found issues. Try to fix them, but if the issues "
+                                    "are pre-existing or unrelated to your changes, just confirm the task is "
+                                    "complete and move on. Do NOT loop — one fix attempt only.\n\n"
+                                    + gate_summary
+                                ),
+                            })
+                            await on_event(AgentEvent(
+                                type="stream_recovering",
+                                content="Verification found issues — one fix attempt...",
+                            ))
+                            continue
+                        # Either passed or exhausted attempts — proceed
+                        self._deterministic_verification_done = True
                         self.history.append({
                             "role": "user",
                             "content": (
-                                "[SYSTEM] Deterministic verification gate failed. "
-                                "Fix all issues below before finishing.\n\n"
-                                "If the failure is due to something the user explicitly asked for (not your mistake), "
-                                "do not silently revert or override their request. Use AskUserQuestion to explain "
-                                "the conflict and offer the user clear choices via the 'options' array so they can "
-                                "select or type their preference. Only fix by changing code when the failure is due "
-                                "to your own error.\n\n"
+                                "[SYSTEM] Verification complete:\n\n"
                                 + gate_summary
+                                + "\n\nProvide final completion update and finish."
                             ),
                         })
-                        await on_event(AgentEvent(
-                            type="stream_recovering",
-                            content="Deterministic verification failed — requesting fixes...",
-                        ))
                         continue
-                    self._deterministic_verification_done = True
-                    self.history.append({
-                        "role": "user",
-                        "content": (
-                            "[SYSTEM] Deterministic verification gate passed:\n\n"
-                            + gate_summary
-                            + "\n\nProvide final completion update (with structured reasoning trace headings) and finish."
-                        ),
-                    })
-                    continue
 
                 # No tool calls — agent is done
                 ctx_est = self._current_token_estimate()
@@ -5428,6 +5500,19 @@ Keep the whole response under 300 words. If the request is already very clear an
 
                             # Invalidate file cache after successful write
                             self._file_cache.pop(self._file_cache_key(path), None)
+
+                            # If this was a created file (snapshot was None), store content
+                            # so Revert can bring the file back if the agent later deletes it
+                            if tu["name"] == "Write" and path:
+                                abs_path = self.backend.resolve_path(path)
+                                if self._file_snapshots.get(abs_path) is None:
+                                    written = tu["input"].get("content", "")
+                                    if isinstance(written, str) and len(written) < 1_000_000:
+                                        try:
+                                            written.encode("utf-8")
+                                            self._file_snapshots[abs_path] = {"created": True, "content": written}
+                                        except (UnicodeDecodeError, UnicodeEncodeError):
+                                            pass
 
                         results.append((tu, result))
                         if not result.success:
