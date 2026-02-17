@@ -28,7 +28,7 @@ from rich.markdown import Markdown
 from rich.markup import escape as rich_escape
 
 from bedrock_service import BedrockService, BedrockError
-from agent import CodingAgent, AgentEvent, BUILD_SYSTEM_PROMPT, classify_intent
+from agent import CodingAgent, AgentEvent, _compose_system_prompt, AVAILABLE_TOOL_NAMES, classify_intent
 from sessions import SessionStore, Session
 from config import (
     get_model_name, get_model_config, model_config, app_config,
@@ -661,7 +661,7 @@ class BedrockCodexApp(App):
                     self.working_directory = new_dir
                     if self._agent:
                         self._agent.working_directory = new_dir
-                        self._agent.system_prompt = BUILD_SYSTEM_PROMPT.format(working_directory=new_dir)
+                        self._agent.system_prompt = _compose_system_prompt("direct", new_dir, AVAILABLE_TOOL_NAMES)
                     self._log(Text(f"   \u2713 {new_dir}", style="#3fb950"))
                     self._update_status()
                 else:

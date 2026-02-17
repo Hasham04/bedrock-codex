@@ -109,6 +109,165 @@ def _chunk_js_ts(content: str) -> List[Tuple[int, int, str, str]]:
     return chunks
 
 
+def _chunk_java(content: str) -> List[Tuple[int, int, str, str]]:
+    """Regex-based Java chunking: classes, interfaces, enums, records, methods."""
+    chunks = []
+    lines = content.splitlines()
+
+    # Match top-level and nested type declarations
+    type_pattern = re.compile(
+        r"^\s*(?:(?:public|protected|private|abstract|static|final|sealed|non-sealed)\s+)*"
+        r"(?:class|interface|enum|record|@interface)\s+(\w+)",
+        re.MULTILINE,
+    )
+    # Match method signatures
+    method_pattern = re.compile(
+        r"^\s*(?:(?:public|protected|private|abstract|static|final|synchronized|native|default)\s+)*"
+        r"(?:<[^>]+>\s+)?(?:\w[\w.<>,\[\]\s]*?)\s+(\w+)\s*\([^)]*\)\s*(?:throws\s+[\w,.\s]+)?\s*\{",
+        re.MULTILINE,
+    )
+
+    def _find_block_end(start_idx: int) -> int:
+        """Find closing brace for a block starting at start_idx (0-based line index)."""
+        depth = 0
+        for i in range(start_idx, min(start_idx + 500, len(lines))):
+            line = lines[i]
+            # Rough brace counting (ignores strings/comments, good enough for chunking)
+            depth += line.count("{") - line.count("}")
+            if depth <= 0 and i > start_idx:
+                return i + 1
+        return min(start_idx + 100, len(lines))
+
+    # Collect type-level chunks
+    for m in type_pattern.finditer(content):
+        start = content[:m.start()].count("\n")
+        name = m.group(1)
+        kind_match = re.search(r"(class|interface|enum|record|@interface)", m.group(0))
+        kind = kind_match.group(1) if kind_match else "class"
+        end = _find_block_end(start)
+        chunks.append((start + 1, end, kind, name))
+
+    # Collect method-level chunks
+    for m in method_pattern.finditer(content):
+        start = content[:m.start()].count("\n")
+        name = m.group(1)
+        end = _find_block_end(start)
+        # Only add if not entirely contained in a type chunk
+        chunks.append((start + 1, end, "method", name))
+
+    # Deduplicate and merge overlapping
+    if chunks:
+        chunks.sort(key=lambda c: (c[0], -c[1]))
+        deduped = [chunks[0]]
+        for c in chunks[1:]:
+            prev = deduped[-1]
+            # Skip if fully contained in previous
+            if c[0] >= prev[0] and c[1] <= prev[1] and c[2] == prev[2]:
+                continue
+            deduped.append(c)
+        chunks = deduped
+
+    if not chunks:
+        for i in range(0, len(lines), 40):
+            chunks.append((i + 1, min(i + 40, len(lines)), "block", ""))
+
+    return chunks
+
+
+# ============================================================
+# Import tracking
+# ============================================================
+
+def extract_imports(path: str, content: str) -> List[str]:
+    """Extract import statements from a file. Returns a list of imported module/class names.
+
+    Supports Python (import X, from X import Y) and Java (import com.example.X).
+    """
+    ext = Path(path).suffix.lower()
+    imports: List[str] = []
+
+    if ext == ".py":
+        try:
+            tree = ast.parse(content)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imports.append(alias.name)
+                elif isinstance(node, ast.ImportFrom):
+                    module = node.module or ""
+                    for alias in node.names:
+                        imports.append(f"{module}.{alias.name}" if module else alias.name)
+        except SyntaxError:
+            # Fallback: regex
+            for m in re.finditer(r"^\s*(?:from\s+([\w.]+)\s+)?import\s+([\w., ]+)", content, re.MULTILINE):
+                from_mod = m.group(1) or ""
+                names = [n.strip().split(" as ")[0] for n in m.group(2).split(",")]
+                for n in names:
+                    imports.append(f"{from_mod}.{n}" if from_mod else n)
+
+    elif ext == ".java":
+        for m in re.finditer(r"^\s*import\s+(?:static\s+)?([\w.]+)\s*;", content, re.MULTILINE):
+            imports.append(m.group(1))
+
+    elif ext in (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"):
+        # ES6: import X from 'Y' / import { X } from 'Y' / require('Y')
+        for m in re.finditer(r"(?:import\s+.*?from\s+['\"]([^'\"]+)['\"]|require\(['\"]([^'\"]+)['\"]\))", content):
+            imports.append(m.group(1) or m.group(2))
+
+    return imports
+
+
+def build_import_graph(file_imports: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Build a reverse import graph: for each module/file, list files that import it.
+
+    file_imports: {file_path: [imported_module_names]}
+    Returns: {module_or_stem: [file_paths_that_import_it]}
+    """
+    reverse: Dict[str, List[str]] = {}
+    for fpath, imps in file_imports.items():
+        for imp in imps:
+            # Normalize: take last component as a short name
+            short = imp.rsplit(".", 1)[-1] if "." in imp else imp
+            reverse.setdefault(imp, []).append(fpath)
+            if short != imp:
+                reverse.setdefault(short, []).append(fpath)
+    return reverse
+
+
+def get_dependency_neighborhood(
+    file_path: str,
+    file_imports: Dict[str, List[str]],
+    reverse_imports: Dict[str, List[str]],
+    max_neighbors: int = 8,
+) -> List[str]:
+    """Get 1-hop dependency neighborhood: files that `file_path` imports + files that import `file_path`.
+
+    Returns up to max_neighbors file paths (excluding self).
+    """
+    neighbors: set = set()
+
+    # Forward: files this file imports
+    direct_imports = file_imports.get(file_path, [])
+    stem = Path(file_path).stem
+
+    for imp in direct_imports:
+        # Try to find a matching file by import name
+        short = imp.rsplit(".", 1)[-1] if "." in imp else imp
+        for candidate_path in file_imports:
+            cand_stem = Path(candidate_path).stem
+            if cand_stem == short or cand_stem == imp:
+                neighbors.add(candidate_path)
+
+    # Reverse: files that import this file
+    for key in [stem, file_path]:
+        for importer in reverse_imports.get(key, []):
+            if importer != file_path:
+                neighbors.add(importer)
+
+    neighbors.discard(file_path)
+    return sorted(neighbors)[:max_neighbors]
+
+
 def chunk_file(path: str, content: str) -> List[CodeChunk]:
     """Split file into semantic chunks. Path is relative to workspace."""
     ext = Path(path).suffix.lower()
@@ -116,6 +275,8 @@ def chunk_file(path: str, content: str) -> List[CodeChunk]:
         ranges = _chunk_python(content)
     elif ext in (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"):
         ranges = _chunk_js_ts(content)
+    elif ext == ".java":
+        ranges = _chunk_java(content)
     else:
         # Generic: 40-line windows
         lines = content.splitlines()
@@ -142,12 +303,14 @@ def chunk_file(path: str, content: str) -> List[CodeChunk]:
     return out
 
 
-def _should_index(path: str) -> bool:
+def _should_index(path: str, gitignore_spec=None) -> bool:
     rel = path.replace("\\", "/")
     parts = rel.split("/")
     if any(p in INDEX_SKIP_DIRS for p in parts):
         return False
     if any(rel.endswith(s) for s in INDEX_SKIP_SUFFIXES):
+        return False
+    if gitignore_spec and gitignore_spec.match_file(rel):
         return False
     return True
 
@@ -170,6 +333,9 @@ class CodebaseIndex:
         self.chunks: List[CodeChunk] = []
         self.file_hashes: Dict[str, str] = {}
         self._embeddings_array: Optional[Any] = None
+        # Import tracking
+        self.file_imports: Dict[str, List[str]] = {}
+        self.reverse_imports: Dict[str, List[str]] = {}
 
     def _load_metadata(self) -> None:
         meta_path = os.path.join(self.index_dir, "meta.json")
@@ -178,6 +344,9 @@ class CodebaseIndex:
                 with open(meta_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self.file_hashes = data.get("file_hashes", {})
+                self.file_imports = data.get("file_imports", {})
+                if self.file_imports:
+                    self.reverse_imports = build_import_graph(self.file_imports)
             except Exception as e:
                 logger.debug("Index meta load failed: %s", e)
 
@@ -185,7 +354,10 @@ class CodebaseIndex:
         os.makedirs(self.index_dir, exist_ok=True)
         meta_path = os.path.join(self.index_dir, "meta.json")
         with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump({"file_hashes": self.file_hashes}, f, indent=0)
+            json.dump({
+                "file_hashes": self.file_hashes,
+                "file_imports": self.file_imports,
+            }, f, indent=0)
 
     def _list_indexable_files_remote(self, backend: Any) -> List[str]:
         """List relative paths of indexable files via backend (SSH). BFS over list_dir."""
@@ -226,6 +398,15 @@ class CodebaseIndex:
         """List relative paths of indexable files under working_directory (local or via backend)."""
         if backend is not None and getattr(backend, "_host", None) is not None:
             return self._list_indexable_files_remote(backend)
+
+        # Load .gitignore for filtering
+        gi = None
+        try:
+            from tools import _load_gitignore
+            gi = _load_gitignore(self.working_directory)
+        except Exception:
+            pass
+
         out = []
         try:
             for root, dirs, files in os.walk(self.working_directory):
@@ -234,11 +415,16 @@ class CodebaseIndex:
                 if rel_root.startswith(".bedrock-codex") or ".." in rel_root:
                     dirs.clear()
                     continue
+                # Filter dirs by gitignore
+                if gi:
+                    dirs[:] = [d for d in dirs if not gi.match_file(
+                        (os.path.join(rel_root, d) if rel_root != "." else d).replace("\\", "/") + "/"
+                    )]
                 for f in files:
                     if f.startswith("."):
                         continue
                     rel = os.path.join(rel_root, f).replace("\\", "/")
-                    if not _should_index(rel):
+                    if not _should_index(rel, gi):
                         continue
                     ext = os.path.splitext(f)[1].lower()
                     if f".{ext}" in INDEX_SKIP_EXTENSIONS or ext in ("", ".md", ".txt"):
@@ -290,6 +476,25 @@ class CodebaseIndex:
                 on_progress(i + 1, len(to_index), rel)
             for c in chunk_file(rel, content):
                 all_new_chunks.append(c)
+            # Extract imports
+            try:
+                imps = extract_imports(rel, content)
+                if imps:
+                    self.file_imports[rel] = imps
+            except Exception:
+                pass
+        # Also extract imports from files that didn't change (already indexed)
+        for rel in files:
+            if rel not in reindex_paths and rel not in self.file_imports:
+                try:
+                    content = backend.read_file(rel)
+                    imps = extract_imports(rel, content)
+                    if imps:
+                        self.file_imports[rel] = imps
+                except Exception:
+                    pass
+        # Build reverse import graph
+        self.reverse_imports = build_import_graph(self.file_imports)
         if not all_new_chunks or not self.embed_fn:
             self._save_metadata()
             return len(self.chunks)

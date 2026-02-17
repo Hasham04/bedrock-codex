@@ -10,8 +10,13 @@ import logging
 import re
 import ast
 import contextvars
+import difflib
+import pathlib
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
+from functools import lru_cache
+from typing import Dict, Any, List, Optional, Set, Tuple
+
+import pathspec
 
 from backend import Backend, LocalBackend
 
@@ -32,6 +37,83 @@ class ToolResult:
     success: bool
     output: str
     error: Optional[str] = None
+
+
+# ============================================================
+# .gitignore-aware filtering
+# ============================================================
+
+_ALWAYS_SKIP_DIRS: Set[str] = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "env",
+    ".mypy_cache", ".pytest_cache", ".tox", ".eggs",
+    "dist", "build", ".next", ".nuxt", ".cache",
+    "coverage", ".coverage", "htmlcov", ".bedrock-codex",
+}
+
+_ALWAYS_SKIP_EXTENSIONS: Set[str] = {
+    ".pyc", ".pyo", ".so", ".dylib", ".o", ".a", ".class",
+    ".min.js", ".min.css", ".map", ".lock",
+}
+
+_gitignore_cache: Dict[str, Optional[pathspec.PathSpec]] = {}
+
+
+def _load_gitignore(working_directory: str, backend: Optional[Backend] = None) -> Optional[pathspec.PathSpec]:
+    """Load and cache .gitignore patterns for a project root.
+
+    Works with both local and SSH backends. If backend is provided and is an
+    SSHBackend, reads .gitignore over SSH. Otherwise reads from local filesystem.
+
+    Returns a PathSpec matcher or None if no .gitignore exists.
+    """
+    if working_directory in _gitignore_cache:
+        return _gitignore_cache[working_directory]
+
+    spec = None
+    try:
+        if backend is not None and getattr(backend, "_host", None) is not None:
+            # SSH: read .gitignore via backend
+            try:
+                content = backend.read_file(".gitignore")
+                if content:
+                    spec = pathspec.PathSpec.from_lines("gitwildmatch", content.splitlines())
+            except Exception:
+                pass
+        else:
+            # Local filesystem
+            gitignore_path = os.path.join(working_directory, ".gitignore")
+            if os.path.isfile(gitignore_path):
+                with open(gitignore_path, "r", encoding="utf-8", errors="replace") as f:
+                    spec = pathspec.PathSpec.from_lines("gitwildmatch", f)
+    except Exception as e:
+        logger.debug(f"Failed to parse .gitignore: {e}")
+
+    _gitignore_cache[working_directory] = spec
+    return spec
+
+
+def _is_ignored(rel_path: str, name: str, is_dir: bool,
+                gitignore_spec: Optional[pathspec.PathSpec]) -> bool:
+    """Check if a path should be ignored based on .gitignore + hardcoded skips."""
+    if name in _ALWAYS_SKIP_DIRS and is_dir:
+        return True
+    if not is_dir:
+        _, ext = os.path.splitext(name)
+        if ext in _ALWAYS_SKIP_EXTENSIONS:
+            return True
+    if gitignore_spec:
+        check_path = rel_path + "/" if is_dir else rel_path
+        if gitignore_spec.match_file(check_path):
+            return True
+    return False
+
+
+def invalidate_gitignore_cache(working_directory: Optional[str] = None) -> None:
+    """Clear cached .gitignore specs. Call when .gitignore changes."""
+    if working_directory:
+        _gitignore_cache.pop(working_directory, None)
+    else:
+        _gitignore_cache.clear()
 
 
 # ============================================================
@@ -113,6 +195,19 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
         return ToolResult(success=False, output="", error=str(e))
 
 
+def _compact_diff(old_content: str, new_content: str, path: str, max_lines: int = 60) -> str:
+    """Generate a compact unified diff for display in the tool panel."""
+    old_lines = old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+    diff = list(difflib.unified_diff(old_lines, new_lines, fromfile=path, tofile=path, lineterm=""))
+    if not diff:
+        return ""
+    # Truncate if too long
+    if len(diff) > max_lines:
+        diff = diff[:max_lines] + [f"... ({len(diff) - max_lines} more diff lines)"]
+    return "\n".join(line.rstrip() for line in diff)
+
+
 def write_file(path: str, content: str,
                backend: Optional[Backend] = None, working_directory: str = ".") -> ToolResult:
     """Create a new file or completely overwrite an existing file."""
@@ -121,16 +216,39 @@ def write_file(path: str, content: str,
         return err
     try:
         b = backend or LocalBackend(working_directory)
+        old_content = ""
+        is_new = True
+        try:
+            if b.file_exists(path):
+                old_content = b.read_file(path)
+                is_new = False
+        except Exception:
+            pass
         b.write_file(path, content)
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
-        return ToolResult(success=True, output=f"Wrote {line_count} lines to {path}")
+        summary = f"{'Created' if is_new else 'Wrote'} {line_count} lines to {path}"
+        if is_new:
+            # For new files, show first few lines as a diff
+            preview_lines = content.splitlines()[:30]
+            diff_text = f"--- /dev/null\n+++ {path}\n@@ -0,0 +1,{len(preview_lines)} @@\n"
+            diff_text += "\n".join(f"+{l}" for l in preview_lines)
+            if len(content.splitlines()) > 30:
+                diff_text += f"\n+... ({len(content.splitlines()) - 30} more lines)"
+            return ToolResult(success=True, output=f"{summary}\n{diff_text}")
+        else:
+            diff_text = _compact_diff(old_content, content, path)
+            if diff_text:
+                return ToolResult(success=True, output=f"{summary}\n{diff_text}")
+            return ToolResult(success=True, output=summary)
     except Exception as e:
         return ToolResult(success=False, output="", error=str(e))
 
 
 def edit_file(path: str, old_string: str, new_string: str,
-              backend: Optional[Backend] = None, working_directory: str = ".") -> ToolResult:
-    """Replace an exact string in a file (must match exactly one location)."""
+              backend: Optional[Backend] = None, working_directory: str = ".",
+              replace_all: bool = False) -> ToolResult:
+    """Replace an exact string in a file. By default must match exactly one location.
+    With replace_all=True, replaces every occurrence (useful for renames)."""
     err = _require_path(path)
     if err:
         return err
@@ -142,13 +260,22 @@ def edit_file(path: str, old_string: str, new_string: str,
         count = content.count(old_string)
         if count == 0:
             return ToolResult(success=False, output="",
-                error=f"old_string not found in {path}. Ensure it matches exactly, including whitespace and indentation.")
-        if count > 1:
+                error=f"old_string not found in {path}. Ensure it matches exactly, including whitespace and indentation. Re-read the file to see current content — it may have changed.")
+        if count > 1 and not replace_all:
             return ToolResult(success=False, output="",
-                error=f"Found {count} occurrences of old_string in {path}. Provide more surrounding context to make it unique.")
-        new_content = content.replace(old_string, new_string, 1)
+                error=f"Found {count} occurrences of old_string in {path}. Add more surrounding context to make it unique, or set replace_all=true to replace all {count} occurrences.")
+        if replace_all:
+            new_content = content.replace(old_string, new_string)
+            replaced = count
+        else:
+            new_content = content.replace(old_string, new_string, 1)
+            replaced = 1
         b.write_file(path, new_content)
-        return ToolResult(success=True, output=f"Applied edit to {path}")
+        diff_text = _compact_diff(content, new_content, path)
+        summary = f"Applied edit to {path}" + (f" ({replaced} replacements)" if replaced > 1 else "")
+        if diff_text:
+            return ToolResult(success=True, output=f"{summary}\n{diff_text}")
+        return ToolResult(success=True, output=summary)
     except Exception as e:
         return ToolResult(success=False, output="", error=str(e))
 
@@ -290,7 +417,11 @@ def symbol_edit(path: str, symbol: str, new_string: str, kind: str = "all", occu
             replacement += "\n"
         new_content = before + replacement + after
         b.write_file(path, new_content)
-        return ToolResult(success=True, output=f"Applied symbol_edit to {path} ({symbol}, lines {start}-{end})")
+        diff_text = _compact_diff(content, new_content, path)
+        summary = f"Applied symbol_edit to {path} ({symbol}, lines {start}-{end})"
+        if diff_text:
+            return ToolResult(success=True, output=f"{summary}\n{diff_text}")
+        return ToolResult(success=True, output=summary)
     except Exception as e:
         return ToolResult(success=False, output="", error=str(e))
 
@@ -418,7 +549,7 @@ def find_symbol(symbol: str, kind: str = "all", path: Optional[str] = None, incl
 
 def list_directory(path: Optional[str] = None,
                    backend: Optional[Backend] = None, working_directory: str = ".") -> ToolResult:
-    """List files and directories at a path."""
+    """List files and directories at a path, respecting .gitignore."""
     try:
         b = backend or LocalBackend(working_directory)
         target = path or "."
@@ -427,14 +558,16 @@ def list_directory(path: Optional[str] = None,
             return ToolResult(success=False, output="", error=f"Not a directory: {target}")
 
         entries = b.list_dir(target)
-        skip = {"__pycache__", ".git", "node_modules", "venv", ".venv"}
+        wd = b.working_directory if hasattr(b, 'working_directory') else os.path.abspath(working_directory)
+        gi = _load_gitignore(wd, backend=b)
         lines = []
         for e in entries:
             name = e["name"]
-            if name in skip:
-                lines.append(f"  {name}/ (skipped)")
+            is_dir = e["type"] == "directory"
+            rel = os.path.join(target, name) if target != "." else name
+            if _is_ignored(rel, name, is_dir, gi):
                 continue
-            if e["type"] == "directory":
+            if is_dir:
                 lines.append(f"  {name}/")
             else:
                 size = e.get("size", 0)
@@ -449,10 +582,25 @@ def list_directory(path: Optional[str] = None,
 
 def glob_find(pattern: str,
               backend: Optional[Backend] = None, working_directory: str = ".") -> ToolResult:
-    """Find files matching a glob pattern."""
+    """Find files matching a glob pattern, respecting .gitignore."""
     try:
         b = backend or LocalBackend(working_directory)
-        matches = b.glob_find(pattern, ".")
+        raw_matches = b.glob_find(pattern, ".")
+        wd = b.working_directory if hasattr(b, 'working_directory') else os.path.abspath(working_directory)
+        gi = _load_gitignore(wd, backend=b)
+
+        matches = []
+        for m in raw_matches:
+            name = os.path.basename(m)
+            parts = pathlib.PurePath(m).parts
+            if any(p in _ALWAYS_SKIP_DIRS for p in parts):
+                continue
+            _, ext = os.path.splitext(name)
+            if ext in _ALWAYS_SKIP_EXTENSIONS:
+                continue
+            if gi and gi.match_file(m):
+                continue
+            matches.append(m)
 
         if not matches:
             return ToolResult(success=True, output="No files found matching pattern.")
@@ -460,6 +608,161 @@ def glob_find(pattern: str,
         output = f"Found {len(matches)} match(es):\n" + "\n".join(f"  {m}" for m in matches[:200])
         if len(matches) > 200:
             output += f"\n  ... [{len(matches) - 200} more]"
+        return ToolResult(success=True, output=output)
+    except Exception as e:
+        return ToolResult(success=False, output="", error=str(e))
+
+
+# ============================================================
+# project_tree — recursive, token-budgeted, .gitignore-aware
+# ============================================================
+
+_KEY_CONFIG_FILES: Set[str] = {
+    "package.json", "tsconfig.json", "pyproject.toml", "setup.py", "setup.cfg",
+    "requirements.txt", "Pipfile", "pom.xml", "build.gradle", "build.gradle.kts",
+    "settings.gradle", "Makefile", "Dockerfile", "docker-compose.yml",
+    "docker-compose.yaml", ".env.example", "Cargo.toml", "go.mod",
+    "CMakeLists.txt", "README.md", "AGENTS.md",
+}
+
+
+def _walk_tree(
+    b: Backend,
+    rel: str,
+    gi: Optional[pathspec.PathSpec],
+    max_depth: int,
+    focus_path: Optional[str],
+    depth: int = 0,
+) -> List[Dict[str, Any]]:
+    """Recursively walk the directory tree via Backend, collecting entries.
+
+    Works with both LocalBackend and SSHBackend.
+    Returns a list of dicts: {name, rel, type, children?, file_count?, size?}.
+    Large directories (>50 visible entries) are collapsed unless they are on
+    the focus_path.
+    """
+    target = rel if rel else "."
+    try:
+        entries = b.list_dir(target)
+    except Exception:
+        return []
+
+    dirs_out: List[Dict[str, Any]] = []
+    files_out: List[Dict[str, Any]] = []
+
+    for e in sorted(entries, key=lambda x: x.get("name", "")):
+        name = e.get("name", "")
+        if not name:
+            continue
+        if name.startswith(".") and name not in (".env.example",):
+            continue
+        is_dir = e.get("type") == "directory"
+        child_rel = (rel + "/" + name) if rel else name
+
+        if _is_ignored(child_rel, name, is_dir, gi):
+            continue
+
+        if is_dir:
+            on_focus = focus_path and (
+                focus_path.startswith(child_rel + "/") or focus_path == child_rel
+            )
+            if depth >= max_depth and not on_focus:
+                try:
+                    sub_entries = b.list_dir(child_rel)
+                    count = len([se for se in sub_entries if not se.get("name", "").startswith(".")])
+                except Exception:
+                    count = 0
+                dirs_out.append({"name": name, "rel": child_rel, "type": "directory",
+                                 "collapsed": True, "file_count": count})
+            else:
+                children = _walk_tree(b, child_rel, gi, max_depth, focus_path, depth + 1)
+                child_file_count = sum(
+                    1 for c in children if c["type"] == "file"
+                ) + sum(
+                    c.get("file_count", 0) for c in children if c["type"] == "directory"
+                )
+
+                should_collapse = (
+                    len(children) > 50
+                    and not on_focus
+                    and depth > 0
+                )
+
+                if should_collapse:
+                    dirs_out.append({"name": name, "rel": child_rel, "type": "directory",
+                                     "collapsed": True, "file_count": child_file_count})
+                else:
+                    dirs_out.append({"name": name, "rel": child_rel, "type": "directory",
+                                     "children": children, "file_count": child_file_count})
+        else:
+            _, ext = os.path.splitext(name)
+            if ext in _ALWAYS_SKIP_EXTENSIONS:
+                continue
+            size = e.get("size", 0)
+            files_out.append({"name": name, "rel": child_rel, "type": "file", "size": size})
+
+    return dirs_out + files_out
+
+
+def _render_tree(entries: List[Dict[str, Any]], indent: int = 0, lines: Optional[List[str]] = None,
+                 char_budget: int = 8000) -> List[str]:
+    """Render tree entries into compact indented text lines, respecting a char budget."""
+    if lines is None:
+        lines = []
+    prefix = "  " * indent
+    for e in entries:
+        if sum(len(l) + 1 for l in lines) > char_budget:
+            lines.append(f"{prefix}... (truncated — tree exceeds budget)")
+            break
+        if e["type"] == "directory":
+            if e.get("collapsed"):
+                count = e.get("file_count", 0)
+                lines.append(f"{prefix}{e['name']}/ ({count} items)")
+            else:
+                children = e.get("children", [])
+                count = e.get("file_count", 0)
+                if count > 0:
+                    lines.append(f"{prefix}{e['name']}/ ({count} files)")
+                else:
+                    lines.append(f"{prefix}{e['name']}/")
+                _render_tree(children, indent + 1, lines, char_budget)
+        else:
+            size = e.get("size", 0)
+            name = e["name"]
+            if name in _KEY_CONFIG_FILES:
+                lines.append(f"{prefix}{name} ({_format_size(size)})")
+            elif size > 100_000:
+                lines.append(f"{prefix}{name} ({_format_size(size)})")
+            else:
+                lines.append(f"{prefix}{name}")
+    return lines
+
+
+def project_tree(
+    focus_path: Optional[str] = None,
+    max_depth: int = 4,
+    backend: Optional[Backend] = None,
+    working_directory: str = ".",
+) -> ToolResult:
+    """Build a compact recursive project tree, respecting .gitignore.
+
+    Works with both LocalBackend and SSHBackend.
+    Token-budgeted: output is capped at ~2000 tokens (~8000 chars).
+    Large directories (>50 entries) are collapsed unless they are on the focus_path.
+    """
+    try:
+        b = backend or LocalBackend(working_directory)
+        wd = b.working_directory if hasattr(b, 'working_directory') else working_directory
+        gi = _load_gitignore(wd, backend=b)
+
+        entries = _walk_tree(b, "", gi, max_depth, focus_path)
+        lines = _render_tree(entries, indent=0, char_budget=8000)
+
+        proj_name = os.path.basename(wd) or wd
+        header = f"Project: {proj_name}"
+        if focus_path:
+            header += f"  (focused: {focus_path})"
+        output = header + "\n" + "\n".join(lines)
         return ToolResult(success=True, output=output)
     except Exception as e:
         return ToolResult(success=False, output="", error=str(e))
@@ -555,13 +858,13 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "Read",
-        "description": "Read the contents of a file with line numbers. ALWAYS read a file before editing it — understand existing code before suggesting modifications. For large files (>500 lines), returns a structural overview (imports, classes, functions) plus head/tail. Use offset and limit to read specific sections of large files. **Batch multiple files in ONE request** — they run in parallel (5-12 files per turn is optimal). After semantic_retrieve, use targeted reads with offset/limit.",
+        "description": "Read the contents of a file with line numbers. You MUST read a file before editing it — never propose changes to code you haven't read. For large files (>500 lines), returns a structural overview (imports, classes, functions) plus head/tail; use offset and limit to read specific sections. Batch multiple file reads in ONE request (5-12 files) — they execute in parallel. It is okay to read a file that does not exist; an error will be returned. After semantic_retrieve results, use targeted reads with offset/limit on the returned file paths. NEVER use cat, head, or tail via Bash — always use this tool for reading files.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path (relative to working directory)"},
-                "offset": {"type": "integer", "description": "Starting line number (1-indexed). Optional."},
-                "limit": {"type": "integer", "description": "Number of lines to read. Optional."},
+                "path": {"type": "string", "description": "File path relative to working directory. If the file does not exist, returns an error."},
+                "offset": {"type": "integer", "description": "Starting line number (1-indexed). Use with limit for targeted reading of large files."},
+                "limit": {"type": "integer", "description": "Number of lines to read from offset. Combine with offset for windowed reads."},
             },
             "required": ["path"],
         },
@@ -570,12 +873,12 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "Write",
-        "description": "Create a new file or completely overwrite an existing file. Only use for NEW files or when more than 50% of the file changes. For partial modifications, ALWAYS prefer Edit instead. After writing, use lint_file to verify no syntax errors were introduced.",
+        "description": "Create a new file or completely overwrite an existing file. Shows a diff of changes for existing files. ALWAYS prefer Edit for partial modifications — only use Write for NEW files or when more than 50% of the content changes. NEVER proactively create documentation files (README, CHANGELOG) unless explicitly asked. NEVER write files that contain secrets (.env, credentials). After writing, run lint_file to verify no syntax errors. Creates parent directories automatically if needed. NEVER use echo/heredoc via Bash to create files — always use this tool.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path (relative to working directory)"},
-                "content": {"type": "string", "description": "The full content to write to the file"},
+                "path": {"type": "string", "description": "File path relative to working directory. Parent directories are created if needed."},
+                "content": {"type": "string", "description": "The full content to write. For existing files, a diff is shown."},
             },
             "required": ["path", "content"],
         },
@@ -584,13 +887,14 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "Edit",
-        "description": "Make a targeted edit by replacing an exact string in a file. The old_string must match EXACTLY one location, including all whitespace and indentation. Include 3-5 lines of surrounding context to ensure uniqueness. If it fails with 'multiple occurrences', add more context lines. If it fails with 'not found', re-read the file first to see the current content — it may have changed. After editing, use lint_file to verify no errors were introduced.",
+        "description": "Make a targeted edit by replacing an exact string in a file. The old_string must match EXACTLY one location including all whitespace and indentation. Include 3-5 lines of surrounding context to ensure uniqueness. If it fails with 'multiple occurrences', either add more context lines OR set replace_all=true to replace every occurrence (ideal for renames). If it fails with 'not found', re-read the file — content may have changed. After editing, run lint_file to verify. NEVER use sed/awk — always use this tool.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path (relative to working directory)"},
-                "old_string": {"type": "string", "description": "The exact string to find (must be unique in the file, including whitespace)"},
+                "old_string": {"type": "string", "description": "The exact string to find (must be unique unless replace_all is true)"},
                 "new_string": {"type": "string", "description": "The replacement string"},
+                "replace_all": {"type": "boolean", "description": "If true, replace ALL occurrences of old_string in the file. Use for renames and bulk replacements. Default: false."},
             },
             "required": ["path", "old_string", "new_string"],
         },
@@ -598,7 +902,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "symbol_edit",
-        "description": "Perform a symbol-aware edit of a function/class/type definition block using AST/tree-sitter when available, with regex fallback. Safer than plain string replacement for refactors. Use kind=function|class|all and occurrence to disambiguate.",
+        "description": "Perform a symbol-aware edit of a function/class/type definition block using AST parsing (Python) or tree-sitter (JS/TS) with regex fallback. Safer than plain Edit for replacing entire function or class bodies. Use kind=function|class|all to narrow the match. Use occurrence when multiple symbols share the same name (e.g. overloaded methods). Always read the file first to verify the symbol exists.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -615,12 +919,12 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "Bash",
-        "description": "Execute a shell command in the working directory. Use for running tests, installing packages, git operations, builds, linters, and type checkers. Always check both stdout and stderr in the output. Non-zero exit codes indicate failure — diagnose the error rather than retrying blindly. Use timeout for long-running processes.",
+        "description": "Execute a shell command in the working directory. Use for: running tests, installing packages, git operations, builds, and system commands that have no dedicated tool. Always check both stdout and stderr. Non-zero exit codes indicate failure — diagnose the error rather than retrying blindly. NEVER use Bash for file operations that have dedicated tools: use Read (not cat/head/tail), Edit (not sed/awk), Write (not echo/heredoc), search (not grep/rg), Glob (not find). When chaining dependent commands, use && (not ;). Set timeout for long-running processes. Output is capped at 20K chars with head/tail preserved.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "The shell command to execute"},
-                "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30)"},
+                "command": {"type": "string", "description": "The shell command to execute. Use && to chain dependent commands."},
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30). Increase for builds, test suites."},
             },
             "required": ["command"],
         },
@@ -629,7 +933,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "TodoWrite",
-        "description": "Create or update the task checklist for this session. Use at the start of multi-step tasks: list items with status pending, then set in_progress when working on one and completed when done. Only one task should be in_progress at a time. Replaces the previous list each time. Keeps progress visible and ensures nothing is dropped.",
+        "description": "Create or update the task checklist for this session. Use proactively for any multi-step task (3+ steps). Create the full checklist at the start with all items 'pending'. Set exactly one item to 'in_progress' at a time. Mark items 'completed' immediately when done — don't batch completions. Add discovered work as new items. Replaces the previous list each time (include ALL items, not just changed ones). Skip for trivial single-step tasks.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -654,7 +958,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "TodoRead",
-        "description": "Get the current task checklist for this session. Call at the start of work, before planning next steps, or when unsure what remains. Returns the same list maintained by TodoWrite (id, content, status).",
+        "description": "Get the current task checklist for this session. Call when resuming work, before planning next steps, or when unsure what remains. Returns the full list maintained by TodoWrite with id, content, and status for each item.",
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -665,7 +969,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "MemoryWrite",
-        "description": "Store a critical or important fact for the rest of this session so you can reuse it later. Use when you learn: user preferences (e.g. 'preferred_language: TypeScript'), key decisions, project conventions, important errors and how they were fixed, or environment/config facts. Key: short identifier (e.g. 'api_base', 'auth_package'). Value: concise string. Do not store trivial or one-off details. Overwrites existing key. Be contextually aware: write when the information would help you in a future message or session.",
+        "description": "Store an important fact for the rest of this session. Use when you learn: user preferences (e.g. 'preferred_language: TypeScript'), project conventions, key architectural decisions, important error patterns and fixes, or environment facts. Key: short identifier (e.g. 'api_base', 'test_cmd'). Value: concise string. Overwrites existing key. Do NOT store trivial or one-off details. Write proactively when the information would improve your future responses.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -678,7 +982,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "MemoryRead",
-        "description": "Retrieve stored facts. Call with no key to get all facts; with key to get one value. Use at the start of a follow-up task, when the user asks what you know, or before acting when stored context (preferences, prior decisions) could change your approach.",
+        "description": "Retrieve stored session facts. Call with no key to get all stored facts; with a specific key to get one value. Use at the start of follow-up tasks, when resuming after context, or when stored preferences/decisions could change your approach.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -690,7 +994,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "semantic_retrieve",
-        "description": "Semantic codebase search. Returns the most relevant code chunks (functions, classes) for a natural-language query. **START HERE for code discovery** - much more effective than reading full files. Examples: 'where is user authentication validated', 'how are database connections handled', 'error handling patterns', 'main entry points'. Use this for exploration and understanding, then use Read with offset/limit to examine specific returned chunks. Cost-efficient: queries against semantic index instead of loading entire files. Prefer over search() for discovery - use search() only for exact strings/regex.",
+        "description": "Semantic codebase search — finds code by meaning, not exact text. Returns the most relevant code chunks (functions, classes) ranked by semantic similarity. START HERE for code discovery and exploration. Ask complete questions: 'where is user authentication validated?', 'how are database connections pooled?', 'what happens when a payment fails?'. Then use Read with offset/limit on returned paths for full context. Much more effective than grep for understanding; use search() only for exact strings or regex patterns. Cost-efficient: queries a pre-built embedding index.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -703,7 +1007,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "search",
-        "description": "Regex search (ripgrep) across files. Use when you have an exact string or pattern; for exploring or finding by meaning use semantic_retrieve instead. Returns matching lines with paths and line numbers. Use `include` to filter by file type. **Fast and cheap** - use for exact matches, error messages, TODOs. For discovery, start with semantic_retrieve first.",
+        "description": "Regex search (ripgrep) across files. Use ONLY for exact strings, regex patterns, error messages, TODOs, or specific identifiers. For 'where/how' questions, use semantic_retrieve instead. Returns matching lines with file paths and line numbers. Use `include` to filter by file type (e.g. '*.py'). Fast and token-efficient. NEVER use grep/rg via Bash — always use this tool.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -717,7 +1021,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "find_symbol",
-        "description": "Symbol-aware navigation helper. Finds symbol definitions and/or references using language-aware patterns across Python/JS/TS and common typed languages. **Use this before editing ambiguous symbols** with many occurrences. Essential for safe refactoring - shows you all places a symbol is used before making changes.",
+        "description": "Symbol-aware navigation — finds definitions and references using language-aware patterns (Python, JS/TS, Java, Rust, Go). Use BEFORE editing ambiguous symbols to see all locations where a symbol is defined or used. Essential for safe refactoring: shows every call site before you rename or modify. Use kind='definition' to find where it's declared, kind='reference' for usages, kind='all' for both.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -732,7 +1036,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "list_directory",
-        "description": "List files and directories at a given path with file sizes. Good first step to understand project structure before diving into specific files.",
+        "description": "List files and directories at a given path with file sizes. Respects .gitignore. For understanding overall project structure, prefer project_tree (gives a full recursive view). Use list_directory for examining one specific directory's contents.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -745,7 +1049,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "Glob",
-        "description": "Find files matching a glob pattern recursively. Example: '**/*.py' finds all Python files. Useful for discovering files before reading them.",
+        "description": "Find files matching a glob pattern recursively. Examples: '**/*.py' (all Python files), 'src/**/*.test.ts' (all test files in src). Respects .gitignore and skips node_modules, __pycache__, .git, etc. Use for discovering files before reading them. NEVER use find via Bash — always use this tool. Results capped at 200 matches.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -756,8 +1060,21 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "type": "custom",
+        "name": "project_tree",
+        "description": "Get a compact recursive project tree respecting .gitignore. Token-budgeted (~2000 tokens). Use as your FIRST step on any new or unfamiliar codebase — gives a full structural overview. Large directories (>50 entries) are collapsed to 'dir/ (N items)'. Use focus_path to expand a specific subtree while collapsing siblings (e.g. focus_path='src/api' to drill into the API layer). Prefer this over repeated list_directory calls for orientation.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "focus_path": {"type": "string", "description": "Optional: expand this subtree fully while collapsing siblings. E.g. 'src/main/java' or 'backend/api'."},
+                "max_depth": {"type": "integer", "description": "Max directory depth to expand (default: 4). Deeper dirs are collapsed."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "type": "custom",
         "name": "lint_file",
-        "description": "Auto-detect the project's linter or type checker and run it on a specific file. Use this after every edit to catch syntax errors, type errors, and style issues before moving on. Returns lint output or confirms no issues found.",
+        "description": "Auto-detect and run the project's linter/type-checker on a file. Supports: ruff/flake8/py_compile (Python), tsc (TypeScript), eslint (JavaScript), cargo check (Rust), go vet (Go), ruby -c (Ruby), bash -n (Shell). Run after EVERY edit to catch syntax errors, type errors, and style violations before moving on. If linting reveals errors you introduced, fix them immediately.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -769,7 +1086,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "WebFetch",
-        "description": "Fetch content from a URL (HTTP GET). Use when you need to verify information (e.g. confirm API shape, check docs, validate an error or version) or when the user asks for latest info. Returns plain text; large responses are truncated. Do not use for sensitive or authenticated endpoints.",
+        "description": "Fetch content from a URL (HTTP GET). Use to verify information: confirm API shapes, check official docs, validate error messages, or get the latest version info. Returns plain text with HTML stripped. Large responses truncated at 500KB. Do NOT use for authenticated endpoints or URLs that require login. The URL must be fully formed (https://...).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -782,7 +1099,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "WebSearch",
-        "description": "Search the web for current information. Use when you need up-to-date docs, error messages, or general lookup. Returns a short list of relevant snippets and links. Prefer WebFetch for a specific known URL.",
+        "description": "Search the web for current information. Use when you need up-to-date docs, error messages, library APIs, or general lookup that may not be in your training data. Returns relevant snippets and links. Be specific in queries — include version numbers and dates when relevant. Prefer WebFetch when you have a specific known URL.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -972,6 +1289,7 @@ TOOL_IMPLEMENTATIONS = {
     "search": search,
     "find_symbol": find_symbol,
     "list_directory": list_directory,
+    "project_tree": project_tree,
     "lint_file": lint_file,
     "semantic_retrieve": semantic_retrieve,
     "WebFetch": web_fetch,
@@ -981,7 +1299,7 @@ TOOL_IMPLEMENTATIONS = {
 }
 
 TOOLS_REQUIRING_APPROVAL = {"Write", "Edit", "symbol_edit", "Bash"}
-SAFE_TOOLS = {"Read", "search", "find_symbol", "list_directory", "Glob", "lint_file", "semantic_retrieve", "WebFetch", "WebSearch", "TodoWrite", "TodoRead"}
+SAFE_TOOLS = {"Read", "search", "find_symbol", "list_directory", "project_tree", "Glob", "lint_file", "semantic_retrieve", "WebFetch", "WebSearch", "TodoWrite", "TodoRead"}
 SCOUT_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     t for t in TOOL_DEFINITIONS if t["name"] in SAFE_TOOLS
 ]
@@ -991,13 +1309,18 @@ SCOUT_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
 ASK_USER_QUESTION_DEFINITION: Dict[str, Any] = {
     "type": "custom",
     "name": "AskUserQuestion",
-    "description": "Ask the user a clarifying question. Use when the task is ambiguous or when verification fails due to something the user explicitly asked for — do not silently override their request; ask them. Optionally provide an 'options' array of short choices so the user can select or type their answer.",
+    "description": "Ask the user a structured clarifying question. Use when: (1) the task is genuinely ambiguous and you cannot infer the answer, (2) verification fails due to a conflict with what the user explicitly asked for, (3) there are multiple valid approaches with significantly different outcomes. Do NOT ask when you can reasonably infer the answer. ALWAYS provide an 'options' array with 2-5 short choices when possible — structured choices are faster for the user than typing. The user can still type a custom answer if none of the options fit.",
     "input_schema": {
         "type": "object",
         "properties": {
-            "question": {"type": "string", "description": "The question to ask the user (clear and concise)"},
-            "context": {"type": "string", "description": "Optional: brief context so the user knows why you're asking"},
-            "options": {"type": "array", "items": {"type": "string"}, "description": "Optional: list of choices the user can select (Cursor-style). User can still type a custom answer."},
+            "question": {"type": "string", "description": "Clear, concise question. State what you need to know and why."},
+            "context": {"type": "string", "description": "Brief context explaining why you're asking (what you found, what the conflict is)."},
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "2-5 short answer choices. ALWAYS provide options when the question has a finite set of answers. Examples: ['Keep existing tests', 'Rewrite tests', 'Skip tests'] or ['Python 3.10+', 'Python 3.8 compatible']. User can still type a custom answer.",
+                "minItems": 2,
+            },
         },
         "required": ["question"],
     },

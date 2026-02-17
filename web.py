@@ -16,6 +16,7 @@ import logging
 import mimetypes
 import os
 import posixpath
+import re
 import shlex
 import struct
 import sys
@@ -99,6 +100,284 @@ _ALLOWED_IMAGE_MEDIA_TYPES = {
     "image/webp",
     "image/gif",
 }
+
+
+# ============================================================
+# Auto-context assembly (Cursor-style automatic context injection)
+# ============================================================
+
+_project_tree_cache: Dict[str, Tuple[float, str]] = {}
+_PROJECT_TREE_TTL = 60.0  # refresh every 60s
+
+_AUTO_CONTEXT_CHAR_BUDGET = 16000  # ~4000 tokens
+
+
+def _assemble_auto_context(
+    working_directory: str,
+    editor_context: Optional[Dict[str, Any]] = None,
+    modified_files: Optional[set] = None,
+    backend: Optional[Backend] = None,
+) -> str:
+    """Assemble auto-context that gets injected into the agent conversation.
+
+    Works with both local and SSH backends. Uses the Backend abstraction for
+    all file reads and command execution.
+
+    Priority order (each section is added only if budget remains):
+    1. Active file (window around cursor, or first 200 lines)
+    2. Selected text (if any)
+    3. Recently modified files by agent (last 3, first 50 lines each)
+    3.5. Dependency-aware context (1-hop imports)
+    4. Git diff summary
+    5. Project tree (cached)
+    6. Open files list
+
+    Returns empty string if no useful context available.
+    """
+    from backend import LocalBackend as _LB
+    b = backend or _LB(os.path.abspath(working_directory))
+    sections: List[str] = []
+    budget = _AUTO_CONTEXT_CHAR_BUDGET
+    editor_context = editor_context or {}
+
+    def add_section(label: str, content: str) -> bool:
+        nonlocal budget
+        section = f"<{label}>\n{content.rstrip()}\n</{label}>"
+        if len(section) <= budget:
+            sections.append(section)
+            budget -= len(section)
+            return True
+        elif budget > 200:
+            truncated = content[:budget - 100].rstrip()
+            section = f"<{label}>\n{truncated}\n… (truncated)\n</{label}>"
+            sections.append(section)
+            budget -= len(section)
+            return True
+        return False
+
+    abs_wd = b.working_directory if hasattr(b, 'working_directory') else os.path.abspath(working_directory)
+
+    def _read_file_safe(path: str) -> Optional[str]:
+        """Read a file via Backend (works for both local and SSH)."""
+        try:
+            return b.read_file(path)
+        except Exception:
+            return None
+
+    # 1. Active file
+    active = editor_context.get("activeFile", {})
+    active_path = active.get("path", "")
+    if active_path:
+        cursor_line = active.get("cursorLine")
+        try:
+            content = _read_file_safe(active_path)
+            if content is not None:
+                all_lines = content.splitlines(keepends=True)
+                total = len(all_lines)
+                if cursor_line and total > 200:
+                    start = max(0, cursor_line - 100)
+                    end = min(total, cursor_line + 100)
+                    window = all_lines[start:end]
+                    header = f"# {active_path} (lines {start+1}-{end} of {total}, cursor at line {cursor_line})\n"
+                else:
+                    window = all_lines[:200]
+                    header = f"# {active_path} ({total} lines total" + (f", cursor at line {cursor_line}" if cursor_line else "") + ")\n"
+                    if total > 200:
+                        header = f"# {active_path} (showing first 200 of {total} lines)\n"
+                numbered = "".join(f"{start + i + 1 if cursor_line and total > 200 else i + 1:6}|{l}" for i, l in enumerate(window))
+                add_section("active_file", header + numbered)
+        except Exception:
+            pass
+
+    # 2. Selected text
+    selected = editor_context.get("selectedText", "")
+    if selected:
+        add_section("selected_text", f"# Selected in {active_path}\n{selected}")
+
+    # 3. Recently modified files (by agent)
+    if modified_files:
+        recent_mods = list(modified_files)[-3:]
+        for mp in recent_mods:
+            if mp == active_path:
+                continue
+            try:
+                content = _read_file_safe(mp)
+                if content is not None:
+                    lines = content.splitlines(keepends=True)[:50]
+                    text = f"# {mp} (recently modified, first {len(lines)} lines)\n" + "".join(lines)
+                    add_section("modified_file", text)
+            except Exception:
+                pass
+
+    # 3.5. Dependency-aware context (1-hop imports of active file)
+    if active_path and budget > 500:
+        try:
+            from codebase_index import get_index, get_dependency_neighborhood
+            idx = get_index(abs_wd)
+            if idx.file_imports:
+                neighbors = get_dependency_neighborhood(
+                    active_path, idx.file_imports, idx.reverse_imports, max_neighbors=5
+                )
+                if neighbors:
+                    dep_lines = [f"# Related files (1-hop imports of {active_path})"]
+                    for np_ in neighbors:
+                        try:
+                            dep_content = _read_file_safe(np_)
+                            if dep_content is not None:
+                                first_lines = dep_content.splitlines(keepends=True)[:20]
+                                dep_lines.append(f"\n## {np_} (first 20 lines)")
+                                dep_lines.append("".join(first_lines))
+                        except Exception:
+                            pass
+                    if len(dep_lines) > 1:
+                        add_section("dependency_context", "\n".join(dep_lines))
+        except Exception:
+            pass
+
+    # 4. Git diff summary (via Backend.run_command for SSH support)
+    try:
+        stdout, _, rc = b.run_command("git diff --stat", ".", timeout=5)
+        if rc == 0 and stdout and stdout.strip():
+            diff_stat = stdout.strip()
+            diff_content = f"# git diff --stat\n{diff_stat}"
+            if len(diff_stat) < 2000:
+                stdout2, _, rc2 = b.run_command("git diff --no-color", ".", timeout=5)
+                if rc2 == 0 and stdout2:
+                    diff_lines = stdout2.split("\n")[:50]
+                    diff_content += "\n\n# git diff (first 50 lines)\n" + "\n".join(diff_lines)
+            add_section("git_diff", diff_content)
+    except Exception:
+        pass
+
+    # 5. Project tree (cached)
+    cache_key = abs_wd
+    now = time.time()
+    cached = _project_tree_cache.get(cache_key)
+    if cached and (now - cached[0]) < _PROJECT_TREE_TTL:
+        tree_text = cached[1]
+    else:
+        try:
+            from tools import project_tree
+            result = project_tree(backend=b, working_directory=abs_wd)
+            tree_text = result.output if result.success else ""
+            _project_tree_cache[cache_key] = (now, tree_text)
+        except Exception:
+            tree_text = ""
+    if tree_text:
+        add_section("project_structure", tree_text)
+
+    # 6. Linter errors on recently modified and active files
+    if budget > 300:
+        lint_targets = set()
+        if active_path:
+            lint_targets.add(active_path)
+        if modified_files:
+            lint_targets.update(list(modified_files)[-3:])
+        if lint_targets:
+            try:
+                from tools import lint_file as _lint_file
+                lint_errors = []
+                for lp in lint_targets:
+                    try:
+                        lr = _lint_file(path=lp, backend=b, working_directory=abs_wd)
+                        if lr.success and lr.output and "no issues" not in lr.output.lower():
+                            lint_errors.append(f"## {lp}\n{lr.output[:500]}")
+                    except Exception:
+                        pass
+                if lint_errors:
+                    add_section("linter_errors", "# Linter errors on active/modified files\n" + "\n\n".join(lint_errors))
+            except Exception:
+                pass
+
+    # 7. Open files list
+    open_files = editor_context.get("openFiles", [])
+    if open_files and len(open_files) > 1:
+        file_list = "\n".join(f"  {f}" for f in open_files if f != active_path)
+        if file_list:
+            add_section("open_files", f"# Other open files in editor\n{file_list}")
+
+    if not sections:
+        return ""
+
+    return "<auto_context>\n" + "\n\n".join(sections) + "\n</auto_context>"
+
+
+def active_file_in_context(auto_ctx: str) -> bool:
+    """Check if auto-context contains an active file section."""
+    return "<active_file>" in auto_ctx
+
+
+# ============================================================
+# @ Mention resolution
+# ============================================================
+
+_MENTION_RE = re.compile(r"@([\w./_-]+)")
+_MENTION_TOKEN_CAP = 6000  # ~1500 tokens per mention, cap total
+
+
+def _resolve_mentions(task_text: str, working_directory: str, backend: Optional[Backend] = None) -> str:
+    """Resolve @file and @special mentions in the task text.
+
+    Works with both local and SSH backends.
+    Returns modified task text with mentions replaced by inline references.
+    """
+    from backend import LocalBackend as _LB
+    b = backend or _LB(os.path.abspath(working_directory))
+    abs_wd = b.working_directory if hasattr(b, 'working_directory') else os.path.abspath(working_directory)
+    mentions = list(_MENTION_RE.finditer(task_text))
+    if not mentions:
+        return task_text
+
+    resolved_parts: List[str] = []
+    budget = _MENTION_TOKEN_CAP
+
+    for m in mentions:
+        ref = m.group(1)
+
+        if ref == "codebase":
+            try:
+                from tools import project_tree
+                result = project_tree(backend=b, working_directory=abs_wd)
+                if result.success and budget > len(result.output):
+                    tag = f"\n<mentioned_codebase>\n{result.output}\n</mentioned_codebase>\n"
+                    resolved_parts.append(tag)
+                    budget -= len(tag)
+            except Exception:
+                pass
+            continue
+
+        if ref == "git":
+            try:
+                stdout, _, rc = b.run_command("git diff --no-color", ".", timeout=10)
+                if rc == 0 and stdout and stdout.strip():
+                    content = stdout[:3000]
+                    if budget > len(content):
+                        tag = f"\n<mentioned_git_diff>\n{content}\n</mentioned_git_diff>\n"
+                        resolved_parts.append(tag)
+                        budget -= len(tag)
+            except Exception:
+                pass
+            continue
+
+        if ref == "terminal":
+            resolved_parts.append("\n<mentioned_terminal>(terminal context not available in this environment)</mentioned_terminal>\n")
+            continue
+
+        try:
+            if b.is_file(ref):
+                content = b.read_file(ref)
+                if len(content) > 4000:
+                    content = content[:4000] + "\n… (truncated)"
+                if budget > len(content):
+                    tag = f"\n<mentioned_file path=\"{ref}\">\n{content}\n</mentioned_file>\n"
+                    resolved_parts.append(tag)
+                    budget -= len(tag)
+        except Exception:
+            pass
+
+    if resolved_parts:
+        return task_text + "\n" + "".join(resolved_parts)
+    return task_text
 
 
 # ============================================================
@@ -803,8 +1082,10 @@ async def websocket_terminal(ws: WebSocket):
 # ------------------------------------------------------------------
 
 def _build_file_tree(root: str, rel: str = "") -> List[Dict[str, Any]]:
-    """Recursively build a file tree, skipping ignored dirs/files."""
+    """Recursively build a file tree, skipping ignored dirs/files. Uses shared gitignore helper."""
+    from tools import _load_gitignore, _is_ignored
     abs_dir = os.path.join(root, rel) if rel else root
+    gi = _load_gitignore(root)
     entries: List[Dict[str, Any]] = []
 
     try:
@@ -816,20 +1097,21 @@ def _build_file_tree(root: str, rel: str = "") -> List[Dict[str, Any]]:
     files_list = []
 
     for name in items:
-        if name.startswith(".") and name in _IGNORE_DIRS:
+        full = os.path.join(abs_dir, name)
+        child_rel = os.path.join(rel, name) if rel else name
+        is_dir = os.path.isdir(full)
+
+        if _is_ignored(child_rel, name, is_dir, gi):
             continue
         if name in _IGNORE_DIRS:
             continue
 
-        full = os.path.join(abs_dir, name)
-        child_rel = os.path.join(rel, name) if rel else name
-
-        if os.path.isdir(full):
+        if is_dir:
             dirs_list.append({
                 "name": name,
                 "path": child_rel,
                 "type": "directory",
-                "children": None,  # lazy-loaded
+                "children": None,
             })
         elif os.path.isfile(full):
             _, ext = os.path.splitext(name)
@@ -846,13 +1128,20 @@ def _build_file_tree(root: str, rel: str = "") -> List[Dict[str, Any]]:
 
 
 @app.get("/api/files")
-async def list_files(path: str = ""):
-    """Return file tree entries for a directory (lazy — one level at a time)."""
+async def list_files(path: str = "", recursive: bool = False):
+    """Return file tree entries for a directory.
+
+    - Default (recursive=false): lazy — one level at a time.
+    - recursive=true: flat list of ALL files (for fuzzy file search in explorer).
+    """
     import posixpath
     b = _backend or LocalBackend(os.path.abspath(_working_directory))
     is_ssh = hasattr(b, '_client')  # SSHBackend has _client attr
+
+    if recursive:
+        return await asyncio.to_thread(_list_all_files_recursive, os.path.abspath(_working_directory), is_ssh, backend=b)
+
     try:
-        # Always run in thread so the event loop stays free while agent is busy
         entries = await asyncio.to_thread(b.list_dir, path or ".")
         result = []
         for e in entries:
@@ -861,7 +1150,6 @@ async def list_files(path: str = ""):
                 continue
             if name in _IGNORE_DIRS:
                 continue
-            # Always use forward slashes for paths so explorer matches git status keys
             if is_ssh:
                 child_rel = posixpath.join(path, name) if path else name
             else:
@@ -873,13 +1161,100 @@ async def list_files(path: str = ""):
                 if f".{ext}" in _IGNORE_EXTENSIONS:
                     continue
                 result.append({"name": name, "path": child_rel, "type": "file", "ext": ext})
-        # Sort: directories first, then files
         dirs = [x for x in result if x["type"] == "directory"]
         files = [x for x in result if x["type"] == "file"]
         return dirs + files
     except Exception as ex:
         logger.error(f"list_files error for path={path!r}: {ex}")
         return JSONResponse({"error": str(ex)}, status_code=500)
+
+
+def _list_all_files_recursive(root: str, is_ssh: bool = False, backend: Optional[Backend] = None) -> List[Dict[str, Any]]:
+    """Collect all files recursively, respecting _IGNORE_DIRS and _IGNORE_EXTENSIONS.
+
+    Works with both local and SSH backends. Uses BFS via Backend.list_dir() for SSH,
+    os.walk() for local (faster).
+
+    Returns a flat list of {name, path, type, ext, dir} for fuzzy file search.
+    Capped at 10,000 files to protect against huge repos.
+    """
+    from tools import _load_gitignore, _is_ignored, _ALWAYS_SKIP_DIRS, _ALWAYS_SKIP_EXTENSIONS
+
+    b = backend
+    wd = b.working_directory if (b and hasattr(b, 'working_directory')) else root
+    gi = _load_gitignore(wd, backend=b)
+    result: List[Dict[str, Any]] = []
+    cap = 10_000
+
+    if b is not None and getattr(b, "_host", None) is not None:
+        # SSH: BFS via Backend.list_dir()
+        queue = [""]
+        while queue and len(result) < cap:
+            rel_dir = queue.pop(0)
+            target = rel_dir if rel_dir else "."
+            try:
+                entries = b.list_dir(target)
+            except Exception:
+                continue
+            for e in sorted(entries, key=lambda x: x.get("name", "")):
+                if len(result) >= cap:
+                    break
+                name = e.get("name", "")
+                if not name or name.startswith("."):
+                    continue
+                is_dir = e.get("type") == "directory"
+                child_rel = (rel_dir + "/" + name) if rel_dir else name
+
+                if name in _IGNORE_DIRS or name in _ALWAYS_SKIP_DIRS:
+                    continue
+                if _is_ignored(child_rel, name, is_dir, gi):
+                    continue
+
+                if is_dir:
+                    queue.append(child_rel)
+                else:
+                    _, ext = os.path.splitext(name)
+                    if ext in _IGNORE_EXTENSIONS or ext in _ALWAYS_SKIP_EXTENSIONS:
+                        continue
+                    result.append({
+                        "name": name,
+                        "path": child_rel,
+                        "type": "file",
+                        "ext": ext.lstrip("."),
+                        "dir": rel_dir if rel_dir else "",
+                    })
+    else:
+        # Local: use os.walk (faster)
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+            rel_dir = os.path.relpath(dirpath, root)
+            if rel_dir == ".":
+                rel_dir = ""
+
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _IGNORE_DIRS and d not in _ALWAYS_SKIP_DIRS
+                and not _is_ignored(os.path.join(rel_dir, d) if rel_dir else d, d, True, gi)
+            ]
+
+            for fname in sorted(filenames):
+                if len(result) >= cap:
+                    return result
+                _, ext = os.path.splitext(fname)
+                if ext in _IGNORE_EXTENSIONS or ext in _ALWAYS_SKIP_EXTENSIONS:
+                    continue
+                child_rel = os.path.join(rel_dir, fname) if rel_dir else fname
+                child_rel = child_rel.replace("\\", "/")
+                if gi and gi.match_file(child_rel):
+                    continue
+                result.append({
+                    "name": fname,
+                    "path": child_rel,
+                    "type": "file",
+                    "ext": ext.lstrip("."),
+                    "dir": rel_dir.replace("\\", "/") if rel_dir else "",
+                })
+
+    return result
 
 
 # ------------------------------------------------------------------
@@ -952,6 +1327,39 @@ def _normalize_user_images(raw_images: Any) -> List[Dict[str, Any]]:
             },
         })
     return blocks
+
+
+@app.get("/api/find-symbol")
+async def api_find_symbol(symbol: str = Query(...), kind: str = Query("definition")):
+    """Find symbol definitions for Go to Definition in the editor."""
+    from tools import find_symbol as _find_symbol
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                _find_symbol, symbol, kind=kind, working_directory=_working_directory
+            ),
+            timeout=10.0,
+        )
+        if not result.success:
+            return JSONResponse({"results": [], "error": result.error})
+        locations = []
+        for line in (result.output or "").split("\n"):
+            line = line.strip()
+            if not line or line.startswith("Found") or line.startswith("No "):
+                continue
+            if ":" in line:
+                parts = line.split(":", 2)
+                if len(parts) >= 2:
+                    fpath = parts[0].strip()
+                    try:
+                        linenum = int(parts[1].strip())
+                    except ValueError:
+                        linenum = 1
+                    text = parts[2].strip() if len(parts) > 2 else ""
+                    locations.append({"path": fpath, "line": linenum, "text": text})
+        return {"results": locations}
+    except Exception as e:
+        return JSONResponse({"results": [], "error": str(e)}, status_code=500)
 
 
 @app.get("/api/file")
@@ -1690,6 +2098,12 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                             if task_text:
                                 await ws.send_json({"type": "replay_user", "content": task_text})
                         continue
+                    # Follow-up with current plan in context — show only the user's message
+                    if "<current_plan>" in content and "User's message: " in content:
+                        task_text = content.split("User's message: ", 1)[-1].strip()
+                        if task_text:
+                            await ws.send_json({"type": "replay_user", "content": task_text})
+                        continue
                     await ws.send_json({"type": "replay_user", "content": content})
                 elif isinstance(content, list):
                     # Tool result blocks are handled via pairing below
@@ -1716,6 +2130,8 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                                     text = parts[-1].strip()
                                     for suffix in ["Execute this plan step by step.", "State which step you are working on."]:
                                         text = text.replace(suffix, "").strip()
+                            if "<current_plan>" in text and "User's message: " in text:
+                                text = text.split("User's message: ", 1)[-1].strip()
                             if text.strip():
                                 await ws.send_json({"type": "replay_user", "content": text})
                         elif block.get("type") == "image":
@@ -1728,8 +2144,10 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
             elif role == "assistant":
                 if isinstance(content, str):
-                    if content.strip():
-                        await ws.send_json({"type": "replay_text", "content": content})
+                    # Strip <updated_plan> tags from displayed assistant text
+                    _display = re.sub(r"<updated_plan>[\s\S]*?</updated_plan>", "", content).strip()
+                    if _display:
+                        await ws.send_json({"type": "replay_text", "content": _display})
                 elif isinstance(content, list):
                     for block in content:
                         btype = block.get("type", "")
@@ -1740,7 +2158,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                                 await ws.send_json({"type": "replay_thinking", "content": thinking_text})
                         elif btype == "text":
                             text = block.get("text", "")
-                            if text.strip():
+                            # Strip <updated_plan> tags from displayed assistant text
+                            text = re.sub(r"<updated_plan>[\s\S]*?</updated_plan>", "", text).strip()
+                            if text:
                                 await ws.send_json({"type": "replay_text", "content": text})
                         elif btype == "tool_use":
                             tool_id = block.get("id", "")
@@ -1923,6 +2343,17 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
     # ------------------------------------------------------------------
 
     _watcher_task = None
+    _save_interval_task: Optional[asyncio.Task] = None
+
+    async def _periodic_save_loop():
+        """Save session every 30s so reconnects/kills don't lose conversation."""
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await asyncio.to_thread(save_session)
+            except Exception:
+                pass
+
     try:
         # Send initial info
         mcfg = get_model_config(model_config.model_id)
@@ -1950,6 +2381,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
         # Replay conversation history so frontend rebuilds the chat
         await replay_history()
+
+        # Start periodic save so SSH disconnect/kill doesn't lose conversation
+        _save_interval_task = asyncio.create_task(_periodic_save_loop())
 
         # ── Background task helpers ─────────────────────────────
         async def _send_status():
@@ -1999,10 +2433,88 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 _pending_question["future"] = None
                 _pending_question["tool_use_id"] = None
 
-        async def _run_task_bg(task_text: str, task_images: Optional[List[Dict[str, Any]]] = None, preserve_snapshots: bool = False):
+        async def _detect_and_apply_plan_update(ag, current_plan):
+            """Check agent's last response for <updated_plan> tags and update plan/checklist."""
+            nonlocal pending_plan
+            if not ag.history:
+                return
+            last_msg = ag.history[-1]
+            text = ""
+            if isinstance(last_msg.get("content"), str):
+                text = last_msg["content"]
+            elif isinstance(last_msg.get("content"), list):
+                for block in last_msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text += block.get("text", "")
+            if not text:
+                return
+
+            # Look for <updated_plan>...</updated_plan> tags
+            match = re.search(r"<updated_plan>\s*(.*?)\s*</updated_plan>", text, re.DOTALL)
+            if not match:
+                return
+
+            plan_body = match.group(1).strip()
+            if not plan_body:
+                return
+
+            # Parse numbered steps
+            new_steps = []
+            for line in plan_body.split("\n"):
+                line = line.strip()
+                if re.match(r"^\d+[\.\)]\s+", line):
+                    new_steps.append(line)
+
+            if not new_steps:
+                return
+
+            # Update state
+            pending_plan = new_steps
+            ag._current_plan = new_steps
+            plan_text_full = "\n".join(new_steps)
+            ag._plan_text = plan_text_full
+
+            # Emit updated plan event to frontend
+            await ws.send_json({
+                "type": "updated_plan",
+                "steps": new_steps,
+                "plan_text": plan_text_full,
+                "plan_file": getattr(ag, "_plan_file_path", None),
+            })
+
+            # Also update the checklist
+            todos = [
+                {"id": str(i + 1), "content": s, "status": "pending"}
+                for i, s in enumerate(new_steps)
+            ]
+            ag._todos = todos
+            await ws.send_json({"type": "todos_updated", "todos": todos})
+
+        async def _run_task_bg(task_text: str, task_images: Optional[List[Dict[str, Any]]] = None, preserve_snapshots: bool = False, editor_context: Optional[Dict[str, Any]] = None):
             """Run a task (plan or direct mode) in the background. preserve_snapshots=True keeps diff/revert cumulative."""
             nonlocal awaiting_build, awaiting_keep_revert, pending_task, pending_plan, pending_images
             task_start = time.time()
+
+            # Assemble auto-context from editor state (Cursor-style)
+            auto_ctx = ""
+            try:
+                auto_ctx = await asyncio.to_thread(
+                    _assemble_auto_context,
+                    _working_directory,
+                    editor_context,
+                    agent.modified_files if hasattr(agent, "modified_files") else None,
+                    backend=_backend,
+                )
+            except Exception as e:
+                logger.debug(f"Auto-context assembly failed: {e}")
+
+            # Resolve @mentions in the task text
+            try:
+                task_text = await asyncio.to_thread(
+                    _resolve_mentions, task_text, _working_directory, backend=_backend
+                )
+            except Exception as e:
+                logger.debug(f"Mention resolution failed: {e}")
 
             # Use LLM to intelligently classify intent (runs on fast Haiku)
             intent = await asyncio.to_thread(
@@ -2010,10 +2522,12 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             )
 
             try:
-                if app_config.plan_phase_enabled and intent.get("plan"):
-                    # Plan phase
+                is_question = intent.get("question", False)
+                if app_config.plan_phase_enabled and intent.get("plan") and not is_question:
+                    # Plan phase — inject auto-context into plan task too
+                    plan_task = (auto_ctx + "\n\n" + task_text) if auto_ctx else task_text
                     plan_steps = await agent.run_plan(
-                        task=task_text,
+                        task=plan_task,
                         on_event=on_event,
                         request_question_answer=_request_question_answer,
                         user_images=task_images or [],
@@ -2037,6 +2551,34 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                         await ws.send_json({"type": "no_plan"})
                 else:
                     # Direct mode — pass scout decision from intent classification
+                    # If user has a pending plan (didn't press Build), inject plan into context so
+                    # follow-up questions ("change step 2 to...") have the plan in scope.
+                    task_for_run = task_text
+                    _is_plan_followup = False
+                    if awaiting_build and (pending_plan or getattr(agent, "_plan_text", None)):
+                        _is_plan_followup = True
+                        plan_text = getattr(agent, "_plan_text", "") or ""
+                        if not plan_text and pending_plan:
+                            plan_text = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(pending_plan))
+                        if plan_text.strip():
+                            task_for_run = (
+                                "[Current plan (user has not run Build yet; use for context):\n<current_plan>\n"
+                                + plan_text.strip()
+                                + "\n</current_plan>]\n\n"
+                                "IMPORTANT: If the user asks to modify, add, remove, or change any plan steps, "
+                                "you MUST output the complete updated plan as a numbered list wrapped in "
+                                "<updated_plan> tags. For example:\n"
+                                "<updated_plan>\n1. First step\n2. Second step\n</updated_plan>\n"
+                                "Always include ALL steps (not just changed ones). "
+                                "If the user is just asking a question about the plan, answer normally without the tags.\n\n"
+                                "User's message: "
+                                + task_text
+                            )
+
+                    # Inject auto-context if available
+                    if auto_ctx:
+                        task_for_run = auto_ctx + "\n\n" + task_for_run
+
                     # Smart model routing: use fast model for trivial/simple tasks
                     complexity = intent.get("complexity", "complex")
                     original_model = agent.service.model_id
@@ -2044,13 +2586,19 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                         agent.service.model_id = app_config.fast_model
                         logger.info(f"Smart routing: using fast model for {complexity} task")
 
+                    # Smart scout skip: if auto-context includes active file and task is targeted, skip scout
+                    enable_scout = intent.get("scout", True)
+                    if auto_ctx and active_file_in_context(auto_ctx) and not intent.get("explore", False):
+                        enable_scout = False
+                        logger.info("Smart scout skip: auto-context provides sufficient file context")
+
                     await ws.send_json({"type": "phase_start", "content": "direct"})
                     try:
                         await agent.run(
-                            task=task_text,
+                            task=task_for_run,
                             on_event=on_event,
                             request_approval=dummy_approval,
-                            enable_scout=intent.get("scout", True),
+                            enable_scout=enable_scout,
                             user_images=task_images or [],
                             preserve_snapshots=preserve_snapshots,
                         )
@@ -2060,16 +2608,20 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     if agent._cancelled:
                         return
 
+                    # Check if the agent's response contains an updated plan
+                    if _is_plan_followup and agent.history:
+                        _detect_and_apply_plan_update(agent, pending_plan)
+
                     elapsed = round(time.time() - task_start, 1)
                     await ws.send_json({"type": "phase_end", "content": "direct", "elapsed": elapsed})
                     await ws.send_json({"type": "done"})
 
-                    # Show diff and Keep/Revert bar if direct run modified files
+                    # Show cumulative diff and Keep/Revert bar for ALL accumulated changes
                     if agent.modified_files:
                         awaiting_keep_revert = True
                         diffs = generate_diffs()
                         if diffs:
-                            await ws.send_json({"type": "diff", "files": diffs})
+                            await ws.send_json({"type": "diff", "files": diffs, "cumulative": True})
             except asyncio.CancelledError:
                 return
             except Exception as exc:
@@ -2087,6 +2639,13 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             nonlocal awaiting_keep_revert
             task_start = time.time()
             try:
+                # Auto-create todos from plan steps so checklist is populated immediately
+                agent._todos = [
+                    {"id": str(i + 1), "content": s, "status": "pending"}
+                    for i, s in enumerate(steps)
+                ]
+                await ws.send_json({"type": "todos_updated", "todos": list(agent._todos)})
+
                 await ws.send_json({"type": "phase_start", "content": "build"})
                 await agent.run_build(
                     task=task_text,
@@ -2103,12 +2662,12 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 await ws.send_json({"type": "phase_end", "content": "build", "elapsed": elapsed})
                 await ws.send_json({"type": "done"})
 
-                # Show diff and Keep/Revert bar if build modified files
+                # Show cumulative diff and Keep/Revert bar for ALL accumulated changes
                 if agent.modified_files:
                     awaiting_keep_revert = True
                     diffs = generate_diffs()
                     if diffs:
-                        await ws.send_json({"type": "diff", "files": diffs})
+                        await ws.send_json({"type": "diff", "files": diffs, "cumulative": True})
             except asyncio.CancelledError:
                 return
             except Exception as exc:
@@ -2371,11 +2930,14 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     else:
                         session.name = "Image prompt"
 
+                editor_context = data.get("context")
                 _cancel_ack_sent = False
-                _agent_task = asyncio.create_task(_run_task_bg(task_text, task_images, preserve_snapshots))
+                _agent_task = asyncio.create_task(_run_task_bg(task_text, task_images, preserve_snapshots, editor_context=editor_context))
                 continue
 
     except WebSocketDisconnect:
+        if _save_interval_task and not _save_interval_task.done():
+            _save_interval_task.cancel()
         if _watcher_task and not _watcher_task.done():
             _watcher_task.cancel()
         if _agent_task and not _agent_task.done():
@@ -2384,6 +2946,8 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         save_session()
         logger.info("WebSocket disconnected")
     except Exception as e:
+        if _save_interval_task and not _save_interval_task.done():
+            _save_interval_task.cancel()
         if _agent_task and not _agent_task.done():
             agent.cancel()
             _agent_task.cancel()

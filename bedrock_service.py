@@ -192,12 +192,38 @@ class BedrockService:
         """Format request body for Anthropic Claude models with thinking, tool_use, and prompt caching"""
         formatted_messages = []
         use_cache = supports_caching(model_id)
-        
-        for msg in messages:
+
+        def _ensure_non_empty_content(role: str, content: Any, index: int) -> Any:
+            """API requires non-empty content for all messages except optional final assistant."""
+            if isinstance(content, str):
+                if (content or "").strip():
+                    return content
+                return "(no content)"
+            if isinstance(content, list):
+                if not content:
+                    return [{"type": "text", "text": "(no content)"}]
+                out = []
+                for b in content:
+                    if not isinstance(b, dict):
+                        out.append(b)
+                        continue
+                    if b.get("type") == "text":
+                        t = b.get("text") or ""
+                        if t.strip():
+                            out.append(b)
+                        else:
+                            out.append({**b, "text": "(no content)"})
+                    else:
+                        out.append(b)
+                return out if out else [{"type": "text", "text": "(no content)"}]
+            return content if content is not None else [{"type": "text", "text": "(no content)"}]
+
+        for i, msg in enumerate(messages):
             if msg["role"] != "system":
+                raw = msg.get("content")
                 formatted_messages.append({
                     "role": msg["role"],
-                    "content": msg["content"]
+                    "content": _ensure_non_empty_content(msg["role"], raw, i)
                 })
         
         # --- Conversation-level prompt caching ---

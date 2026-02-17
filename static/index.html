@@ -185,6 +185,10 @@
                         </button>
                     </div>
                 </div>
+                <!-- File filter (fuzzy search for files) -->
+                <div class="file-filter-wrap">
+                    <input id="file-filter-input" type="text" class="file-filter-input" placeholder="Filter files… (type to search)" spellcheck="false" autocomplete="off">
+                </div>
                 <!-- Search Panel (hidden by default) -->
                 <div id="search-panel" class="search-panel hidden">
                     <div class="search-input-row">
@@ -241,6 +245,7 @@
                         </button>
                     </div>
                 </div>
+                <div id="editor-breadcrumb" class="editor-breadcrumb hidden"></div>
                 <div id="editor-container">
                     <div id="editor-welcome">
                         <div class="editor-welcome-inner">
@@ -317,19 +322,17 @@
                     </div>
                 </div>
 
-                <!-- Session stats + file edits dropup + Review on one line -->
+                <!-- File edits dropup (only shown when there are edited files) -->
                 <div id="chat-composer-stats" class="chat-composer-stats hidden">
                     <div id="chat-composer-files-dropup" class="chat-composer-files-dropup hidden" aria-hidden="true"></div>
-                    <div class="chat-composer-stats-row">
-                        <button type="button" id="chat-composer-stats-toggle" class="chat-composer-stats-line" aria-expanded="false" title="Click to show edits per file">
-                            <span id="chat-composer-time" class="chat-stat-time"></span>
-                            <span id="chat-composer-totals" class="chat-stat-totals"><span class="add">+0</span> <span class="del">−0</span></span>
-                            <span class="chat-stat-sep">·</span>
-                            <span id="chat-composer-files" class="chat-stat-files">0 files</span>
-                            <span class="chat-composer-chevron" aria-hidden="true">&#x25B2;</span>
-                        </button>
-                        <button type="button" id="chat-composer-review-btn" class="chat-composer-review-btn" title="Review changed files">Review</button>
-                    </div>
+                    <button type="button" id="chat-composer-stats-toggle" class="chat-composer-stats-line" aria-expanded="false" title="Click to show edits per file">
+                        <span id="chat-composer-time" class="chat-stat-time"></span>
+                        <span id="chat-composer-totals" class="chat-stat-totals"><span class="add">+0</span> <span class="del">−0</span></span>
+                        <span class="chat-stat-sep">·</span>
+                        <span id="chat-composer-files" class="chat-stat-files">0 files</span>
+                        <span id="chat-composer-edits" class="chat-stat-edits"></span>
+                        <span class="chat-composer-chevron" aria-hidden="true">&#x25B2;</span>
+                    </button>
                 </div>
 
                 <!-- Input -->
@@ -342,7 +345,8 @@
                             </svg>
                         </button>
                         <input id="image-input" type="file" accept="image/*" multiple class="hidden">
-                        <textarea id="user-input" placeholder="Ask anything... (Enter to send)" rows="1"></textarea>
+                        <textarea id="user-input" placeholder="Ask anything… (@ to mention files) (Enter to send)" rows="1"></textarea>
+                        <div id="mention-popup" class="mention-popup hidden"></div>
                         <button type="button" id="send-btn" title="Send (Enter)">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/>
@@ -356,6 +360,15 @@
                     </div>
                 </div>
             </aside>
+        </div>
+    </div>
+
+    <!-- Command Palette / Quick File Open overlay (Cmd+Shift+P / Cmd+P) -->
+    <div id="command-palette" class="command-palette hidden">
+        <div class="command-palette-backdrop"></div>
+        <div class="command-palette-dialog">
+            <input id="command-palette-input" type="text" placeholder="Type a command…" spellcheck="false" autocomplete="off">
+            <div id="command-palette-results" class="command-palette-results"></div>
         </div>
     </div>
 

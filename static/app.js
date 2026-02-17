@@ -36,6 +36,7 @@
 
     // ── DOM refs — IDE ────────────────────────────────────────
     const $fileTree      = document.getElementById("file-tree");
+    const $fileFilter    = document.getElementById("file-filter-input");
     const $refreshTree   = document.getElementById("refresh-tree-btn");
     const $tabBar        = document.getElementById("tab-bar");
     const $editorWelcome = document.getElementById("editor-welcome");
@@ -61,7 +62,6 @@
     const $chatSessionStats = document.getElementById("chat-session-stats");
     const $chatSessionTime = document.getElementById("chat-session-time");
     const $chatSessionTotals = document.getElementById("chat-session-totals");
-    const $chatComposerReviewBtn = document.getElementById("chat-composer-review-btn");
     const $chatMenuBtn = document.getElementById("chat-menu-btn");
     const $chatMenuDropdown = document.getElementById("chat-menu-dropdown");
     const $stickyTodoBar = document.getElementById("sticky-todo-bar");
@@ -76,6 +76,7 @@
     const $chatComposerTime = document.getElementById("chat-composer-time");
     const $chatComposerTotals = document.getElementById("chat-composer-totals");
     const $chatComposerFiles = document.getElementById("chat-composer-files");
+    const $chatComposerEdits = document.getElementById("chat-composer-edits");
     const $openBtn       = document.getElementById("open-project-btn");
     const $logoHome      = document.getElementById("logo-home");
     const $searchToggle  = document.getElementById("search-toggle-btn");
@@ -156,6 +157,18 @@
     let scoutEl = null;
     const pendingImages = []; // { id, file, previewUrl, name, size, media_type }
     let currentSessionId = null;
+    const BEDROCK_SESSION_KEY = "bedrock_session_" + (location.host || "default");
+    function persistSessionId(id) {
+        try {
+            if (id) localStorage.setItem(BEDROCK_SESSION_KEY, id);
+            else localStorage.removeItem(BEDROCK_SESSION_KEY);
+        } catch (_) {}
+    }
+    function loadPersistedSessionId() {
+        try {
+            return localStorage.getItem(BEDROCK_SESSION_KEY) || null;
+        } catch (_) { return null; }
+    }
     let sessionStartTime = null; // set on first user message for "Xm" / "Xh" in header
     let suppressAgentSwitch = false;
 
@@ -414,14 +427,16 @@
             totalDel += stats.deletions;
         });
 
-        const showStats = sessionStartTime || changes.length > 0;
+        const hasFileEdits = changes.length > 0;
+        const showHeaderStats = sessionStartTime || hasFileEdits;
         const elapsed = sessionStartTime ? Date.now() - sessionStartTime : 0;
         const timeStr = formatSessionDuration(elapsed);
-        const filesLabel = changes.length === 0 ? "0 files" : (changes.length + " file" + (changes.length !== 1 ? "s" : ""));
+        const filesLabel = hasFileEdits ? (changes.length + " file" + (changes.length !== 1 ? "s" : "")) : "0 files";
+        const totalEdits = totalAdd + totalDel;
 
-        // Update header session stats (Cursor-style: time · +X -Y · Auto)
+        // Update header session stats (only when session or file edits)
         if ($chatSessionStats) {
-            if (showStats) {
+            if (showHeaderStats) {
                 $chatSessionStats.classList.remove("hidden");
                 if ($chatSessionTime) $chatSessionTime.textContent = timeStr;
                 if ($chatSessionTotals) {
@@ -435,9 +450,9 @@
             }
         }
 
-        // Update composer stats bar + file edits dropup (time · +N −M · N files; click to show per-file list)
+        // File edits bar: only show when there are edited files
         if ($chatComposerStats) {
-            if (showStats) {
+            if (hasFileEdits) {
                 $chatComposerStats.classList.remove("hidden");
                 if ($chatComposerTime) $chatComposerTime.textContent = timeStr;
                 if ($chatComposerTotals) {
@@ -447,33 +462,30 @@
                     if (delEl) delEl.textContent = "\u2212" + totalDel;
                 }
                 if ($chatComposerFiles) $chatComposerFiles.textContent = filesLabel;
-                // Populate dropup: edits per file with icon, path, +X −Y; click opens file
+                if ($chatComposerEdits) $chatComposerEdits.textContent = "\u2009\u22c5\u2009" + (totalEdits === 1 ? "1 edit" : totalEdits + " edits");
                 if ($chatComposerFilesDropup) {
-                    if (changes.length > 0) {
-                        $chatComposerFilesDropup.innerHTML = changes.map(([path, stats]) => {
-                            const icon = fileTypeIcon(path, 14);
-                            const add = stats.edits > 0 ? `<span class="add">+${stats.edits}</span>` : "";
-                            const del = stats.deletions > 0 ? `<span class="del">−${stats.deletions}</span>` : "";
-                            return `<div class="composer-file-item" data-path="${escapeHtml(path)}" title="${escapeHtml(path)}">
-                                <span class="file-icon">${icon}</span>
-                                <span class="file-path">${escapeHtml(path)}</span>
-                                <span class="file-stats">${add} ${del}</span>
-                            </div>`;
-                        }).join("");
-                        $chatComposerFilesDropup.querySelectorAll(".composer-file-item[data-path]").forEach((item) => {
-                            item.addEventListener("click", () => {
-                                const path = item.dataset.path;
-                                if (path) openFile(path);
-                            });
+                    $chatComposerFilesDropup.innerHTML = changes.map(([path, stats]) => {
+                        const icon = fileTypeIcon(path, 14);
+                        const add = stats.edits > 0 ? `<span class="add">+${stats.edits}</span>` : "";
+                        const del = stats.deletions > 0 ? `<span class="del">−${stats.deletions}</span>` : "";
+                        return `<div class="composer-file-item" data-path="${escapeHtml(path)}" title="${escapeHtml(path)}">
+                            <span class="file-icon">${icon}</span>
+                            <span class="file-path">${escapeHtml(path)}</span>
+                            <span class="file-stats">${add} ${del}</span>
+                        </div>`;
+                    }).join("");
+                    $chatComposerFilesDropup.querySelectorAll(".composer-file-item[data-path]").forEach((item) => {
+                        item.addEventListener("click", () => {
+                            const path = item.dataset.path;
+                            if (path) openFile(path);
                         });
-                    } else {
-                        $chatComposerFilesDropup.innerHTML = "";
-                    }
+                    });
                 }
             } else {
                 $chatComposerStats.classList.add("hidden");
                 if ($chatComposerFilesDropup) $chatComposerFilesDropup.innerHTML = "";
-                if ($chatComposerStats) $chatComposerStats.removeAttribute("data-expanded");
+                $chatComposerStats.removeAttribute("data-expanded");
+                if ($chatComposerEdits) $chatComposerEdits.textContent = "";
             }
         }
 
@@ -688,9 +700,430 @@
     async function refreshTree() {
         await fetchGitStatus();
         $fileTree.innerHTML = "";
+        if ($fileFilter) $fileFilter.value = "";
         loadTree();
         updateModifiedFilesBar();
     }
+
+    /* ── File filter: fuzzy search in explorer tree ─────────────── */
+    let _fileFilterTimeout = null;
+    let _allFilePaths = null;
+
+    function fuzzyMatch(query, text) {
+        query = query.toLowerCase();
+        text = text.toLowerCase();
+        let qi = 0;
+        for (let ti = 0; ti < text.length && qi < query.length; ti++) {
+            if (text[ti] === query[qi]) qi++;
+        }
+        return qi === query.length;
+    }
+
+    async function fetchAllFiles() {
+        try {
+            const res = await fetch("/api/files?recursive=true");
+            if (res.ok) {
+                _allFilePaths = await res.json();
+                return _allFilePaths;
+            }
+        } catch {}
+        return null;
+    }
+
+    function renderFilteredFiles(matches) {
+        $fileTree.innerHTML = "";
+        if (!matches || matches.length === 0) {
+            $fileTree.innerHTML = `<div class="info-msg" style="padding:10px;opacity:0.6">No files match filter</div>`;
+            return;
+        }
+        matches.slice(0, 100).forEach(item => {
+            const el = document.createElement("div");
+            const icon = fileIcon(item.ext || item.name.split(".").pop());
+            const pathNorm = (item.path || "").replace(/\\/g, "/");
+            const g = gitStatus.get(pathNorm);
+            const agentMod = modifiedFiles.has(item.path) || modifiedFiles.has(pathNorm);
+            const statusCls = agentMod ? "modified" : (g === "M" ? "modified" : g === "A" ? "added" : g === "D" ? "deleted" : g === "U" ? "untracked" : "");
+            el.innerHTML = `
+                <div class="tree-item ${statusCls}" data-path="${escapeHtml(item.path)}" data-type="file" style="padding-left:12px">
+                    <span class="tree-icon">${icon}</span>
+                    <span class="tree-file-name">${escapeHtml(item.name)}</span>
+                    <span class="tree-file-path-hint" style="margin-left:6px;opacity:0.45;font-size:11px">${escapeHtml(item.dir || "")}</span>
+                </div>
+            `;
+            el.querySelector(".tree-item").addEventListener("click", () => openFile(item.path));
+            $fileTree.appendChild(el);
+        });
+        if (matches.length > 100) {
+            $fileTree.insertAdjacentHTML("beforeend", `<div class="info-msg" style="padding:8px;opacity:0.5">${matches.length - 100} more...</div>`);
+        }
+    }
+
+    if ($fileFilter) {
+        $fileFilter.addEventListener("input", () => {
+            clearTimeout(_fileFilterTimeout);
+            const q = $fileFilter.value.trim();
+            if (!q) {
+                $fileTree.innerHTML = "";
+                loadTree();
+                return;
+            }
+            _fileFilterTimeout = setTimeout(async () => {
+                if (!_allFilePaths) await fetchAllFiles();
+                if (!_allFilePaths) return;
+                const matches = _allFilePaths.filter(f => fuzzyMatch(q, f.name) || fuzzyMatch(q, f.path));
+                renderFilteredFiles(matches);
+            }, 150);
+        });
+        $fileFilter.addEventListener("keydown", (e) => {
+            if (e.key === "Escape") {
+                $fileFilter.value = "";
+                $fileTree.innerHTML = "";
+                loadTree();
+            }
+        });
+    }
+
+    /* ── @ Mention autocomplete system ────────────────────────── */
+    const $mentionPopup = document.getElementById("mention-popup");
+    let _mentionActive = false;
+    let _mentionStart = -1;
+    let _mentionSelectedIdx = 0;
+    let _mentionItems = [];
+
+    const SPECIAL_MENTIONS = [
+        { label: "codebase", desc: "Inject project tree + entry points", type: "special", icon: "🗂" },
+        { label: "git", desc: "Inject git diff output", type: "special", icon: "📋" },
+        { label: "terminal", desc: "Inject recent terminal output", type: "special", icon: "⬛" },
+    ];
+
+    function scoredFuzzyMatch(query, text) {
+        query = query.toLowerCase();
+        text = text.toLowerCase();
+        let qi = 0, score = 0, lastMatch = -1;
+        for (let ti = 0; ti < text.length && qi < query.length; ti++) {
+            if (text[ti] === query[qi]) {
+                if (ti === 0 || text[ti - 1] === "/" || text[ti - 1] === "." || text[ti - 1] === "_" || text[ti - 1] === "-") {
+                    score += 10;
+                }
+                if (lastMatch === ti - 1) score += 5;
+                score += 1;
+                lastMatch = ti;
+                qi++;
+            }
+        }
+        return qi === query.length ? score : -1;
+    }
+
+    function getMentionCandidates(query) {
+        const results = [];
+        const q = query.toLowerCase();
+
+        for (const s of SPECIAL_MENTIONS) {
+            if (!q || s.label.toLowerCase().includes(q)) {
+                results.push({ ...s, score: q ? (s.label.toLowerCase().startsWith(q) ? 100 : 50) : 10 });
+            }
+        }
+
+        if (_allFilePaths) {
+            for (const f of _allFilePaths) {
+                if (results.length >= 12) break;
+                const nameScore = scoredFuzzyMatch(q, f.name);
+                const pathScore = scoredFuzzyMatch(q, f.path);
+                const best = Math.max(nameScore, pathScore);
+                if (!q || best > 0) {
+                    results.push({
+                        label: f.name,
+                        path: f.path,
+                        dir: f.dir || "",
+                        type: "file",
+                        icon: "",
+                        score: best > 0 ? best : 1,
+                    });
+                }
+            }
+        }
+
+        results.sort((a, b) => b.score - a.score);
+        return results.slice(0, 10);
+    }
+
+    function renderMentionPopup(items) {
+        if (!$mentionPopup) return;
+        if (!items || items.length === 0) {
+            $mentionPopup.classList.add("hidden");
+            _mentionActive = false;
+            return;
+        }
+        _mentionItems = items;
+        _mentionSelectedIdx = 0;
+        let html = "";
+        items.forEach((item, i) => {
+            const icon = item.type === "file" ? (typeof fileTypeIcon === "function" ? fileTypeIcon(item.label, 14) : "📄") : item.icon;
+            const dir = item.dir ? `<span class="mention-dir">${escapeHtml(item.dir)}</span>` : "";
+            const desc = item.desc ? `<span class="mention-dir">${escapeHtml(item.desc)}</span>` : "";
+            const typeBadge = item.type === "special" ? `<span class="mention-type">special</span>` : "";
+            html += `<div class="mention-item${i === 0 ? " selected" : ""}" data-idx="${i}">
+                <span class="mention-icon">${icon}</span>
+                <span class="mention-label">${escapeHtml(item.label)}</span>
+                ${dir}${desc}${typeBadge}
+            </div>`;
+        });
+        $mentionPopup.innerHTML = html;
+        $mentionPopup.classList.remove("hidden");
+        _mentionActive = true;
+
+        $mentionPopup.querySelectorAll(".mention-item").forEach(el => {
+            el.addEventListener("mousedown", (e) => {
+                e.preventDefault();
+                selectMention(parseInt(el.dataset.idx));
+            });
+        });
+    }
+
+    function selectMention(idx) {
+        const item = _mentionItems[idx];
+        if (!item) return;
+        const val = $input.value;
+        const before = val.slice(0, _mentionStart);
+        const after = val.slice($input.selectionStart);
+        const mention = item.type === "file" ? `@${item.path} ` : `@${item.label} `;
+        $input.value = before + mention + after;
+        closeMentionPopup();
+        $input.focus();
+        const newPos = before.length + mention.length;
+        $input.setSelectionRange(newPos, newPos);
+    }
+
+    function closeMentionPopup() {
+        if ($mentionPopup) $mentionPopup.classList.add("hidden");
+        _mentionActive = false;
+        _mentionStart = -1;
+    }
+
+    function updateMentionHighlight() {
+        if (!$mentionPopup) return;
+        $mentionPopup.querySelectorAll(".mention-item").forEach((el, i) => {
+            el.classList.toggle("selected", i === _mentionSelectedIdx);
+        });
+        const sel = $mentionPopup.querySelector(".mention-item.selected");
+        if (sel) sel.scrollIntoView({ block: "nearest" });
+    }
+
+    if ($input && $mentionPopup) {
+        $input.addEventListener("input", async () => {
+            const val = $input.value;
+            const pos = $input.selectionStart;
+
+            if (_mentionActive) {
+                if (pos <= _mentionStart || val[_mentionStart] !== "@") {
+                    closeMentionPopup();
+                    return;
+                }
+                const query = val.slice(_mentionStart + 1, pos);
+                if (query.includes(" ") || query.includes("\n")) {
+                    closeMentionPopup();
+                    return;
+                }
+                if (!_allFilePaths) await fetchAllFiles();
+                renderMentionPopup(getMentionCandidates(query));
+                return;
+            }
+
+            if (pos > 0 && val[pos - 1] === "@") {
+                const charBefore = pos >= 2 ? val[pos - 2] : " ";
+                if (charBefore === " " || charBefore === "\n" || pos === 1) {
+                    _mentionStart = pos - 1;
+                    if (!_allFilePaths) await fetchAllFiles();
+                    renderMentionPopup(getMentionCandidates(""));
+                }
+            }
+        });
+
+        $input.addEventListener("keydown", (e) => {
+            if (!_mentionActive) return;
+            if (e.key === "ArrowDown") {
+                e.preventDefault();
+                _mentionSelectedIdx = Math.min(_mentionSelectedIdx + 1, _mentionItems.length - 1);
+                updateMentionHighlight();
+            } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                _mentionSelectedIdx = Math.max(_mentionSelectedIdx - 1, 0);
+                updateMentionHighlight();
+            } else if (e.key === "Enter" || e.key === "Tab") {
+                e.preventDefault();
+                selectMention(_mentionSelectedIdx);
+            } else if (e.key === "Escape") {
+                e.preventDefault();
+                closeMentionPopup();
+            }
+        });
+
+        $input.addEventListener("blur", () => {
+            setTimeout(closeMentionPopup, 150);
+        });
+    }
+
+    /* ── Command Palette + Quick File Open (Cmd+Shift+P / Cmd+P) ── */
+    const $cp = document.getElementById("command-palette");
+    const $cpInput = document.getElementById("command-palette-input");
+    const $cpResults = document.getElementById("command-palette-results");
+    let _cpMode = "command";
+    let _cpSelectedIdx = 0;
+    let _cpItems = [];
+
+    const CP_COMMANDS = [
+        { id: "open-file", label: "Open File…", shortcut: "⌘P", icon: "📄", action: () => openCommandPalette("file") },
+        { id: "search-files", label: "Search in Files", shortcut: "⌘⇧F", icon: "🔍", action: () => { closeCommandPalette(); const btn = document.getElementById("search-toggle-btn"); if (btn) btn.click(); } },
+        { id: "new-chat", label: "New Chat / Reset Session", shortcut: "", icon: "💬", action: () => { closeCommandPalette(); send({ type: "reset" }); } },
+        { id: "refresh-tree", label: "Refresh File Tree", shortcut: "", icon: "🔄", action: () => { closeCommandPalette(); refreshTree(); } },
+        { id: "toggle-explorer", label: "Toggle Explorer Panel", shortcut: "⌘B", icon: "📁", action: () => { closeCommandPalette(); const ex = document.getElementById("file-explorer"); if (ex) ex.style.display = ex.style.display === "none" ? "" : "none"; } },
+        { id: "go-to-line", label: "Go to Line…", shortcut: "⌘G", icon: "↕", action: () => { closeCommandPalette(); if (monacoInstance) monacoInstance.getAction("editor.action.gotoLine")?.run(); } },
+    ];
+
+    function openCommandPalette(mode = "command") {
+        if (!$cp) return;
+        _cpMode = mode;
+        $cp.classList.remove("hidden");
+        $cpInput.value = mode === "file" ? "" : "> ";
+        $cpInput.placeholder = mode === "file" ? "Search files by name…" : "Type a command…";
+        $cpInput.focus();
+        updatePaletteResults();
+    }
+
+    function closeCommandPalette() {
+        if ($cp) $cp.classList.add("hidden");
+        $cpInput.value = "";
+    }
+
+    function updatePaletteResults() {
+        const raw = $cpInput.value;
+        const isCmd = raw.startsWith("> ");
+        _cpMode = isCmd ? "command" : "file";
+        const q = isCmd ? raw.slice(2).trim() : raw.trim();
+
+        if (_cpMode === "command") {
+            _cpItems = CP_COMMANDS.filter(c => !q || c.label.toLowerCase().includes(q.toLowerCase()));
+            _cpSelectedIdx = 0;
+            renderPaletteItems(_cpItems.map(c => ({
+                icon: c.icon,
+                label: c.label,
+                shortcut: c.shortcut,
+                dir: "",
+            })));
+        } else {
+            if (!_allFilePaths) {
+                fetchAllFiles().then(() => updatePaletteResults());
+                return;
+            }
+            let matches;
+            if (!q) {
+                matches = _allFilePaths.slice(0, 15);
+            } else {
+                const scored = [];
+                for (const f of _allFilePaths) {
+                    const s = scoredFuzzyMatch(q, f.name);
+                    const ps = scoredFuzzyMatch(q, f.path);
+                    const best = Math.max(s, ps);
+                    if (best > 0) scored.push({ ...f, score: best });
+                }
+                scored.sort((a, b) => b.score - a.score);
+                matches = scored.slice(0, 15);
+            }
+            _cpItems = matches.map(f => ({
+                icon: typeof fileTypeIcon === "function" ? fileTypeIcon(f.name, 14) : "📄",
+                label: f.name,
+                dir: f.dir || "",
+                path: f.path,
+                shortcut: "",
+                _isFile: true,
+            }));
+            _cpSelectedIdx = 0;
+            renderPaletteItems(_cpItems);
+        }
+    }
+
+    function renderPaletteItems(items) {
+        if (!$cpResults) return;
+        if (!items.length) {
+            $cpResults.innerHTML = `<div class="cp-item" style="opacity:0.4;cursor:default">No results</div>`;
+            return;
+        }
+        let html = "";
+        items.forEach((item, i) => {
+            const dir = item.dir ? `<span class="cp-dir">${escapeHtml(item.dir)}</span>` : "";
+            const shortcut = item.shortcut ? `<span class="cp-shortcut">${item.shortcut}</span>` : "";
+            html += `<div class="cp-item${i === 0 ? " selected" : ""}" data-idx="${i}">
+                <span class="cp-icon">${item.icon}</span>
+                <span class="cp-label">${escapeHtml(item.label)}</span>
+                ${dir}${shortcut}
+            </div>`;
+        });
+        $cpResults.innerHTML = html;
+        $cpResults.querySelectorAll(".cp-item").forEach(el => {
+            el.addEventListener("mousedown", (e) => {
+                e.preventDefault();
+                executePaletteItem(parseInt(el.dataset.idx));
+            });
+        });
+    }
+
+    function executePaletteItem(idx) {
+        const item = _cpItems[idx];
+        if (!item) return;
+        if (item._isFile || item.path) {
+            closeCommandPalette();
+            openFile(item.path);
+        } else if (item.action) {
+            item.action();
+        } else {
+            const cmd = CP_COMMANDS[idx];
+            if (cmd && cmd.action) cmd.action();
+        }
+    }
+
+    function updatePaletteHighlight() {
+        if (!$cpResults) return;
+        $cpResults.querySelectorAll(".cp-item").forEach((el, i) => {
+            el.classList.toggle("selected", i === _cpSelectedIdx);
+        });
+        const sel = $cpResults.querySelector(".cp-item.selected");
+        if (sel) sel.scrollIntoView({ block: "nearest" });
+    }
+
+    if ($cp && $cpInput) {
+        $cpInput.addEventListener("input", updatePaletteResults);
+        $cpInput.addEventListener("keydown", (e) => {
+            if (e.key === "ArrowDown") {
+                e.preventDefault();
+                _cpSelectedIdx = Math.min(_cpSelectedIdx + 1, _cpItems.length - 1);
+                updatePaletteHighlight();
+            } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                _cpSelectedIdx = Math.max(_cpSelectedIdx - 1, 0);
+                updatePaletteHighlight();
+            } else if (e.key === "Enter") {
+                e.preventDefault();
+                executePaletteItem(_cpSelectedIdx);
+            } else if (e.key === "Escape") {
+                e.preventDefault();
+                closeCommandPalette();
+            }
+        });
+        $cp.querySelector(".command-palette-backdrop").addEventListener("click", closeCommandPalette);
+    }
+
+    document.addEventListener("keydown", (e) => {
+        const isMac = navigator.platform.toUpperCase().indexOf("MAC") >= 0;
+        const mod = isMac ? e.metaKey : e.ctrlKey;
+
+        if (mod && e.shiftKey && e.key.toLowerCase() === "p") {
+            e.preventDefault();
+            openCommandPalette("command");
+        } else if (mod && !e.shiftKey && e.key.toLowerCase() === "p") {
+            e.preventDefault();
+            openCommandPalette("file");
+        }
+    });
 
     async function updateModifiedFilesBar() {
         if (!$modifiedFilesBar || !$modifiedFilesToggle || !$modifiedFilesList || !$modifiedFilesDropdown) return;
@@ -805,7 +1238,6 @@
             $chatComposerFilesDropup.setAttribute("aria-hidden", expanded ? "true" : "false");
         }
         $chatComposerStatsToggle.addEventListener("click", toggleComposerFilesDropup);
-        if ($chatComposerReviewBtn) $chatComposerReviewBtn.addEventListener("click", toggleComposerFilesDropup);
     }
     // Chat menu (…) dropdown
     if ($chatMenuBtn && $chatMenuDropdown) {
@@ -841,14 +1273,84 @@
             inherit: true,
             rules: [],
             colors: {
-                "editor.background": "#0d1117",
-                "editor.foreground": "#e6edf3",
-                "editorLineNumber.foreground": "#6e7681",
-                "editorCursor.foreground": "#58a6ff",
+                "editor.background": "#1a1a2e",
+                "editor.foreground": "#e8eaf0",
+                "editorLineNumber.foreground": "#5c6370",
+                "editorCursor.foreground": "#6c9fff",
                 "editor.selectionBackground": "#264f78",
-                "editor.lineHighlightBackground": "#161b22",
+                "editor.lineHighlightBackground": "#16213e",
+                "editorWidget.background": "#16213e",
+                "editorWidget.border": "#2a3a5c",
+                "editorSuggestWidget.background": "#16213e",
+                "editorSuggestWidget.border": "#2a3a5c",
             }
         });
+
+        // Go to Definition provider (F12 / Cmd+Click)
+        m.languages.registerDefinitionProvider("*", {
+            provideDefinition: async (model, position) => {
+                const word = model.getWordAtPosition(position);
+                if (!word) return null;
+                try {
+                    const res = await fetch(`/api/find-symbol?symbol=${encodeURIComponent(word.word)}&kind=definition`);
+                    if (!res.ok) return null;
+                    const data = await res.json();
+                    if (!data.results || !data.results.length) return null;
+                    const r = data.results[0];
+                    openFile(r.path).then(() => {
+                        if (monacoInstance) {
+                            monacoInstance.revealLineInCenter(r.line);
+                            monacoInstance.setPosition({ lineNumber: r.line, column: 1 });
+                        }
+                    });
+                    const existingModel = m.editor.getModel(m.Uri.file(r.path));
+                    if (existingModel) {
+                        return [{ uri: m.Uri.file(r.path), range: new m.Range(r.line, 1, r.line, 1) }];
+                    }
+                    return null;
+                } catch { return null; }
+            }
+        });
+
+        // Find References provider (Shift+F12)
+        m.languages.registerReferenceProvider("*", {
+            provideReferences: async (model, position) => {
+                const word = model.getWordAtPosition(position);
+                if (!word) return [];
+                try {
+                    const res = await fetch(`/api/find-symbol?symbol=${encodeURIComponent(word.word)}&kind=all`);
+                    if (!res.ok) return [];
+                    const data = await res.json();
+                    if (!data.results || !data.results.length) return [];
+                    return data.results.map(r => {
+                        const existingModel = m.editor.getModel(m.Uri.file(r.path));
+                        if (existingModel) {
+                            return { uri: m.Uri.file(r.path), range: new m.Range(r.line, 1, r.line, 1) };
+                        }
+                        return { uri: model.uri, range: new m.Range(1, 1, 1, 1) };
+                    }).filter(r => r.uri !== model.uri || r.range.startLineNumber > 1);
+                } catch { return []; }
+            }
+        });
+
+        // Register editor opener so Go to Definition opens files in our editor
+        if (m.editor.registerEditorOpener) {
+            m.editor.registerEditorOpener({
+                openCodeEditor(source, resource, selectionOrPosition) {
+                    const filePath = resource.path.startsWith("/") ? resource.path.slice(1) : resource.path;
+                    openFile(filePath).then(() => {
+                        if (monacoInstance && selectionOrPosition) {
+                            const line = selectionOrPosition.startLineNumber || selectionOrPosition.lineNumber || 1;
+                            const col = selectionOrPosition.startColumn || selectionOrPosition.column || 1;
+                            monacoInstance.setPosition({ lineNumber: line, column: col });
+                            monacoInstance.revealLineInCenter(line);
+                        }
+                    });
+                    return true;
+                }
+            });
+        }
+
         monacoReady = true;
     }
 
@@ -922,12 +1424,15 @@
                 theme: "bedrock-dark",
                 fontSize: 13,
                 fontFamily: "'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace",
-                minimap: { enabled: true },
+                minimap: { enabled: true, maxColumn: 80 },
                 scrollBeyondLastLine: false,
                 automaticLayout: true,
                 lineNumbers: "on",
                 renderLineHighlight: "gutter",
                 padding: { top: 8 },
+                "bracketPairColorization.enabled": true,
+                guides: { bracketPairs: true, indentation: true },
+                stickyScroll: { enabled: true },
             });
 
             // Save on Cmd/Ctrl+S
@@ -958,6 +1463,34 @@
         $fileTree.querySelectorAll(".tree-item").forEach(t => t.classList.remove("active"));
         const treeItem = $fileTree.querySelector(`.tree-item[data-path="${CSS.escape(path)}"]`);
         if (treeItem) treeItem.classList.add("active");
+
+        // Update breadcrumb
+        updateBreadcrumb(path);
+    }
+
+    const $breadcrumb = document.getElementById("editor-breadcrumb");
+    function updateBreadcrumb(path) {
+        if (!$breadcrumb) return;
+        if (!path) {
+            $breadcrumb.classList.add("hidden");
+            return;
+        }
+        $breadcrumb.classList.remove("hidden");
+        const parts = path.replace(/\\/g, "/").split("/");
+        let html = "";
+        parts.forEach((part, i) => {
+            if (i > 0) html += `<span class="bc-sep">›</span>`;
+            const isCurrent = i === parts.length - 1;
+            const partPath = parts.slice(0, i + 1).join("/");
+            html += `<span class="bc-part${isCurrent ? " current" : ""}" data-path="${escapeHtml(partPath)}">${escapeHtml(part)}</span>`;
+        });
+        $breadcrumb.innerHTML = html;
+        $breadcrumb.querySelectorAll(".bc-part").forEach(el => {
+            el.addEventListener("click", () => {
+                const p = el.dataset.path;
+                if (openTabs.has(p)) switchToTab(p);
+            });
+        });
     }
 
     function createTabEl(path) {
@@ -1266,7 +1799,7 @@
                         isWholeLine: true,
                         linesDecorationsClassName: "diff-gutter-added",
                         className: "diff-line-added-bg",
-                        overviewRuler: { color: "#3fb950", position: monaco.editor.OverviewRulerLane.Left },
+                        overviewRuler: { color: "#4ec9b0", position: monaco.editor.OverviewRulerLane.Left },
                     }
                 });
             }
@@ -1279,7 +1812,7 @@
                         isWholeLine: true,
                         linesDecorationsClassName: "diff-gutter-modified",
                         className: "diff-line-modified-bg",
-                        overviewRuler: { color: "#58a6ff", position: monaco.editor.OverviewRulerLane.Left },
+                        overviewRuler: { color: "#6c9fff", position: monaco.editor.OverviewRulerLane.Left },
                     }
                 });
             }
@@ -1291,7 +1824,7 @@
                     options: {
                         isWholeLine: false,
                         linesDecorationsClassName: "diff-gutter-deleted",
-                        overviewRuler: { color: "#f85149", position: monaco.editor.OverviewRulerLane.Left },
+                        overviewRuler: { color: "#f44747", position: monaco.editor.OverviewRulerLane.Left },
                     }
                 });
             }
@@ -1328,7 +1861,7 @@
                         isWholeLine: true,
                         linesDecorationsClassName: "diff-gutter-added",
                         className: "diff-line-added-bg",
-                        overviewRuler: { color: "#3fb950", position: monaco.editor.OverviewRulerLane.Left },
+                        overviewRuler: { color: "#4ec9b0", position: monaco.editor.OverviewRulerLane.Left },
                     }
                 });
             }
@@ -1339,7 +1872,7 @@
                         isWholeLine: true,
                         linesDecorationsClassName: "diff-gutter-modified",
                         className: "diff-line-modified-bg",
-                        overviewRuler: { color: "#58a6ff", position: monaco.editor.OverviewRulerLane.Left },
+                        overviewRuler: { color: "#6c9fff", position: monaco.editor.OverviewRulerLane.Left },
                     }
                 });
             }
@@ -1349,7 +1882,7 @@
                     options: {
                         isWholeLine: false,
                         linesDecorationsClassName: "diff-gutter-deleted",
-                        overviewRuler: { color: "#f85149", position: monaco.editor.OverviewRulerLane.Left },
+                        overviewRuler: { color: "#f44747", position: monaco.editor.OverviewRulerLane.Left },
                     }
                 });
             }
@@ -1578,10 +2111,11 @@
             fontSize: 12,
             fontFamily: "ui-monospace, monospace",
             theme: {
-                background: "#0d1117",
-                foreground: "#e6edf3",
-                cursor: "#58a6ff",
-                cursorAccent: "#0d1117",
+                background: "#1a1a2e",
+                foreground: "#e8eaf0",
+                cursor: "#6c9fff",
+                cursorAccent: "#1a1a2e",
+                selectionBackground: "#264f78",
             },
         });
         const FitAddonCtor = window.FitAddon && (window.FitAddon.FitAddon || window.FitAddon);
@@ -1840,24 +2374,35 @@
     }
 
     // Thinking blocks
+    let _thinkingBuffer = ""; // accumulates raw thinking text for markdown rendering
+    let _thinkingRenderTimer = null; // debounce timer for markdown render
+    let _thinkingUserCollapsed = false; // track if user manually collapsed during stream
+
     function updateThinkingHeader(block, done = false) {
         if (!block) return;
         const started = Number(block.dataset.startedAt || Date.now());
         const elapsed = Math.max(0, Math.round((Date.now() - started) / 1000));
         const titleEl = block.querySelector(".thinking-title");
-        const statusEl = block.querySelector(".thinking-status-text");
         if (titleEl) {
-            titleEl.textContent = elapsed > 0 ? `Thought ${elapsed}s` : "Thought 0s";
+            if (done) {
+                titleEl.textContent = `Thought for ${elapsed}s`;
+            } else {
+                titleEl.textContent = elapsed > 0 ? `Thinking\u2026 ${elapsed}s` : "Thinking\u2026";
+            }
         }
-        if (statusEl) {
-            statusEl.textContent = done ? "" : "";
+        if (done) {
+            block.classList.remove("thinking-active");
+        } else {
+            block.classList.add("thinking-active");
         }
     }
 
     function createThinkingBlock() {
         const bubble = getOrCreateBubble();
-        const block = document.createElement("div"); block.className = "thinking-block";
+        const block = document.createElement("div"); block.className = "thinking-block thinking-active";
         block.dataset.startedAt = String(Date.now());
+        _thinkingBuffer = "";
+        _thinkingUserCollapsed = false;
         block.innerHTML = `
             <div class="thinking-header">
                 <div class="thinking-left">
@@ -1867,7 +2412,7 @@
                             <path d="M9 19h6"/><path d="M10 22h4"/>
                         </svg>
                     </span>
-                    <span class="thinking-title">Thought 0s</span>
+                    <span class="thinking-title">Thinking\u2026</span>
                 </div>
                 <div class="thinking-right">
                     <span class="thinking-spinner spinner"></span>
@@ -1875,20 +2420,61 @@
                 </div>
             </div>
             <div class="thinking-content"></div>`;
-        block.querySelector(".thinking-header").addEventListener("click", () => block.classList.toggle("collapsed"));
+        block.querySelector(".thinking-header").addEventListener("click", () => {
+            block.classList.toggle("collapsed");
+            if (block.classList.contains("thinking-active")) {
+                _thinkingUserCollapsed = block.classList.contains("collapsed");
+            }
+        });
         bubble.appendChild(block);
         updateThinkingHeader(block, false);
         scrollChat();
         return block.querySelector(".thinking-content");
     }
+
+    function _renderThinkingContent(el) {
+        if (!el || !_thinkingBuffer) return;
+        if (typeof marked !== "undefined") {
+            el.innerHTML = marked.parse(_thinkingBuffer);
+            el.querySelectorAll("pre code").forEach(b => {
+                if (typeof hljs !== "undefined") try { hljs.highlightElement(b); } catch (_) {}
+            });
+        } else {
+            el.textContent = _thinkingBuffer;
+        }
+        // Auto-scroll to bottom of thinking content
+        el.scrollTop = el.scrollHeight;
+    }
+
+    function appendThinkingContent(el, delta) {
+        if (!el) return;
+        _thinkingBuffer += delta;
+        // Debounce markdown rendering (every 80ms) to avoid jank during fast streaming
+        if (_thinkingRenderTimer) clearTimeout(_thinkingRenderTimer);
+        _thinkingRenderTimer = setTimeout(() => { _renderThinkingContent(el); }, 80);
+        const block = el.closest(".thinking-block");
+        if (block) updateThinkingHeader(block, false);
+        scrollChat();
+    }
+
     function finishThinking(el) {
         if (!el) return;
+        if (_thinkingRenderTimer) { clearTimeout(_thinkingRenderTimer); _thinkingRenderTimer = null; }
+        // Final render with full content
+        _renderThinkingContent(el);
         const block = el.closest(".thinking-block"); if (!block) return;
         updateThinkingHeader(block, true);
         const spinner = block.querySelector(".thinking-spinner"); if (spinner) spinner.remove();
-        block.classList.add("collapsed");
+        // Collapse only if thinking was long OR user didn't manually interact
+        if (!_thinkingUserCollapsed) {
+            block.classList.add("collapsed");
+        }
         const header = block.querySelector(".thinking-header");
-        if (header && !header.querySelector(".copy-btn")) header.appendChild(makeCopyBtn(() => el.textContent));
+        if (header && !header.querySelector(".copy-btn")) {
+            header.appendChild(makeCopyBtn(() => _thinkingBuffer || el.textContent));
+        }
+        _thinkingBuffer = "";
+        _thinkingUserCollapsed = false;
     }
 
     // Tool blocks
@@ -1937,7 +2523,8 @@
         addUserMessage(prompt);
         setRunning(true);
         addAssistantMessage();
-        send({ type: "task", content: prompt });
+        const editorCtx = gatherEditorContext();
+        send({ type: "task", content: prompt, ...(editorCtx ? { context: editorCtx } : {}) });
     }
     function openFileAt(path, lineNumber) {
         if (!path) return;
@@ -2035,6 +2622,31 @@
         }
         return wrap;
     }
+
+    function formatToolOutputBody(content) {
+        const str = String(content || "").trim();
+        if (!str) return makeProgressiveBody("(no output)", "tool-result-body");
+        try {
+            const parsed = JSON.parse(str);
+            if (parsed && typeof parsed === "object") {
+                const pretty = JSON.stringify(parsed, null, 2);
+                const wrap = document.createElement("div");
+                wrap.className = "tool-result-body-wrap";
+                const pre = document.createElement("pre");
+                pre.className = "tool-result-body tool-result-json";
+                pre.textContent = pretty;
+                wrap.appendChild(pre);
+                return wrap;
+            }
+        } catch (_) {}
+        if (str.length > 4000) return makeProgressiveBody(str, "", 4000);
+        const wrap = document.createElement("div");
+        const pre = document.createElement("pre");
+        pre.className = "tool-result-body";
+        pre.textContent = str;
+        wrap.appendChild(pre);
+        return wrap;
+    }
     function makeLocationList(rawText) {
         const lines = String(rawText || "").split("\n");
         const groups = [];
@@ -2055,7 +2667,8 @@
                 const row = document.createElement("button");
                 row.type = "button";
                 row.className = "tool-match-item";
-                row.innerHTML = `<span class="tool-match-group">${escapeHtml(hit.group)}</span><span class="tool-match-loc">${escapeHtml(hit.path)}:${hit.line}</span><span class="tool-match-text">${escapeHtml(hit.text || "")}</span>`;
+                const shortPath = condensePath(hit.path) || hit.path;
+                row.innerHTML = `<span class="tool-match-group">${escapeHtml(hit.group)}</span><span class="tool-match-loc" title="${escapeHtml(hit.path)}">${escapeHtml(shortPath)}:${hit.line}</span><span class="tool-match-text">${escapeHtml(hit.text || "")}</span>`;
                 row.addEventListener("click", (e) => { e.stopPropagation(); openFileAt(hit.path, hit.line); });
                 wrap.appendChild(row);
             });
@@ -2111,6 +2724,24 @@
         wrap.appendChild(preWrap);
         return wrap;
     }
+    /** Check if content contains a unified diff (has --- and +++ headers or @@ hunks). */
+    function _contentHasDiff(text) {
+        if (!text) return false;
+        return (/^---\s/m.test(text) && /^\+\+\+\s/m.test(text)) || /^@@\s/m.test(text);
+    }
+
+    /** Extract the diff portion from tool output (skip the summary line). */
+    function _extractDiffFromContent(text) {
+        if (!text) return { summary: "", diff: "" };
+        const lines = text.split("\n");
+        const diffStart = lines.findIndex(l => /^---\s/.test(l) || /^@@\s/.test(l));
+        if (diffStart <= 0) return { summary: "", diff: text };
+        return {
+            summary: lines.slice(0, diffStart).join("\n").trim(),
+            diff: lines.slice(diffStart).join("\n"),
+        };
+    }
+
     function renderToolOutput(runEl, name, input, content, success, extraData) {
         const out = document.createElement("div");
         out.className = `tool-result ${success ? "tool-result-success" : "tool-result-error"} ${name === "Bash" ? "tool-result-terminal" : ""}`;
@@ -2134,7 +2765,26 @@
             const preview = makeReadFilePreview(content, input);
             if (preview) out.appendChild(preview);
         }
-        if (name === "Write" || name === "Edit" || name === "symbol_edit") {
+
+        // Write/Edit/symbol_edit: render real diff from tool result (replaces preview)
+        const isFileEdit = name === "Write" || name === "Edit" || name === "symbol_edit";
+        if (isFileEdit && _contentHasDiff(content)) {
+            const { summary, diff } = _extractDiffFromContent(content);
+            if (summary) {
+                const meta = document.createElement("div");
+                meta.className = "tool-read-meta";
+                meta.textContent = summary;
+                out.appendChild(meta);
+            }
+            const mini = document.createElement("div");
+            mini.className = "tool-mini-diff";
+            mini.innerHTML = renderDiff(diff);
+            out.appendChild(mini);
+            // Remove preview diff if it was shown from tool_call
+            const existingPreview = runEl.querySelector(".tool-edit-preview");
+            if (existingPreview) existingPreview.remove();
+        } else if (isFileEdit) {
+            // Fallback: use input-based preview diff if tool didn't return a diff
             const diff = buildEditPreviewDiff(name, input);
             if (diff) {
                 const mini = document.createElement("div");
@@ -2142,9 +2792,18 @@
                 mini.innerHTML = renderDiff(diff);
                 out.appendChild(mini);
             }
+            // Remove preview if present
+            const existingPreview = runEl.querySelector(".tool-edit-preview");
+            if (existingPreview) existingPreview.remove();
         }
 
-        out.appendChild(makeProgressiveBody(content || "(no output)", name === "Bash" ? "tool-terminal-body" : "", name === "Bash" ? 6000 : 2400));
+        if (name === "Bash") {
+            out.appendChild(makeProgressiveBody(content || "(no output)", "tool-terminal-body", 6000));
+        } else if (isFileEdit && _contentHasDiff(content)) {
+            // Don't show raw JSON/text for file edits that have diffs — diff is enough
+        } else {
+            out.appendChild(formatToolOutputBody(content));
+        }
         runEl.appendChild(out);
         return out;
     }
@@ -2202,7 +2861,7 @@
             /* Stop button lives in .tool-content-actions; no need to inject into options panel */
         } else {
             const desc = toolDesc(name, input);
-            const headerDesc = (name === "Read" && input?.path) ? readFileDisplayString(input) : toolDescForHeader(name);
+            const headerDesc = (name === "Read" && input?.path) ? readFileDisplayString(input) : toolDescForHeader(name, input);
             const linkHtml = webToolLinkHtml(name, input);
             const icon = toolIcon(name, input);
             group = document.createElement("div");
@@ -2219,11 +2878,13 @@
                 : `<span class="tool-status tool-status-pending" title="Pending">${toolActionIcon("pending")}</span>`;
 
             const summaryText = headerDesc ? `${toolTitle(name)} ${headerDesc}` : toolTitle(name);
+            const fileToolWithPath = (name === "Read" || name === "Write" || name === "Edit" || name === "symbol_edit" || name === "lint_file") && input?.path;
+            const headerTitle = fileToolWithPath ? String(input.path).replace(/\\/g, "/") : (headerDesc || toolTitle(name));
             group.innerHTML = `
                 <div class="tool-header ${isCmd ? "tool-header-cmd" : ""}">
                     <div class="tool-left">
                         <span class="tool-icon-wrap"><span class="tool-icon">${icon}</span></span>
-                        <span class="tool-summary" title="${escapeHtml(headerDesc || toolTitle(name))}">${escapeHtml(summaryText)}</span>${linkHtml}
+                        <span class="tool-summary" title="${escapeHtml(headerTitle)}">${escapeHtml(summaryText)}</span>${linkHtml}
                     </div>
                     <div class="tool-right">
                         ${statusHtml}
@@ -2245,7 +2906,9 @@
                     </div>
                     <div class="tool-run-list"></div>
                 </div>`;
-            group.classList.add("collapsed");
+            // Write/Edit/symbol_edit start expanded so user can see the diff; others start collapsed
+            const startsExpanded = name === "Write" || name === "Edit" || name === "symbol_edit";
+            if (!startsExpanded) group.classList.add("collapsed");
             group.querySelector(".tool-header").addEventListener("click", () => group.classList.toggle("collapsed"));
 
             const optionsWrap = group.querySelector(".tool-options-wrap");
@@ -2335,6 +2998,16 @@
             <div class="tool-section-label">${isCmd ? "Command" : "Input"}</div>`;
         const inputText = isCmd ? (input?.command || JSON.stringify(input, null, 2)) : JSON.stringify(input, null, 2);
         run.appendChild(makeProgressiveBody(inputText || "{}", isCmd ? "tool-input tool-input-cmd" : "tool-input", isCmd ? 2800 : 1800));
+        // For Write/Edit: show instant preview diff from input so user sees changes immediately
+        if (name === "Write" || name === "Edit" || name === "symbol_edit") {
+            const previewDiff = buildEditPreviewDiff(name, input);
+            if (previewDiff) {
+                const previewWrap = document.createElement("div");
+                previewWrap.className = "tool-edit-preview";
+                previewWrap.innerHTML = `<div class="tool-section-label">Changes</div><div class="tool-mini-diff">${renderDiff(previewDiff)}</div>`;
+                run.appendChild(previewWrap);
+            }
+        }
         runList.appendChild(run);
         toolRunState.set(run, { name, input: input || {}, output: "" });
         if (toolUseId) toolRunById.set(String(toolUseId), run);
@@ -2343,9 +3016,29 @@
     }
     function addToolResult(content, success, runEl, extraData) {
         if (!runEl) return;
-        const state = toolRunState.get(runEl);
-        if (!state) return;
-        const group = runEl.closest(".tool-block");
+        // If we were passed the group (e.g. fallback when tool_use_id didn't match), use last run in group
+        if (runEl.classList && runEl.classList.contains("tool-block")) {
+            const list = runEl.querySelector(".tool-run-list");
+            runEl = (list && list.lastElementChild) || runEl;
+        }
+        let state = toolRunState.get(runEl);
+        if (!state) {
+            // Still update group header status so circle -> tick/cross works even when run state is missing (e.g. no output)
+            const group = runEl.closest ? runEl.closest(".tool-block") : (runEl.parentElement && runEl.parentElement.closest(".tool-block"));
+            if (group) {
+                const header = group.querySelector(".tool-header");
+                const statusEl = (header && header.querySelector(".tool-status")) || group.querySelector(".tool-status");
+                if (statusEl) {
+                    statusEl.outerHTML = success
+                        ? `<span class="tool-status tool-status-success" title="Done">${toolActionIcon("done")}</span>`
+                        : `<span class="tool-status tool-status-error" title="Failed">${toolActionIcon("failed")}</span>`;
+                    group.classList.remove("tool-block-loading");
+                }
+            }
+            return;
+        }
+        let group = runEl.closest(".tool-block");
+        if (!group && runEl.parentElement) group = runEl.parentElement.closest(".tool-block");
         if (!group) return;
         const isCmd = state.name === "Bash";
 
@@ -2377,7 +3070,8 @@
         const retryBtn = group.querySelector(".tool-action-retry");
         if (retryBtn) retryBtn.classList.toggle("hidden", success !== false);
 
-        const statusEl = group.querySelector(".tool-status");
+        const header = group.querySelector(".tool-header");
+        const statusEl = (header && header.querySelector(".tool-status")) || group.querySelector(".tool-status");
         if (statusEl) {
             if (isCmd) {
                 const exitCode = extraData?.exit_code;
@@ -2445,18 +3139,28 @@
         maybeAutoFollow(group, runEl);
         scrollChat();
     }
+    /** Show only the relevant part of a path in headers (last 2 segments, e.g. src/foo.tsx). */
+    function condensePath(fullPath) {
+        if (!fullPath || typeof fullPath !== "string") return "";
+        const path = String(fullPath).replace(/\\/g, "/").replace(/\/+$/, "");
+        const segments = path.split("/").filter(Boolean);
+        if (segments.length === 0) return "";
+        if (segments.length <= 2) return segments.join("/");
+        return segments.slice(-2).join("/");
+    }
     function readFileDisplayString(input) {
         if (!input?.path) return "Read";
         const path = String(input.path).replace(/\\/g, "/");
+        const short = condensePath(path);
         const base = path.split("/").pop() || path;
         const offset = input.offset != null ? Number(input.offset) : null;
         const limit = input.limit != null ? Number(input.limit) : null;
         if (offset != null && limit != null && limit > 0) {
             const end = offset + limit - 1;
-            return base + " L" + offset + "\u2013" + end;
+            return short + " L" + offset + "\u2013" + end;
         }
-        if (offset != null) return base + " L" + offset;
-        return base;
+        if (offset != null) return short + " L" + offset;
+        return short;
     }
     function countFilesAndMatchesInSearchOutput(output) {
         if (!output || typeof output !== "string") return { fileCount: 0, matchCount: 0 };
@@ -2555,8 +3259,17 @@
             default: return "";
         }
     }
-    function toolDescForHeader(n) {
-        /* Compact headers: don't show long desc in header; full input is in expanded body. */
+    function toolDescForHeader(n, i) {
+        /* Compact headers: show condensed path (or other short hint); full input is in expanded body. */
+        if (!i) return "";
+        const path = i.path != null ? String(i.path).replace(/\\/g, "/") : "";
+        if (n === "Write" || n === "Edit" || n === "lint_file") return condensePath(path) || "";
+        if (n === "symbol_edit") {
+            const p = condensePath(path);
+            const sym = i.symbol ? (i.symbol.length > 20 ? i.symbol.slice(0, 17) + "…" : i.symbol) : "";
+            return [p, sym].filter(Boolean).join(" · ") || "";
+        }
+        if (n === "list_directory" || n === "search" || n === "find_symbol") return condensePath(path) || (n === "search" ? (i.pattern || "") : n === "find_symbol" ? (i.symbol || "") : "") || "";
         return "";
     }
     /** Understated link/query for WebFetch/WebSearch in tool header. Returns safe HTML or "". */
@@ -2711,11 +3424,29 @@
             return;
         }
         $stickyTodoBar.classList.remove("hidden");
-        let countText = "To-dos " + items.length;
+
+        // Count completed/in-progress/pending
+        const completed = items.filter(t => (t.status || "").toLowerCase() === "completed").length;
+        const inProgress = items.filter(t => (t.status || "").toLowerCase() === "in_progress").length;
+        let countText = `${completed}/${items.length} tasks`;
         if (progress && progress.stepNum != null && progress.totalSteps != null) {
-            countText += ` — Step ${progress.stepNum}/${progress.totalSteps}`;
+            countText += ` \u2014 Step ${progress.stepNum}/${progress.totalSteps}`;
+        } else if (inProgress > 0) {
+            countText += ` \u2014 ${inProgress} in progress`;
         }
         $stickyTodoCount.textContent = countText;
+
+        // Build progress bar
+        const pct = items.length > 0 ? Math.round((completed / items.length) * 100) : 0;
+        let progressBar = $stickyTodoBar.querySelector(".sticky-todo-progress");
+        if (!progressBar) {
+            progressBar = document.createElement("div");
+            progressBar.className = "sticky-todo-progress";
+            progressBar.innerHTML = `<div class="sticky-todo-progress-fill"></div>`;
+            $stickyTodoBar.insertBefore(progressBar, $stickyTodoList);
+        }
+        progressBar.querySelector(".sticky-todo-progress-fill").style.width = pct + "%";
+
         $stickyTodoList.innerHTML = items.map((t) => {
             const status = (t.status || "pending").toLowerCase();
             const content = (t.content || "").trim() || "\u2014";
@@ -2757,8 +3488,32 @@
     // CHAT — Diff display
     // ================================================================
 
-    function showDiffs(files) {
+    function showDiffs(files, isCumulative) {
+        // Remove any previous cumulative diff container so we replace, not duplicate
+        const existing = document.getElementById("cumulative-diff-container");
+        if (existing) existing.remove();
+
         const bubble = getOrCreateBubble();
+        const container = document.createElement("div");
+        container.id = "cumulative-diff-container";
+        container.className = "cumulative-diff-container";
+
+        // Summary header
+        const totalAdds = files.reduce((s, f) => s + (f.additions || 0), 0);
+        const totalDels = files.reduce((s, f) => s + (f.deletions || 0), 0);
+        const newFiles = files.filter(f => f.label === "new file").length;
+        const modFiles = files.length - newFiles;
+        let summaryText = `${files.length} file${files.length !== 1 ? "s" : ""} changed`;
+        const parts = [];
+        if (modFiles > 0) parts.push(`${modFiles} modified`);
+        if (newFiles > 0) parts.push(`${newFiles} new`);
+        if (parts.length) summaryText += ` (${parts.join(", ")})`;
+
+        const summary = document.createElement("div");
+        summary.className = "diff-summary-header";
+        summary.innerHTML = `<span class="diff-summary-text">${escapeHtml(summaryText)}</span><span class="diff-stats"><span class="add">+${totalAdds}</span><span class="del">-${totalDels}</span></span>`;
+        container.appendChild(summary);
+
         files.forEach(f => {
             const block = document.createElement("div"); block.className = "diff-block";
             const labelCls = f.label === "new file" ? "new-file" : "modified";
@@ -2766,18 +3521,20 @@
 
             block.querySelector(".diff-file-header").addEventListener("click", () => block.classList.toggle("collapsed"));
 
-            // Click file name to open in Monaco diff view
             block.querySelector(".diff-file-name").style.cursor = "pointer";
             block.querySelector(".diff-file-name").addEventListener("click", (e) => { e.stopPropagation(); openDiffForFile(f.path); });
 
             block.appendChild(makeCopyBtn(f.diff));
-            bubble.appendChild(block);
+            container.appendChild(block);
             markFileModified(f.path);
         });
 
+        bubble.appendChild(container);
+
+        const fileCount = files.length;
         showActionBar([
-            { label: "\u2713 Keep All Changes", cls: "success", onClick: async () => { hideActionBar(); send({type:"keep"}); showInfo("\u2713 Changes kept."); clearAllDiffDecorations(); modifiedFiles.clear(); await refreshTree(); await fetchGitStatus(); if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); }},
-            { label: "\u2715 Revert All", cls: "danger", onClick: async () => { hideActionBar(); send({type:"revert"}); showInfo("\u21A9 Reverted."); clearAllDiffDecorations(); modifiedFiles.clear(); await refreshTree(); await fetchGitStatus(); if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); reloadAllModifiedFiles(); }},
+            { label: `\u2713 Keep All (${fileCount} file${fileCount !== 1 ? "s" : ""})`, cls: "success", onClick: async () => { hideActionBar(); send({type:"keep"}); showInfo("\u2713 Changes kept."); clearAllDiffDecorations(); modifiedFiles.clear(); const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); await refreshTree(); await fetchGitStatus(); if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); }},
+            { label: `\u2715 Revert All (${fileCount} file${fileCount !== 1 ? "s" : ""})`, cls: "danger", onClick: async () => { hideActionBar(); send({type:"revert"}); showInfo("\u21A9 Reverted " + fileCount + " file(s)."); clearAllDiffDecorations(); modifiedFiles.clear(); const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); await refreshTree(); await fetchGitStatus(); if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); reloadAllModifiedFiles(); }},
         ]);
         scrollChat();
     }
@@ -2900,6 +3657,8 @@
     function connect() {
         _preventReconnect = false;
         if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+        // Restore session_id from localStorage so reconnect/reopen restores same conversation
+        if (!currentSessionId) currentSessionId = loadPersistedSessionId();
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
         let wsUrl = `${proto}//${location.host}/ws`;
         if (currentSessionId) {
@@ -2944,6 +3703,26 @@
             ws = null;
         }
     }
+    function gatherEditorContext() {
+        const ctx = {};
+        if (activeTab) {
+            ctx.activeFile = { path: activeTab };
+            if (monacoInstance) {
+                const pos = monacoInstance.getPosition();
+                if (pos) ctx.activeFile.cursorLine = pos.lineNumber;
+                const sel = monacoInstance.getSelection();
+                if (sel && !sel.isEmpty()) {
+                    ctx.selectedText = monacoInstance.getModel().getValueInRange(sel);
+                    if (ctx.selectedText.length > 2000) ctx.selectedText = ctx.selectedText.slice(0, 2000) + "…";
+                }
+            }
+        }
+        if (openTabs.size > 0) {
+            ctx.openFiles = [...openTabs.keys()];
+        }
+        return Object.keys(ctx).length > 0 ? ctx : undefined;
+    }
+
     function send(obj) {
         if (!ws || ws.readyState !== WebSocket.OPEN) return false;
         ws.send(JSON.stringify(obj));
@@ -2955,6 +3734,7 @@
             case "init": {
                 $modelName.textContent = evt.model_name || "?";
                 currentSessionId = evt.session_id || currentSessionId;
+                persistSessionId(currentSessionId);
                 if (evt.session_id) {
                     fileChangesThisSession.clear();
                     sessionStartTime = sessionStartTime || Date.now();
@@ -2992,25 +3772,22 @@
             }
             case "thinking_start": currentThinkingEl = createThinkingBlock(); break;
             case "thinking":
-                if (currentThinkingEl) {
-                    currentThinkingEl.textContent += evt.content || "";
-                    const thinkingBlock = currentThinkingEl.closest(".thinking-block");
-                    updateThinkingHeader(thinkingBlock, false);
-                    scrollChat();
-                }
+                appendThinkingContent(currentThinkingEl, evt.content || "");
                 break;
             case "thinking_end": finishThinking(currentThinkingEl); currentThinkingEl = null; break;
             case "text_start": currentTextEl = null; currentTextBuffer = ""; break;
             case "text":
                 currentTextBuffer += evt.content || "";
                 if (!currentTextEl) { const b = getOrCreateBubble(); currentTextEl = document.createElement("div"); currentTextEl.className = "text-content"; b.appendChild(currentTextEl); }
-                currentTextEl.innerHTML = renderMarkdown(currentTextBuffer);
-                currentTextEl.querySelectorAll("pre code").forEach(b => { if (typeof hljs !== "undefined") hljs.highlightElement(b); });
+                { const _display = currentTextBuffer.replace(/<updated_plan>[\s\S]*?<\/updated_plan>/g, "").trim();
+                  currentTextEl.innerHTML = renderMarkdown(_display);
+                  currentTextEl.querySelectorAll("pre code").forEach(b => { if (typeof hljs !== "undefined") hljs.highlightElement(b); }); }
                 scrollChat();
                 break;
             case "text_end":
                 if (currentTextEl && currentTextBuffer) {
-                    currentTextEl.innerHTML = renderMarkdown(currentTextBuffer);
+                    const _display = currentTextBuffer.replace(/<updated_plan>[\s\S]*?<\/updated_plan>/g, "").trim();
+                    currentTextEl.innerHTML = renderMarkdown(_display);
                     currentTextEl.querySelectorAll("pre code").forEach(b => { if (typeof hljs !== "undefined") hljs.highlightElement(b); });
                     const bubble = currentTextEl.closest(".msg-bubble");
                     if (bubble && !bubble.querySelector(":scope > .copy-btn")) bubble.appendChild(makeCopyBtn(currentTextBuffer));
@@ -3041,7 +3818,12 @@
                 break;
             case "tool_result":
                 {
-                    const runEl = (evt.data?.tool_use_id && toolRunById.get(String(evt.data.tool_use_id))) || lastToolBlock;
+                    let runEl = (evt.data?.tool_use_id && toolRunById.get(String(evt.data.tool_use_id))) || lastToolBlock;
+                    // If we fell back to lastToolBlock and it's the group (not a run), use the last run in that group
+                    if (runEl && runEl.classList && runEl.classList.contains("tool-block")) {
+                        const list = runEl.querySelector(".tool-run-list");
+                        if (list && list.lastElementChild) runEl = list.lastElementChild;
+                    }
                     addToolResult(evt.content || "", evt.data?.success !== false, runEl, evt.data);
                     const todoList = evt.data?.todos ?? evt.data?.data?.todos;
                     const isTodoWrite = evt.data?.tool_name === "TodoWrite" || (runEl && (runEl.dataset.toolName === "TodoWrite" || runEl.dataset.toolName === "todo_write"));
@@ -3132,6 +3914,29 @@
                 );
                 setRunning(false);
                 break;
+            case "updated_plan":
+                {
+                    const steps = evt.steps || [];
+                    const planFile = evt.plan_file || null;
+                    const planText = evt.plan_text || "";
+                    if (steps.length) {
+                        currentPlanSteps = [...steps];
+                        // Update checklist from updated plan steps
+                        currentChecklistItems = steps.map((s, i) => ({
+                            id: String(i + 1), content: s, status: "pending",
+                        }));
+                        showAgentChecklist(currentChecklistItems);
+                        // Re-show plan UI with updated steps (preserves Build/Feedback/Reject buttons)
+                        showPlan(steps, planFile, planText, true);
+                        // Show a brief notification in chat
+                        const notif = document.createElement("div");
+                        notif.className = "info-msg plan-updated-msg";
+                        notif.textContent = `Plan updated — ${steps.length} steps`;
+                        $chatMessages.appendChild(notif);
+                        scrollChat();
+                    }
+                }
+                break;
             case "todos_updated": {
                 const list = evt.todos || (evt.data && evt.data.todos) || [];
                 const normalized = Array.isArray(list) ? list.map((t, i) => ({
@@ -3149,7 +3954,7 @@
                 );
                 break;
             case "diff":
-                showDiffs(evt.files || []);
+                showDiffs(evt.files || [], !!evt.cumulative);
                 setRunning(false);
                 refreshTree();
                 updateModifiedFilesBar();
@@ -3164,6 +3969,7 @@
                 hideActionBar();
                 clearAllDiffDecorations();
                 modifiedFiles.clear();
+                { const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); }
                 showInfo("\u2713 Changes kept.");
                 refreshTree();
                 fetchGitStatus().then(() => { if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); });
@@ -3172,6 +3978,7 @@
                 hideActionBar();
                 clearAllDiffDecorations();
                 modifiedFiles.clear();
+                { const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); }
                 showInfo("\u21A9 Reverted " + (evt.files || []).length + " file(s).");
                 refreshTree();
                 fetchGitStatus().then(() => { if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); });
@@ -3220,6 +4027,7 @@
             case "reset_done":
                 $chatMessages.innerHTML = "";
                 currentSessionId = evt.session_id || currentSessionId;
+                persistSessionId(currentSessionId);
                 sessionStartTime = null;
                 fileChangesThisSession.clear();
                 currentChecklistItems = [];
@@ -3299,10 +4107,8 @@
                 }
                 if (evt.awaiting_keep_revert && evt.has_diffs) {
                     if (evt.diffs && evt.diffs.length > 0) {
-                        // Show the full diff view with keep/revert
-                        showDiffs(evt.diffs);
+                        showDiffs(evt.diffs, true);
                     } else {
-                        // Fallback: just show keep/revert action bar
                         showActionBar([
                             { label: "\u2713 Keep All", cls: "primary", onClick: () => { hideActionBar(); send({ type: "keep" }); }},
                             { label: "\u21A9 Revert All", cls: "danger", onClick: () => { hideActionBar(); send({ type: "revert" }); }},
@@ -3364,7 +4170,8 @@
         clearPendingImages();
         setRunning(true);
         addAssistantMessage();
-        const sent = send({ type: "task", content: text, images: imagesPayload });
+        const editorCtx = gatherEditorContext();
+        const sent = send({ type: "task", content: text, images: imagesPayload, ...(editorCtx ? { context: editorCtx } : {}) });
         if (!sent) {
             setRunning(false);
             showInfo("Send failed. Check connection.");
@@ -3418,6 +4225,7 @@
             const nextId = $agentSelect.value || null;
             if (!nextId || nextId === currentSessionId) return;
             currentSessionId = nextId;
+            persistSessionId(currentSessionId);
             disconnectWs();
             connect();
         });
@@ -3762,6 +4570,7 @@
                 return;
             }
             currentSessionId = data.session_id || null;
+            persistSessionId(currentSessionId);
             await loadAgentSessions();
             disconnectWs();
             connect();
@@ -3950,6 +4759,7 @@
         clearPendingImages();
         setRunning(false);
         currentSessionId = null;
+        persistSessionId(null);
         if ($agentSelect) {
             suppressAgentSwitch = true;
             $agentSelect.innerHTML = "";
