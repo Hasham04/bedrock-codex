@@ -178,12 +178,48 @@ _PROJECT_TREE_TTL = 60.0  # refresh every 60s
 
 _AUTO_CONTEXT_CHAR_BUDGET = 16000  # ~4000 tokens
 
+# Background codebase index — built once on first WS connect, then reused
+_bg_index_task: Optional[asyncio.Task] = None
+_bg_index_ready = asyncio.Event()
+_bg_codebase_index: Optional[Any] = None  # CodebaseIndex once built
+
+
+async def _build_index_background(backend: Backend, working_directory: str):
+    """Build codebase index in background thread on first WS connect."""
+    global _bg_codebase_index
+    try:
+        from codebase_index import get_index, set_embed_fn
+        from config import app_config
+
+        if not getattr(app_config, "codebase_index_enabled", True):
+            _bg_index_ready.set()
+            return
+
+        svc = BedrockService()
+        if hasattr(svc, "embed_texts"):
+            set_embed_fn(svc.embed_texts)
+
+        idx = await asyncio.to_thread(
+            lambda: get_index(working_directory, embed_fn=svc.embed_texts if hasattr(svc, "embed_texts") else None, backend=backend)
+        )
+
+        if not idx.chunks:
+            await asyncio.to_thread(lambda: idx.build(backend))
+
+        _bg_codebase_index = idx
+        logger.info("Background index ready: %d chunks", len(idx.chunks))
+    except Exception as e:
+        logger.warning("Background index build failed: %s", e)
+    finally:
+        _bg_index_ready.set()
+
 
 def _assemble_auto_context(
     working_directory: str,
     editor_context: Optional[Dict[str, Any]] = None,
     modified_files: Optional[set] = None,
     backend: Optional[Backend] = None,
+    user_query: Optional[str] = None,
 ) -> str:
     """Assemble auto-context that gets injected into the agent conversation.
 
@@ -298,6 +334,21 @@ def _assemble_auto_context(
                             pass
                     if len(dep_lines) > 1:
                         add_section("dependency_context", "\n".join(dep_lines))
+        except Exception:
+            pass
+
+    # 3.7. Semantic search — use background index to find relevant chunks for the query
+    if user_query and budget > 1000:
+        try:
+            idx = _bg_codebase_index
+            if idx and idx.chunks:
+                results = idx.retrieve(user_query, top_k=5)
+                if results:
+                    sem_lines = ["# Relevant code (semantic search)"]
+                    for chunk in results:
+                        snippet = chunk.to_search_snippet(max_lines=20)
+                        sem_lines.append(snippet)
+                    add_section("semantic_context", "\n\n".join(sem_lines))
         except Exception:
             pass
 
@@ -2235,7 +2286,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         "updated_plan", "scout_context", "verification_context",
         # Auto-context tags from build_auto_context()
         "auto_context", "active_file", "selected_text", "modified_file",
-        "dependency_context", "git_diff", "project_structure",
+        "dependency_context", "semantic_context", "git_diff", "project_structure",
         "linter_errors", "open_files", "recent_files",
     ]
     _STRIP_XML_RE = re.compile(
@@ -2867,6 +2918,14 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         # Start periodic save so SSH disconnect/kill doesn't lose conversation
         _save_interval_task = asyncio.create_task(_periodic_save_loop())
 
+        # Kick off background codebase index build (first connect only)
+        global _bg_index_task
+        if _bg_index_task is None or _bg_index_task.done():
+            _bg_index_ready.clear()
+            _bg_index_task = asyncio.create_task(
+                _build_index_background(_backend or backend, agent_wd)
+            )
+
         # ── Background task helpers ─────────────────────────────
         async def _send_status():
             """Send token count status to frontend."""
@@ -2974,31 +3033,48 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             nonlocal awaiting_build, awaiting_keep_revert, pending_task, pending_plan, pending_images
             task_start = time.time()
 
-            # Assemble auto-context from editor state (Cursor-style)
-            auto_ctx = ""
-            try:
-                auto_ctx = await asyncio.to_thread(
-                    _assemble_auto_context,
-                    _working_directory,
-                    editor_context,
-                    agent.modified_files if hasattr(agent, "modified_files") else None,
-                    backend=_backend,
-                )
-            except Exception as e:
-                logger.debug(f"Auto-context assembly failed: {e}")
+            # Immediate feedback so the user sees activity right away
+            await wsr.send_json({"type": "scout_progress", "content": "Preparing\u2026"})
 
-            # Resolve @mentions in the task text
-            try:
-                task_text = await asyncio.to_thread(
-                    _resolve_mentions, task_text, _working_directory, backend=_backend
-                )
-            except Exception as e:
-                logger.debug(f"Mention resolution failed: {e}")
+            # Run auto-context, mention resolution, and intent classification in parallel
+            async def _auto_ctx_task():
+                try:
+                    return await asyncio.to_thread(
+                        _assemble_auto_context,
+                        _working_directory,
+                        editor_context,
+                        agent.modified_files if hasattr(agent, "modified_files") else None,
+                        backend=_backend,
+                        user_query=task_text,
+                    )
+                except Exception as e:
+                    logger.debug(f"Auto-context assembly failed: {e}")
+                    return ""
 
-            # Use LLM to intelligently classify intent (runs on fast Haiku)
-            intent = await asyncio.to_thread(
-                classify_intent, task_text, agent.service
+            async def _mentions_task():
+                try:
+                    return await asyncio.to_thread(
+                        _resolve_mentions, task_text, _working_directory, backend=_backend
+                    )
+                except Exception as e:
+                    logger.debug(f"Mention resolution failed: {e}")
+                    return task_text
+
+            async def _intent_task():
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.to_thread(classify_intent, task_text, agent.service),
+                        timeout=3.0,
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    return {"scout": True, "plan": False, "question": False, "complexity": "simple"}
+
+            auto_ctx, task_text, intent = await asyncio.gather(
+                _auto_ctx_task(), _mentions_task(), _intent_task()
             )
+
+            # End the "Preparing" indicator now that pre-processing is done
+            await wsr.send_json({"type": "scout_end"})
 
             try:
                 is_question = intent.get("question", False)

@@ -64,7 +64,7 @@ class AppConfig:
     # Scout sub-agent settings
     scout_enabled: bool = os.getenv("SCOUT_ENABLED", "true").lower() == "true"
     scout_model: str = os.getenv("SCOUT_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
-    scout_max_iterations: int = int(os.getenv("SCOUT_MAX_ITERATIONS", "28"))
+    scout_max_iterations: int = int(os.getenv("SCOUT_MAX_ITERATIONS", "8"))
     # Plan-then-Build phase
     plan_phase_enabled: bool = os.getenv("PLAN_PHASE_ENABLED", "true").lower() == "true"
     # YOLO mode — auto-approve all operations including shell commands
@@ -72,7 +72,7 @@ class AppConfig:
     # Fast model for simple tasks (smart routing)
     fast_model: str = os.getenv("FAST_MODEL", "us.anthropic.claude-sonnet-4-20250514-v1:0")
     # Refine user task into output spec + constraints before planning (Cursor-style)
-    task_refinement_enabled: bool = os.getenv("TASK_REFINEMENT_ENABLED", "true").lower() == "true"
+    task_refinement_enabled: bool = os.getenv("TASK_REFINEMENT_ENABLED", "false").lower() == "true"
     # Enforce structured reasoning traces in user-visible responses
     enforce_reasoning_trace: bool = os.getenv("ENFORCE_REASONING_TRACE", "true").lower() == "true"
     # Deterministic verification gate before final "done"

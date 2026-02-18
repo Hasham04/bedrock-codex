@@ -143,6 +143,8 @@ class SessionStore:
         path = self._path_for(session.session_id)
         data = asdict(session)
 
+        os.makedirs(self.base_dir, exist_ok=True)
+
         tmp_path = path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:

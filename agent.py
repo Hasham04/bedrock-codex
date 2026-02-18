@@ -174,39 +174,33 @@ Example pattern:
 # --- Phase-Specific Modules (one per phase) ---
 
 _MOD_PHASE_SCOUT = """<mission>
-Build a complete mental model of this codebase: architecture, patterns, conventions, and risks. You're preparing for implementation, not skimming. Your output directly determines the quality of the plan that follows.
+Build a precise mental model of the codebase focused on what THIS task needs. You're preparing for implementation — be surgical, not exhaustive.
 </mission>
 
 <strategy>
-1. Foundation first: project_tree for structure, then Read manifest files (package.json, pyproject.toml, requirements.txt, pom.xml, build.gradle). Understand the stack, dependencies, and build system.
-2. Smart discovery: Use semantic_retrieve for "where/how" questions, then Read the returned chunks with offset/limit. Use search only for exact strings or identifiers.
-3. Batch aggressively: Read 5-12 files per turn. Each batch should answer a specific question about the codebase: "What's the entry point?", "How does auth work?", "What patterns do tests follow?"
-4. Follow relevance: Read files that will be touched, their imports, related tests, and shared utilities. Understand the data flow for THIS specific task.
-5. Trace dependencies: For every file you plan to change, identify its importers and imports. Use find_symbol for key symbols to understand usage breadth.
-6. Know when done: Can you confidently answer ALL of these?
-   - Stack, framework, key dependencies?
-   - Architecture: how modules communicate, where state lives?
-   - Exact files to change, and what each change involves?
-   - Patterns to follow: naming, error handling, logging, testing conventions?
-   - Build/test/lint commands?
-   - What could go wrong? Edge cases, tech debt, tight coupling?
+1. **Check context first**: Auto-context and semantic search results are injected into the conversation. Read them before using any tools — they often contain the answer.
+2. **Foundation**: If not already visible, run project_tree once. Read manifest files only if you need to understand the stack.
+3. **Targeted reads**: Use semantic_retrieve for "where/how" questions. When you get chunk results with line ranges, read ONLY those ranges with offset/limit — never the whole file.
+4. **Batch heavily**: Read 5-15 files per tool turn. Group reads that answer ONE question: "What's the entry point?", "How does auth work?", "What test patterns exist?"
+5. **Follow the graph**: For files you'll change, check their imports and importers. Use find_symbol to measure usage breadth of key symbols.
+6. **Stop early**: If auto-context + 1-2 tool turns give you enough information, stop. Over-scouting wastes tokens. You're done when you can answer:
+   - Exact files to change and what each change involves
+   - Patterns to follow (naming, error handling, testing)
+   - What could break
 </strategy>
 
 <anti_patterns>
-- Don't read files that won't be relevant to the task. Every read should have a purpose.
-- Don't stop at surface level. If a function delegates to another module, follow the call chain.
-- Don't assume — if you're unsure whether a pattern exists, search for it.
-- Don't read entire large files. Use offset/limit after checking the structural overview.
+- NEVER read a file that auto-context or semantic results already provided — that's a wasted tool call.
+- NEVER read entire large files. Always use offset/limit after checking the structural overview.
+- Don't read files unrelated to the task. Every Read must have a stated purpose.
+- Don't do more than 3 scout turns for simple tasks. 1-2 is usually enough.
 </anti_patterns>
 
 <output_format>
-Provide your findings as:
-## Stack — Language, framework, key dependencies, versions if visible
-## Architecture — How the app is organized, module boundaries, data flow, where state lives
-## Files Relevant to This Task — path, role, key functions/classes, line ranges of interest
-## Patterns and Conventions — Code style, error handling, logging, DI, existing utilities to reuse (cite specific examples)
-## Build/Test/Lint — Exact commands the project uses
-## Risks and Gotchas — Edge cases, tech debt, coupling issues, breaking change potential
+## Architecture — Module boundaries, data flow relevant to this task
+## Files to Change — path, key functions/classes, line ranges
+## Patterns — Conventions to follow (cite examples from reads)
+## Risks — Edge cases, breaking change potential
 </output_format>"""
 
 _MOD_PHASE_PLAN = """<mission>
@@ -216,9 +210,9 @@ The plan must be precise enough that another engineer could execute it step-by-s
 </mission>
 
 <process>
-1. UNDERSTAND: Read relevant source files if not already in scout context. Batch reads, follow imports, check tests. Each batch answers a specific question. Stop when you have enough context — don't over-research.
-2. DESIGN: Find the simplest approach that fully solves the problem. Reuse existing code and patterns. Consider 2-3 alternatives and explain why your choice is best. Identify reusable utilities, existing test helpers, and shared patterns.
-3. VALIDATE: Trace each step mentally. Do they connect? Are there circular dependencies, missing imports, or ordering constraints? Could any step break existing functionality?
+1. UNDERSTAND: Auto-context and semantic search results are already injected — check them first before reading files. Only read files not already in context. Batch reads, follow imports. Stop when you have enough — don't over-research.
+2. DESIGN: Find the simplest approach. Reuse existing code and patterns. Consider 2-3 alternatives and explain why your choice is best.
+3. VALIDATE: Trace each step mentally. Are there circular dependencies, missing imports, or ordering constraints? Could any step break existing functionality?
 4. DOCUMENT: Write a plan precise enough for step-by-step execution:
    - Problem statement: what's broken or missing, and why
    - Approach with reasoning: what you'll do and why this approach over alternatives
@@ -243,12 +237,13 @@ Use your thinking time to: evaluate multiple approaches before committing, trace
 
 _MOD_PHASE_BUILD = """<execution>
 For each implementation step:
-1. Read the relevant file if not read this session (NEVER edit blind)
-2. Make a precise, minimal change — one logical change per Edit call
-3. Re-read the changed section to verify correctness
-4. Run lint_file immediately — if errors were introduced, fix them before proceeding
-5. If the step involves multiple independent files, batch all Edit calls in one response
-6. Mark the TodoWrite item as completed, then move to the next step
+1. Check if the file content is already in auto-context or was read in scout phase — skip Read if so
+2. If not in context, Read the relevant file with offset/limit (NEVER edit blind, NEVER read whole large files)
+3. Make a precise, minimal change — one logical change per Edit call
+4. Re-read only the changed section (use offset/limit) to verify correctness
+5. Run lint_file immediately — if errors were introduced, fix them before proceeding
+6. If the step involves multiple independent files, batch all Edit calls in one response
+7. Mark the TodoWrite item as completed, then move to the next step
 
 Before every edit: understand the current code, trace dependencies, consider impact on callers/imports/tests.
 After every edit: verify the change compiles, passes lint, and hasn't broken the surrounding code.
@@ -2914,6 +2909,7 @@ class CodingAgent:
         loop = asyncio.get_event_loop()
         scout_iteration = 0
         max_iters = app_config.scout_max_iterations
+        _consecutive_light_iters = 0  # track iterations with 0-1 tool calls (winding down)
 
         try:
             while scout_iteration < max_iters and not self._cancelled:
@@ -2957,6 +2953,14 @@ class CodingAgent:
                     ))
                     return result.content.strip() if result.content else None
 
+                # Emit tool_call events so the frontend shows the tool carousel
+                for tu in result.tool_uses:
+                    await on_event(AgentEvent(
+                        type="tool_call",
+                        content=tu.name,
+                        data={"name": tu.name, "input": tu.input, "id": tu.id},
+                    ))
+
                 # Execute scout tools in parallel (all safe/read-only)
                 async def _exec_scout_tool(tu) -> tuple:
                     r = await loop.run_in_executor(
@@ -2975,7 +2979,6 @@ class CodingAgent:
                     if isinstance(text, str) and len(text) > 8000:
                         is_hot = hasattr(self, 'modified_files') and tu.input and tu.input.get("path") in (self.modified_files or set())
                         text = self._compress_tool_result(text, tu.name, is_hot)
-                        # Final safety cap at 12K chars for scout
                         if len(text) > 12000:
                             lines = text.split("\n")
                             head_n = max(40, len(lines) // 3)
@@ -2987,6 +2990,17 @@ class CodingAgent:
                         "content": text,
                         "is_error": not tr.success,
                     })
+
+                    # Emit tool_result event so the frontend updates the tool block status
+                    await on_event(AgentEvent(
+                        type="tool_result",
+                        content=tu.name,
+                        data={
+                            "tool_use_id": tu.id,
+                            "success": tr.success,
+                            "output": text[:500] if text else "",
+                        },
+                    ))
 
                     display_name = SCOUT_TOOL_DISPLAY_NAMES.get(tu.name, tu.name)
                     inp = tu.input or {}
@@ -3013,6 +3027,19 @@ class CodingAgent:
                     ))
 
                 scout_messages.append({"role": "user", "content": tool_results})
+
+                # Early exit: if LLM used only 1 tool for 2 consecutive turns,
+                # it's winding down — break to save time
+                if len(result.tool_uses) <= 1:
+                    _consecutive_light_iters += 1
+                else:
+                    _consecutive_light_iters = 0
+                if _consecutive_light_iters >= 2 and result.content and len(result.content) > 200:
+                    await on_event(AgentEvent(
+                        type="scout_end",
+                        content=f"Scout finished ({scout_iteration} iterations, early exit)",
+                    ))
+                    return result.content.strip()
 
             await on_event(AgentEvent(
                 type="scout_end",
@@ -3107,12 +3134,15 @@ Keep the whole response under 300 words. If the request is already very clear an
         self._cancelled = False
         self._current_plan = None
 
-        # Run scout for first message — decision comes from classify_intent in web.py
-        # run_plan is only called when intent["plan"]=True, which implies scouting
+        # Run scout for first message — skip if auto-context already has rich context
         scout_context = None
-        if app_config.scout_enabled and len(self.history) == 0:
+        has_semantic = "<semantic_context>" in task
+        has_structure = "<project_structure>" in task
+        if app_config.scout_enabled and len(self.history) == 0 and not (has_semantic and has_structure):
             scout_context = await self._run_scout(task, on_event)
             self._scout_context = scout_context  # cache for build phase
+        elif has_semantic or has_structure:
+            logger.info("Skipping scout — auto-context already contains semantic/structure context")
 
         await on_event(AgentEvent(type="phase_start", content="plan"))
 
@@ -3262,7 +3292,7 @@ Keep the whole response under 300 words. If the request is already very clear an
 
                 await on_event(AgentEvent(
                     type="scout_progress",
-                    content=f"Planning: iteration {plan_iter + 1} — {'reading codebase' if plan_iter < 3 else 'analyzing & planning'}...",
+                    content=f"Planning — {'reading codebase' if plan_iter < 3 else 'analyzing & planning'}...",
                 ))
 
                 # After many iterations without concluding, nudge the model
@@ -3320,15 +3350,15 @@ Keep the whole response under 300 words. If the request is already very clear an
                                 "content": text_r,
                                 "is_error": False,
                             })
-                            await on_event(AgentEvent(type="tool_result", content=text_r[:200], data={"id": tu["id"], "name": "AskUserQuestion", "success": True}))
+                            await on_event(AgentEvent(type="tool_result", content=text_r[:200], data={"tool_use_id": tu["id"], "name": "AskUserQuestion", "success": True}))
                         except Exception as e:
                             text_r = f"Clarification failed or skipped: {e}"
                             tool_results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": text_r, "is_error": True})
-                            await on_event(AgentEvent(type="tool_result", content=text_r, data={"id": tu["id"], "name": "AskUserQuestion", "success": False}))
+                            await on_event(AgentEvent(type="tool_result", content=text_r, data={"tool_use_id": tu["id"], "name": "AskUserQuestion", "success": False}))
                     else:
                         text_r = "Clarification not available; proceed with your best assumption."
                         tool_results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": text_r, "is_error": False})
-                        await on_event(AgentEvent(type="tool_result", content=text_r, data={"id": tu["id"], "name": "AskUserQuestion", "success": True}))
+                        await on_event(AgentEvent(type="tool_result", content=text_r, data={"tool_use_id": tu["id"], "name": "AskUserQuestion", "success": True}))
 
                 # Execute read-only tools in parallel
                 async def _exec_plan_tool(tu):
@@ -3359,7 +3389,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                         await on_event(AgentEvent(
                             type="tool_result",
                             content=text_r[:200] if isinstance(text_r, str) else str(text_r)[:200],
-                            data={"id": tu["id"], "name": tu["name"], "success": tr.success},
+                            data={"tool_use_id": tu["id"], "name": tu["name"], "success": tr.success},
                         ))
 
                 plan_messages.append({"role": "user", "content": tool_results})
@@ -3825,10 +3855,14 @@ Keep the whole response under 300 words. If the request is already very clear an
         self._deterministic_verification_done = False
         self._verification_gate_attempts = 0
 
-        # Run scout for first message — controlled by intent classification
+        # Run scout for first message — skip if auto-context already has rich context
         scout_context = None
-        if enable_scout and app_config.scout_enabled and len(self.history) == 0:
+        _has_sem = "<semantic_context>" in task
+        _has_str = "<project_structure>" in task
+        if enable_scout and app_config.scout_enabled and len(self.history) == 0 and not (_has_sem and _has_str):
             scout_context = await self._run_scout(task, on_event)
+        elif _has_sem or _has_str:
+            logger.info("Skipping scout — auto-context already contains semantic/structure context")
 
         # Build the user message — prepend project context and scout context when available
         project_docs = self._load_project_docs() if len(self.history) == 0 else ""

@@ -455,10 +455,10 @@ class SSHBackend(Backend):
 
     def _remote_path(self, path: str) -> str:
         """Resolve a relative path to absolute on the remote. Expands ~ so SFTP can open paths."""
-        if os.path.isabs(path):
-            return path
-        # Use posixpath for remote (always Linux)
+        # Use posixpath for remote (always Linux/Unix)
         import posixpath
+        if posixpath.isabs(path):
+            return path
         p = posixpath.normpath(posixpath.join(self._working_directory, path))
         if "~" in p:
             p = self._expand_remote_tilde(p)

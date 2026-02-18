@@ -1,5 +1,10 @@
-# Environment & secrets
+# Environment & secrets — NEVER commit credentials
 .env
+.env.*
+*.pem
+*.key
+credentials.json
+aws_credentials
 
 # Logs
 *.log

@@ -138,6 +138,30 @@ def _extract_structure(lines: List[str]) -> str:
 
 _MAX_FULL_READ_LINES = 500
 
+# ── File content cache (avoids re-reading unchanged files within same session) ──
+_file_content_cache: Dict[str, Tuple[float, str]] = {}  # path -> (mtime_or_time, content)
+_FILE_CACHE_TTL = 5.0  # seconds; short enough to catch agent writes
+
+
+def _cached_read(path: str, b: Backend) -> str:
+    """Read file via backend with short-lived cache to avoid duplicate reads."""
+    import time as _time
+    now = _time.time()
+    cached = _file_content_cache.get(path)
+    if cached and (now - cached[0]) < _FILE_CACHE_TTL:
+        return cached[1]
+    content = b.read_file(path)
+    _file_content_cache[path] = (now, content)
+    return content
+
+
+def invalidate_file_cache(path: Optional[str] = None) -> None:
+    """Invalidate read cache after writes/edits. Call from write/edit tools."""
+    if path:
+        _file_content_cache.pop(path, None)
+    else:
+        _file_content_cache.clear()
+
 
 def _require_path(path: str, name: str = "path") -> Optional[ToolResult]:
     """Return an error ToolResult if path is empty/whitespace; else None."""
@@ -159,7 +183,7 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
         if not b.file_exists(path) and not b.file_exists(full_path):
             return ToolResult(success=False, output="", error=f"File not found: {path}")
 
-        content = b.read_file(path)
+        content = _cached_read(path, b)
         lines = content.splitlines(keepends=True)
         total_lines = len(lines)
 
@@ -225,6 +249,7 @@ def write_file(path: str, content: str,
         except Exception:
             pass
         b.write_file(path, content)
+        invalidate_file_cache(path)
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         summary = f"{'Created' if is_new else 'Wrote'} {line_count} lines to {path}"
         if is_new:
@@ -271,6 +296,7 @@ def edit_file(path: str, old_string: str, new_string: str,
             new_content = content.replace(old_string, new_string, 1)
             replaced = 1
         b.write_file(path, new_content)
+        invalidate_file_cache(path)
         diff_text = _compact_diff(content, new_content, path)
         summary = f"Applied edit to {path}" + (f" ({replaced} replacements)" if replaced > 1 else "")
         if diff_text:
@@ -417,6 +443,7 @@ def symbol_edit(path: str, symbol: str, new_string: str, kind: str = "all", occu
             replacement += "\n"
         new_content = before + replacement + after
         b.write_file(path, new_content)
+        invalidate_file_cache(path)
         diff_text = _compact_diff(content, new_content, path)
         summary = f"Applied symbol_edit to {path} ({symbol}, lines {start}-{end})"
         if diff_text:

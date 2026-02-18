@@ -1,6 +1,17 @@
 """
 Amazon Bedrock service module.
 Handles all interactions with AWS Bedrock API including extended thinking.
+
+DATA PRIVACY:
+  - All LLM calls go through AWS Bedrock, which does NOT use customer data
+    for model training (per AWS Service Terms §50.3).
+  - No telemetry, analytics, or usage tracking is collected by this application.
+  - Session data (conversation history) is stored ONLY on the local filesystem
+    (~/.bedrock-codex/sessions/) and is never transmitted externally.
+  - The only external network calls are: (1) AWS Bedrock API for inference,
+    (2) user-initiated WebFetch/WebSearch tool calls.
+  - AWS account-level model invocation logging (CloudWatch/S3) is controlled
+    by your AWS account administrator, not by this application.
 """
 
 import boto3

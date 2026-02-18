@@ -152,6 +152,8 @@
     let currentThinkingEl = null;
     let currentTextEl = null;
     let currentTextBuffer = "";
+    let _textDirty = false;      // new chunks arrived since last render
+    let _textRenderRAF = null;   // rAF for throttled morphdom render
     let lastToolBlock = null;
     const toolRunById = new Map(); // tool_use_id -> run element
     let scoutEl = null;
@@ -2682,6 +2684,7 @@
     let _thinkingBuffer = ""; // accumulates raw thinking text for markdown rendering
     let _thinkingRenderTimer = null; // debounce timer for markdown render
     let _thinkingUserCollapsed = false; // track if user manually collapsed during stream
+    let _thinkingTickInterval = null; // 1s interval to update the reasoning timer in real time
 
     function updateThinkingHeader(block, done = false) {
         if (!block) return;
@@ -2700,6 +2703,14 @@
         } else {
             block.classList.add("thinking-active");
         }
+    }
+
+    function _startThinkingTick(block) {
+        _stopThinkingTick();
+        _thinkingTickInterval = setInterval(() => updateThinkingHeader(block, false), 1000);
+    }
+    function _stopThinkingTick() {
+        if (_thinkingTickInterval) { clearInterval(_thinkingTickInterval); _thinkingTickInterval = null; }
     }
 
     function createThinkingBlock() {
@@ -2733,6 +2744,7 @@
         });
         bubble.appendChild(block);
         updateThinkingHeader(block, false);
+        _startThinkingTick(block);
         scrollChat();
         return block.querySelector(".thinking-content");
     }
@@ -2764,6 +2776,7 @@
 
     function finishThinking(el) {
         if (!el) return;
+        _stopThinkingTick();
         if (_thinkingRenderTimer) { clearTimeout(_thinkingRenderTimer); _thinkingRenderTimer = null; }
         // Final render with full content
         _renderThinkingContent(el);
@@ -3204,6 +3217,43 @@
         if (body) body.scrollTop = body.scrollHeight;
         scrollChat();
     }
+    function _fadeOutTool(block) {
+        if (block._fadingOut || block.classList.contains("tool-gone")) return;
+        if (block.classList.contains("tool-block-loading")) return;
+        block._fadingOut = true;
+        const h = block.offsetHeight;
+        // Phase 1: fade opacity
+        block.animate(
+            [{ opacity: 1 }, { opacity: 0 }],
+            { duration: 350, easing: "ease-out", fill: "forwards" }
+        ).onfinish = () => {
+            // Phase 2: collapse height so content below slides up
+            block.animate(
+                [{ height: h + "px", marginTop: "2px", marginBottom: "2px" },
+                 { height: "0px", marginTop: "0px", marginBottom: "0px" }],
+                { duration: 280, easing: "cubic-bezier(0.4, 0, 0.2, 1)", fill: "forwards" }
+            ).onfinish = () => {
+                block.classList.add("tool-gone");
+                block.style.display = "none";
+                block._fadingOut = false;
+                scrollChat();
+            };
+        };
+    }
+    function _scheduleToolFadeOut(block, delay) {
+        if (block._fadeTimer || block._fadingOut || block.classList.contains("tool-gone")) return;
+        block._fadeTimer = setTimeout(() => {
+            block._fadeTimer = null;
+            // Only fade if it's not the last visible tool in the bubble
+            const bubble = block.closest(".msg-bubble");
+            if (!bubble) return;
+            const visible = Array.from(bubble.querySelectorAll(".tool-block:not(.tool-gone)"));
+            if (visible.length > 1 && visible[visible.length - 1] !== block) {
+                _fadeOutTool(block);
+            }
+        }, delay);
+    }
+
     function addToolCall(name, input, toolUseId = null, { stream = true } = {}) {
         name = normalizedToolName(name);
         const bubble = getOrCreateBubble();
@@ -3359,6 +3409,9 @@
 
             bubble.appendChild(group);
             lastToolGroup = group;
+            // Fade out older completed tools now that a new one appeared
+            const older = Array.from(bubble.querySelectorAll(".tool-block:not(.tool-gone):not(.tool-block-loading)"));
+            older.forEach(b => { if (b !== group) _fadeOutTool(b); });
         }
 
         const runList = group.querySelector(".tool-run-list");
@@ -3401,51 +3454,47 @@
                 run.appendChild(previewWrap);
 
                 if (stream) {
-                    // Stream diff lines with a typing effect
+                    // Smooth line-by-line streaming (Cursor-style)
                     const diffLines = previewDiff.split("\n");
                     let lineIdx = 0;
-                    const LINES_PER_TICK = 3;   // reveal 3 lines per frame for speed
-                    const TICK_MS = 18;         // ~18ms between ticks (~55fps)
+                    let _rafId = 0;
+                    let _lastTime = 0;
+                    const LINE_DELAY = 12; // ms per line — fast but perceptible
 
-                    // Blinking write cursor at the bottom of the diff
+                    // Thin caret cursor
                     const cursor = document.createElement("div");
                     cursor.className = "diff-stream-cursor";
                     miniDiff.appendChild(cursor);
 
-                    function _streamNextLines() {
+                    function _streamTick(ts) {
                         if (lineIdx >= diffLines.length) {
-                            cursor.remove(); // done streaming — remove cursor
+                            cursor.classList.add("fade-out");
+                            setTimeout(() => cursor.remove(), 200);
                             return;
                         }
-                        const frag = document.createDocumentFragment();
-                        const end = Math.min(lineIdx + LINES_PER_TICK, diffLines.length);
-                        for (let i = lineIdx; i < end; i++) {
-                            const l = diffLines[i];
-                            const div = document.createElement("div");
-                            let c = "ctx";
-                            if (l.startsWith("+++") || l.startsWith("---")) c = "hunk";
-                            else if (l.startsWith("@@")) c = "hunk";
-                            else if (l.startsWith("+")) c = "add";
-                            else if (l.startsWith("-")) c = "del";
-                            div.className = "diff-line " + c;
-                            div.textContent = l;
-                            frag.appendChild(div);
+                        // Throttle to LINE_DELAY ms per line
+                        if (ts - _lastTime < LINE_DELAY) {
+                            _rafId = requestAnimationFrame(_streamTick);
+                            return;
                         }
-                        // Insert lines before the cursor so cursor stays at the end
-                        miniDiff.insertBefore(frag, cursor);
-                        lineIdx = end;
-                        // Auto-scroll the diff container to follow the latest lines
+                        _lastTime = ts;
+                        const l = diffLines[lineIdx];
+                        const div = document.createElement("div");
+                        let c = "ctx";
+                        if (l.startsWith("+++") || l.startsWith("---")) c = "hunk";
+                        else if (l.startsWith("@@")) c = "hunk";
+                        else if (l.startsWith("+")) c = "add";
+                        else if (l.startsWith("-")) c = "del";
+                        div.className = "diff-line " + c;
+                        div.textContent = l;
+                        miniDiff.insertBefore(div, cursor);
+                        lineIdx++;
                         miniDiff.scrollTop = miniDiff.scrollHeight;
-                        // Auto-scroll the chat to follow the streaming code
-                        if (group.dataset.follow === "1") scrollChat();
-                        if (lineIdx < diffLines.length) {
-                            setTimeout(_streamNextLines, TICK_MS);
-                        } else {
-                            cursor.remove(); // done streaming — remove cursor
-                        }
+                        if (lineIdx % 4 === 0 && group.dataset.follow === "1") scrollChat();
+                        _rafId = requestAnimationFrame(_streamTick);
                     }
-                    // Kick off the streaming after a micro-delay so the tool header paints first
-                    setTimeout(_streamNextLines, 30);
+                    // Kick off after a micro-delay so the tool header paints first
+                    requestAnimationFrame(_streamTick);
                 } else {
                     // Instant render (replay / history restore)
                     miniDiff.classList.add("no-animate");
@@ -3534,6 +3583,8 @@
         }
 
         group.classList.remove("tool-block-loading");
+
+        _scheduleToolFadeOut(group, 700);
 
         const stopBtn = group.querySelector(".tool-stop-btn");
         if (stopBtn && success !== undefined) stopBtn.remove();
@@ -3634,6 +3685,7 @@
             Glob: "Glob",
             find_symbol: "Symbols",
             scout: "Scout",
+            project_tree: "Project Tree",
             TodoWrite: "Planning next steps",
             TodoRead: "Read todos",
             MemoryWrite: "Store",
@@ -3669,6 +3721,7 @@
             Glob: "Glob",
             find_symbol: "Symbols",
             scout: "Scout",
+            project_tree: "Project Tree",
             TodoWrite: "Planning next steps",
             TodoRead: "Read todos",
             MemoryWrite: "Store",
@@ -3744,6 +3797,7 @@
             SemanticRetrieve: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="10" cy="10" r="7"/><line x1="19" y1="19" x2="15.5" y2="15.5"/><line x1="6" y1="14" x2="14" y2="14"/><line x1="6" y1="17" x2="12" y2="17"/><line x1="6" y1="20" x2="13" y2="20"/></svg>`,
             find_symbol: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16"/><path d="M7 4v3a5 5 0 0 0 10 0V4"/><line x1="12" y1="17" x2="12" y2="21"/><line x1="8" y1="21" x2="16" y2="21"/></svg>`,
             list_directory: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`,
+            project_tree: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="5" rx="1"/><rect x="14" y="8" width="7" height="5" rx="1"/><rect x="14" y="16" width="7" height="5" rx="1"/><line x1="10" y1="5.5" x2="14" y2="10.5"/><line x1="10" y1="5.5" x2="14" y2="18.5"/></svg>`,
             Glob: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><path d="M11 8v6"/><path d="M8 11h6"/></svg>`,
             scout: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`,
             TodoWrite: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2h6v4H9V2z"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M9 10l2 2 4-4"/><path d="M9 14h6M9 18h6"/></svg>`,
@@ -4137,15 +4191,28 @@
         scrollChat();
         ta.focus();
     }
+    let _phaseTickIntervals = {};
     function showPhase(name) {
-        if (name === "direct") return; // no indicator needed — output speaks for itself
+        if (name === "direct") return;
         const bubble = getOrCreateBubble();
         const div = document.createElement("div"); div.className = "phase-indicator"; div.id = `phase-${name}`;
-        div.innerHTML = `<span class="phase-label">${escapeHtml(phaseLabel(name))}</span>`;
+        div.dataset.startedAt = String(Date.now());
+        const label = phaseLabel(name);
+        div.innerHTML = `<span class="phase-label">${escapeHtml(label)}</span>`;
         bubble.appendChild(div);
         scrollChat();
+        _phaseTickIntervals[name] = setInterval(() => {
+            if (div.classList.contains("done")) { clearInterval(_phaseTickIntervals[name]); return; }
+            const s = Math.max(0, Math.round((Date.now() - Number(div.dataset.startedAt)) / 1000));
+            const lbl = div.querySelector(".phase-label");
+            if (lbl && s > 0) {
+                const cur = lbl.textContent.replace(/\s+\d+s$/, "");
+                lbl.textContent = `${cur} ${s}s`;
+            }
+        }, 1000);
     }
     function endPhase(name, elapsed) {
+        if (_phaseTickIntervals[name]) { clearInterval(_phaseTickIntervals[name]); delete _phaseTickIntervals[name]; }
         const el = document.getElementById(`phase-${name}`);
         if (el) {
             el.classList.add("done");
@@ -4156,22 +4223,44 @@
     function phaseLabel(n) { return {plan:"Planning\u2026",build:"Building\u2026",direct:"Running\u2026"}[n]||n; }
     function phaseDoneLabel(n) { return {plan:"Planned",build:"Built",direct:"Completed"}[n]||n; }
 
+    let _scoutTickInterval = null;
+    let _scoutStartedAt = 0;
     function showScoutProgress(text) {
+        // If a plan phase is active, update its label instead of showing a separate scout block
+        const planPhase = document.getElementById("phase-plan");
+        if (planPhase && !planPhase.classList.contains("done")) {
+            const lbl = planPhase.querySelector(".phase-label");
+            if (lbl) lbl.textContent = text || "Planning\u2026";
+            scrollChat();
+            return;
+        }
         if (!scoutEl) {
             const bubble = getOrCreateBubble();
             scoutEl = document.createElement("div"); scoutEl.className = "scout-block";
             scoutEl.innerHTML = `<span class="scout-text"></span>`;
+            _scoutStartedAt = Date.now();
             bubble.appendChild(scoutEl);
+            _scoutTickInterval = setInterval(() => {
+                if (!scoutEl || scoutEl.classList.contains("scout-done")) { clearInterval(_scoutTickInterval); return; }
+                const s = Math.max(0, Math.round((Date.now() - _scoutStartedAt) / 1000));
+                const textEl = scoutEl.querySelector(".scout-text");
+                if (textEl && s > 0) {
+                    const base = textEl.textContent.replace(/\s+\d+s$/, "");
+                    textEl.textContent = `${base} ${s}s`;
+                }
+            }, 1000);
         }
         const textEl = scoutEl.querySelector(".scout-text");
         if (textEl) textEl.textContent = text || "Scanning\u2026";
         scrollChat();
     }
     function endScout() {
+        if (_scoutTickInterval) { clearInterval(_scoutTickInterval); _scoutTickInterval = null; }
         if (scoutEl) {
+            const s = Math.max(0, Math.round((Date.now() - _scoutStartedAt) / 1000));
             scoutEl.classList.add("scout-done");
             const textEl = scoutEl.querySelector(".scout-text");
-            if (textEl) textEl.textContent = "\u2713 Scan complete";
+            if (textEl) textEl.textContent = s > 0 ? `Scanned \u2014 ${s}s` : "\u2713 Scan complete";
             scoutEl = null;
         }
     }
@@ -4288,6 +4377,39 @@
         return true;
     }
 
+    function _textMorphRender() {
+        _textRenderRAF = null;
+        if (!currentTextEl || !_textDirty) return;
+        _textDirty = false;
+        const display = currentTextBuffer
+            .replace(/<updated_plan>[\s\S]*?<\/updated_plan>/g, "").trim();
+        if (!display) return;
+        const html = renderMarkdown(display);
+        const temp = document.createElement("div");
+        temp.className = currentTextEl.className;
+        temp.innerHTML = html;
+        morphdom(currentTextEl, temp, {
+            childrenOnly: false,
+            onBeforeElUpdated(fromEl, toEl) {
+                if (fromEl.isEqualNode(toEl)) return false;
+                return true;
+            }
+        });
+        currentTextEl.querySelectorAll("pre code").forEach(b => {
+            if (!b._hlDone && typeof hljs !== "undefined") {
+                hljs.highlightElement(b);
+                b._hlDone = true;
+            }
+        });
+        scrollChat();
+    }
+
+    function _scheduleTextRender() {
+        if (!_textRenderRAF) {
+            _textRenderRAF = requestAnimationFrame(_textMorphRender);
+        }
+    }
+
     function handleEvent(evt) {
         switch (evt.type) {
             case "init": {
@@ -4333,21 +4455,33 @@
                 _isFirstConnect = false;
                 break;
             }
-            case "thinking_start": currentThinkingEl = createThinkingBlock(); break;
+            case "thinking_start":
+                if (scoutEl && !scoutEl.classList.contains("scout-done")) endScout();
+                currentThinkingEl = createThinkingBlock();
+                break;
             case "thinking":
                 appendThinkingContent(currentThinkingEl, evt.content || "");
                 break;
             case "thinking_end": finishThinking(currentThinkingEl); currentThinkingEl = null; break;
-            case "text_start": currentTextEl = null; currentTextBuffer = ""; break;
+            case "text_start":
+                currentTextEl = null;
+                currentTextBuffer = "";
+                _textDirty = false;
+                if (_textRenderRAF) { cancelAnimationFrame(_textRenderRAF); _textRenderRAF = null; }
+                break;
             case "text":
                 currentTextBuffer += evt.content || "";
-                if (!currentTextEl) { const b = getOrCreateBubble(); currentTextEl = document.createElement("div"); currentTextEl.className = "text-content"; b.appendChild(currentTextEl); }
-                { const _display = currentTextBuffer.replace(/<updated_plan>[\s\S]*?<\/updated_plan>/g, "").trim();
-                  currentTextEl.innerHTML = renderMarkdown(_display);
-                  currentTextEl.querySelectorAll("pre code").forEach(b => { if (typeof hljs !== "undefined") hljs.highlightElement(b); }); }
-                scrollChat();
+                if (!currentTextEl) {
+                    const b = getOrCreateBubble();
+                    currentTextEl = document.createElement("div");
+                    currentTextEl.className = "text-content";
+                    b.appendChild(currentTextEl);
+                }
+                _textDirty = true;
+                _scheduleTextRender();
                 break;
             case "text_end":
+                if (_textRenderRAF) { cancelAnimationFrame(_textRenderRAF); _textRenderRAF = null; }
                 if (currentTextEl && currentTextBuffer) {
                     const _display = currentTextBuffer.replace(/<updated_plan>[\s\S]*?<\/updated_plan>/g, "").trim();
                     currentTextEl.innerHTML = renderMarkdown(_display);
@@ -4356,6 +4490,8 @@
                     if (bubble && !bubble.querySelector(":scope > .copy-btn")) bubble.appendChild(makeCopyBtn(currentTextBuffer));
                 }
                 currentTextEl = null; currentTextBuffer = "";
+                _textDirty = false;
+                scrollChat();
                 break;
             case "tool_call":
                 lastToolBlock = addToolCall(
@@ -4381,7 +4517,8 @@
                 break;
             case "tool_result":
                 {
-                    let runEl = (evt.data?.tool_use_id && toolRunById.get(String(evt.data.tool_use_id))) || lastToolBlock;
+                    const _trId = evt.data?.tool_use_id || evt.data?.id;
+                    let runEl = (_trId && toolRunById.get(String(_trId))) || lastToolBlock;
                     // If we fell back to lastToolBlock and it's the group (not a run), use the last run in that group
                     if (runEl && runEl.classList && runEl.classList.contains("tool-block")) {
                         const list = runEl.querySelector(".tool-run-list");
@@ -4401,7 +4538,7 @@
                 }
                 // Reload file if it was just written and track changes (accept Write/Edit or write_file/edit_file)
                 {
-                    const runEl = (evt.data?.tool_use_id && toolRunById.get(String(evt.data.tool_use_id))) || lastToolBlock;
+                    const runEl = (_trId && toolRunById.get(String(_trId))) || lastToolBlock;
                     if (runEl) {
                         const tn = runEl.dataset.toolName;
                         const isWrite = tn === "Write" || tn === "write_file";
@@ -4431,8 +4568,8 @@
                         }
                     }
                 }
-                if (evt.data?.tool_use_id) {
-                    toolRunById.delete(String(evt.data.tool_use_id));
+                if (_trId) {
+                    toolRunById.delete(String(_trId));
                 }
                 lastToolBlock = null;
                 break;
@@ -4471,7 +4608,10 @@
             case "scout_start": showScoutProgress("Scanning\u2026"); break;
             case "scout_progress": showScoutProgress(evt.content); break;
             case "scout_end": endScout(); break;
-            case "phase_start": showPhase(evt.content); break;
+            case "phase_start":
+                if (scoutEl && !scoutEl.classList.contains("scout-done")) endScout();
+                showPhase(evt.content);
+                break;
             case "user_question": showClarifyingQuestion(evt.question || "", evt.context || "", evt.tool_use_id || "", evt.options); break;
             case "phase_end":
                 endPhase(evt.content, evt.elapsed || 0);
@@ -4535,6 +4675,22 @@
             case "done":
                 setRunning(false);
                 if (evt.data) updateTokenDisplay(evt.data);
+                // Stop all live timers
+                _stopThinkingTick();
+                Object.keys(_phaseTickIntervals).forEach(k => { clearInterval(_phaseTickIntervals[k]); delete _phaseTickIntervals[k]; });
+                // Clean up any tool blocks still in loading state
+                document.querySelectorAll(".tool-block-loading").forEach(b => {
+                    b.classList.remove("tool-block-loading");
+                    const st = b.querySelector(".tool-status");
+                    if (st && !st.classList.contains("tool-status-success") && !st.classList.contains("tool-status-error")) {
+                        st.className = "tool-status tool-status-success";
+                        st.title = "Done";
+                        st.innerHTML = toolActionIcon("done");
+                    }
+                });
+                // End any active phases/scouts
+                document.querySelectorAll(".phase-indicator:not(.done)").forEach(el => el.classList.add("done"));
+                if (scoutEl && !scoutEl.classList.contains("scout-done")) endScout();
                 break;
             case "kept":
                 hideActionBar();
@@ -4621,7 +4777,18 @@
                 }
                 loadAgentSessions();
                 break;
-            case "error": showError(evt.content || "Unknown error"); setRunning(false); break;
+            case "error":
+                showError(evt.content || "Unknown error");
+                setRunning(false);
+                // Clean up loading tool blocks on error
+                document.querySelectorAll(".tool-block-loading").forEach(b => {
+                    b.classList.remove("tool-block-loading");
+                    const st = b.querySelector(".tool-status");
+                    if (st) { st.className = "tool-status tool-status-error"; st.title = "Error"; st.innerHTML = toolActionIcon("failed"); }
+                });
+                document.querySelectorAll(".phase-indicator:not(.done)").forEach(el => el.classList.add("done"));
+                if (scoutEl && !scoutEl.classList.contains("scout-done")) endScout();
+                break;
             case "stream_retry": case "stream_recovering": showInfo(evt.content || "Recovering\u2026"); break;
             case "stream_failed": showError(evt.content || "Stream failed."); setRunning(false); break;
             case "status":
@@ -4659,7 +4826,8 @@
                 break;
             case "replay_tool_result":
                 {
-                    const runEl = (evt.data?.tool_use_id && toolRunById.get(String(evt.data.tool_use_id))) || lastToolBlock;
+                    const _rtrId = evt.data?.tool_use_id || evt.data?.id;
+                    const runEl = (_rtrId && toolRunById.get(String(_rtrId))) || lastToolBlock;
                     addToolResult(evt.content || "", evt.data?.success !== false, runEl, evt.data);
                     if (runEl && evt.data?.success !== false) {
                         const tn = runEl.dataset.toolName;
@@ -4683,7 +4851,7 @@
                             detectFileDeletesFromBash(inputData.command, evt.content || "");
                         }
                     }
-                    if (evt.data?.tool_use_id) toolRunById.delete(String(evt.data.tool_use_id));
+                    if (_rtrId) toolRunById.delete(String(_rtrId));
                 }
                 lastToolBlock = null;
                 break;
