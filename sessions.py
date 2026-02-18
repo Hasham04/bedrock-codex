@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,15 +146,17 @@ class SessionStore:
 
         os.makedirs(self.base_dir, exist_ok=True)
 
-        tmp_path = path + ".tmp"
+        fd, tmp_path = tempfile.mkstemp(dir=self.base_dir, suffix=".tmp")
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             os.replace(tmp_path, path)
             logger.info(f"Session saved: {path}")
         except Exception:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
             raise
 
         return path
