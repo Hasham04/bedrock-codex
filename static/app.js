@@ -3290,6 +3290,147 @@
         }, delay);
     }
 
+    function addToolCallPlaceholder(name, toolUseId) {
+        name = normalizedToolName(name);
+        const bubble = getOrCreateBubble();
+        const icon = toolIcon(name, {});
+        const isWrite = name === "Write" || name === "Edit" || name === "symbol_edit";
+        const group = document.createElement("div");
+        group.className = "tool-block tool-block-loading";
+        group.dataset.toolName = name;
+        group.dataset.groupKey = name;
+        group.dataset.count = "1";
+        group.dataset.firstAt = String(Date.now());
+        group.dataset.lastAt = String(Date.now());
+        group.dataset.follow = "1";
+        const statusHtml = `<span class="tool-status tool-status-pending" title="Generating\u2026"><span class="tool-status-dot"></span></span>`;
+        group.innerHTML = `
+            <div class="tool-header">
+                <div class="tool-left">
+                    <span class="tool-icon-wrap"><span class="tool-icon">${icon}</span></span>
+                    <span class="tool-summary">${escapeHtml(toolTitle(name))} <span class="tool-generating-label">generating\u2026</span></span>
+                </div>
+                <div class="tool-right">${statusHtml}<span class="tool-chevron">\u25BC</span></div>
+            </div>
+            <div class="tool-content">
+                <div class="tool-run-list">
+                    <div class="tool-run tool-run-placeholder" ${toolUseId ? `data-tool-use-id="${escapeHtml(String(toolUseId))}"` : ""}>
+                        <div class="tool-input-progress" style="padding:8px 12px;color:var(--muted);font-size:0.85em;">
+                            Generating input\u2026
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        if (isWrite) group.classList.remove("collapsed");
+        else group.classList.add("collapsed");
+        group.querySelector(".tool-header").addEventListener("click", () => group.classList.toggle("collapsed"));
+        bubble.appendChild(group);
+        lastToolGroup = group;
+        const run = group.querySelector(".tool-run-placeholder");
+        if (toolUseId && run) toolRunById.set(String(toolUseId), run);
+        toolRunState.set(run, { name, input: {}, output: "" });
+        scrollChat();
+        return group;
+    }
+
+    function updateToolInputProgress(runEl, bytes, path) {
+        const prog = runEl.querySelector ? runEl.querySelector(".tool-input-progress") : null;
+        if (!prog) return;
+        const kb = (bytes / 1024).toFixed(1);
+        let text = `Generating input\u2026 ${kb} KB`;
+        if (path) {
+            const group = runEl.closest(".tool-block");
+            if (group) {
+                const summaryEl = group.querySelector(".tool-summary");
+                if (summaryEl) {
+                    const name = group.dataset.toolName || "";
+                    summaryEl.innerHTML = `${escapeHtml(toolTitle(name))} <span class="tool-generating-path">${escapeHtml(condensePath(path))}</span> <span class="tool-generating-label">generating\u2026 ${escapeHtml(kb)} KB</span>`;
+                }
+            }
+            text = `Writing ${condensePath(path)}\u2026 ${kb} KB`;
+        }
+        prog.textContent = text;
+    }
+
+    function finalizeToolCallPlaceholder(runEl, name, input) {
+        name = normalizedToolName(name);
+        const group = runEl.closest(".tool-block");
+        if (!group) return;
+        const genLabel = group.querySelector(".tool-generating-label");
+        if (genLabel) genLabel.remove();
+        const genPath = group.querySelector(".tool-generating-path");
+        if (genPath) genPath.remove();
+        const summaryEl = group.querySelector(".tool-summary");
+        const headerDesc = (name === "Read" && input?.path) ? readFileDisplayString(input) : toolDescForHeader(name, input);
+        const summaryText = headerDesc ? `${toolTitle(name)} ${headerDesc}` : toolTitle(name);
+        if (summaryEl) summaryEl.textContent = summaryText;
+        if (input?.path) group.dataset.path = input.path;
+        const placeholder = runEl.querySelector(".tool-input-progress");
+        if (placeholder) placeholder.remove();
+        runEl.classList.remove("tool-run-placeholder");
+        runEl.dataset.toolName = name;
+        if (input?.path) runEl.dataset.path = input.path;
+        runEl._toolInput = input || {};
+        const formattedInput = formatToolInput(name, input);
+        if (formattedInput) {
+            runEl.appendChild(formattedInput);
+        } else {
+            const isCmd = name === "Bash";
+            const inputText = isCmd ? (input?.command || JSON.stringify(input, null, 2)) : JSON.stringify(input, null, 2);
+            runEl.appendChild(makeProgressiveBody(inputText || "{}", isCmd ? "tool-input tool-input-cmd" : "tool-input", isCmd ? 2800 : 1800));
+        }
+        if (name === "Write" || name === "Edit" || name === "symbol_edit") {
+            const previewDiff = buildEditPreviewDiff(name, input);
+            if (previewDiff) {
+                const previewWrap = document.createElement("div");
+                previewWrap.className = "tool-edit-preview";
+                const label = document.createElement("div");
+                label.className = "tool-section-label";
+                label.textContent = "Changes";
+                const miniDiff = document.createElement("div");
+                miniDiff.className = "tool-mini-diff";
+                previewWrap.appendChild(label);
+                previewWrap.appendChild(miniDiff);
+                runEl.appendChild(previewWrap);
+                const diffLines = previewDiff.split("\n");
+                let lineIdx = 0;
+                let _lastTime = 0;
+                const LINE_DELAY = 12;
+                const cursor = document.createElement("div");
+                cursor.className = "diff-stream-cursor";
+                miniDiff.appendChild(cursor);
+                function _streamTick(ts) {
+                    if (lineIdx >= diffLines.length) {
+                        cursor.classList.add("fade-out");
+                        setTimeout(() => cursor.remove(), 200);
+                        return;
+                    }
+                    if (ts - _lastTime < LINE_DELAY) { requestAnimationFrame(_streamTick); return; }
+                    _lastTime = ts;
+                    const l = diffLines[lineIdx];
+                    const div = document.createElement("div");
+                    let c = "ctx";
+                    if (l.startsWith("+++") || l.startsWith("---")) c = "hunk";
+                    else if (l.startsWith("@@")) c = "hunk";
+                    else if (l.startsWith("+")) c = "add";
+                    else if (l.startsWith("-")) c = "del";
+                    div.className = "diff-line " + c;
+                    div.textContent = l;
+                    miniDiff.insertBefore(div, cursor);
+                    lineIdx++;
+                    miniDiff.scrollTop = miniDiff.scrollHeight;
+                    if (lineIdx % 4 === 0 && group.dataset.follow === "1") scrollChat();
+                    requestAnimationFrame(_streamTick);
+                }
+                requestAnimationFrame(_streamTick);
+            }
+            group.classList.remove("collapsed");
+        }
+        const state = toolRunState.get(runEl);
+        if (state) { state.name = name; state.input = input || {}; toolRunState.set(runEl, state); }
+        scrollChat();
+    }
+
     function addToolCall(name, input, toolUseId = null, { stream = true } = {}) {
         name = normalizedToolName(name);
         const bubble = getOrCreateBubble();
@@ -4172,7 +4313,7 @@
 
         const fileCount = files.length;
         showActionBar([
-            { label: `Keep`, cls: "success", onClick: async () => { hideActionBar(); send({type:"keep"}); showInfo("\u2713 Changes kept."); clearAllDiffDecorations(); modifiedFiles.clear(); fileChangesThisSession.clear(); const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); await refreshTree(); await fetchGitStatus(); if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); updateFileChangesDropdown(); }},
+            { label: `Keep`, cls: "success", onClick: async () => { hideActionBar(); send({type:"keep"}); showInfo("\u2713 Changes accepted."); clearAllDiffDecorations(); const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); await refreshTree(); await fetchGitStatus(); if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); updateFileChangesDropdown(); }},
             { label: `Revert`, cls: "danger", onClick: async () => { hideActionBar(); send({type:"revert"}); showInfo("\u21A9 Reverted " + fileCount + " file(s)."); clearAllDiffDecorations(); modifiedFiles.clear(); fileChangesThisSession.clear(); const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); await refreshTree(); await fetchGitStatus(); if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); updateFileChangesDropdown(); reloadAllModifiedFiles(); }},
         ]);
         scrollChat();
@@ -4536,13 +4677,35 @@
                 _textDirty = false;
                 scrollChat();
                 break;
-            case "tool_call":
-                lastToolBlock = addToolCall(
-                    evt.data?.name || "tool",
-                    evt.data?.input || evt.data || {},
-                    evt.data?.id || evt.data?.tool_use_id || null
-                );
-                // Update todo UI immediately when agent sends TodoWrite (don't wait for todos_updated)
+            case "tool_use_start": {
+                const _tusName = normalizedToolName(evt.data?.name || "tool");
+                const _tusId = evt.data?.id || null;
+                lastToolBlock = addToolCallPlaceholder(_tusName, _tusId);
+                break;
+            }
+            case "tool_input_delta": {
+                const _tidId = evt.data?.id;
+                const _tidEl = (_tidId && toolRunById.get(String(_tidId))) || lastToolBlock;
+                if (_tidEl) updateToolInputProgress(_tidEl, evt.data?.bytes || 0, evt.data?.path || "");
+                break;
+            }
+            case "tool_call": {
+                const _tcId = evt.data?.id || evt.data?.tool_use_id || null;
+                const _tcExisting = _tcId ? toolRunById.get(String(_tcId)) : null;
+                if (_tcExisting) {
+                    finalizeToolCallPlaceholder(
+                        _tcExisting,
+                        evt.data?.name || "tool",
+                        evt.data?.input || evt.data || {}
+                    );
+                    lastToolBlock = _tcExisting.closest(".tool-block") || _tcExisting;
+                } else {
+                    lastToolBlock = addToolCall(
+                        evt.data?.name || "tool",
+                        evt.data?.input || evt.data || {},
+                        _tcId
+                    );
+                }
                 const toolName = evt.data?.name;
                 if (toolName === "TodoWrite" && evt.data?.input?.todos && Array.isArray(evt.data.input.todos)) {
                     const normalized = evt.data.input.todos.map((t, i) => ({
@@ -4552,12 +4715,12 @@
                     }));
                     showAgentChecklist(normalized);
                 }
-                // Track file modifications (accept Write/Edit or write_file/edit_file)
                 if (toolName === "Write" || toolName === "write_file" || toolName === "Edit" || toolName === "edit_file" || toolName === "symbol_edit") {
                     const p = evt.data?.input?.path;
                     if (p) { markFileModified(p); reloadFileInEditor(p); }
                 }
                 break;
+            }
             case "tool_result":
                 {
                     const _trId = evt.data?.tool_use_id || evt.data?.id;
@@ -4753,10 +4916,8 @@
             case "kept":
                 hideActionBar();
                 clearAllDiffDecorations();
-                modifiedFiles.clear();
-                fileChangesThisSession.clear();
                 { const dc = document.getElementById("cumulative-diff-container"); if (dc) dc.remove(); }
-                showInfo("\u2713 Changes kept.");
+                showInfo("\u2713 Changes accepted — you can still revert later.");
                 refreshTree();
                 fetchGitStatus().then(() => { if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); });
                 updateFileChangesDropdown();
@@ -4965,7 +5126,7 @@
                         showDiffs(evt.diffs, true);
                     } else {
                         showActionBar([
-                            { label: "Keep", cls: "success", onClick: () => { hideActionBar(); send({ type: "keep" }); fileChangesThisSession.clear(); updateFileChangesDropdown(); }},
+                            { label: "Keep", cls: "success", onClick: () => { hideActionBar(); send({ type: "keep" }); updateFileChangesDropdown(); }},
                             { label: "Revert", cls: "danger", onClick: () => { hideActionBar(); send({ type: "revert" }); fileChangesThisSession.clear(); updateFileChangesDropdown(); }},
                         ]);
                     }

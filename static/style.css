@@ -1960,6 +1960,23 @@ body { display: flex; flex-direction: column; }
     50%      { opacity: 0.3; }
 }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+/* Streaming tool-input progress indicators */
+.tool-generating-label {
+    color: var(--muted);
+    font-size: 0.85em;
+    font-weight: 400;
+    animation: caretPulse 1.2s ease-in-out infinite;
+}
+.tool-generating-path {
+    color: var(--blue);
+    font-weight: 500;
+}
+.tool-input-progress {
+    color: var(--muted);
+    font-size: 0.85em;
+    padding: 8px 12px;
+    animation: caretPulse 1.2s ease-in-out infinite;
+}
 .tool-result-success .tool-result-body { border-left: 3px solid var(--green); box-shadow: inset 2px 0 8px var(--green-glow); }
 .tool-result-error .tool-result-body { border-left: 3px solid var(--red); box-shadow: inset 2px 0 8px var(--red-glow); }
 

@@ -21,6 +21,11 @@ class AWSConfig:
     session_token: str = os.getenv("AWS_SESSION_TOKEN", "")
     profile_name: str = os.getenv("AWS_PROFILE", "")
     
+    # Timeout configurations for Bedrock API calls
+    # AWS docs recommend at least 3600s for Claude 4+ models with extended thinking
+    connect_timeout: int = int(os.getenv("AWS_CONNECT_TIMEOUT", "10"))
+    read_timeout: int = int(os.getenv("AWS_READ_TIMEOUT", "3600"))
+    
     def has_explicit_credentials(self) -> bool:
         return bool(self.access_key_id and self.secret_access_key)
     
@@ -101,6 +106,8 @@ class AppConfig:
     # Enterprise: semantic codebase index (Cursor-style)
     codebase_index_enabled: bool = os.getenv("CODEBASE_INDEX_ENABLED", "true").lower() == "true"
     embedding_model_id: str = os.getenv("EMBEDDING_MODEL_ID", "cohere.embed-english-v3")
+    # Server-side context editing (Anthropic beta) — offloads tool/thinking compaction to the API
+    context_editing_enabled: bool = os.getenv("CONTEXT_EDITING_ENABLED", "true").lower() == "true"
 
 
 # ============================================================
@@ -130,7 +137,8 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "default_thinking_budget": 120000,
         "supports_caching": True,
         "cache_min_tokens": 1024,
-        "cache_ttl_options": ["5m"],
+        "cache_ttl_options": ["5m", "1h"],
+        "supports_context_editing": True,
     },
     # ----- Claude 4.5 family -----
     {
@@ -437,6 +445,11 @@ def get_cache_min_tokens(model_id: str) -> int:
 def get_cache_ttl_options(model_id: str) -> List[str]:
     """Get supported cache TTL options"""
     return get_model_config(model_id).get("cache_ttl_options", ["5m"])
+
+
+def supports_context_editing(model_id: str) -> bool:
+    """Check if model supports server-side context editing (Anthropic beta)"""
+    return get_model_config(model_id).get("supports_context_editing", False)
 
 
 def get_credentials_info() -> str:

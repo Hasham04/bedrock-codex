@@ -525,7 +525,8 @@ class BedrockCodexApp(App):
                 self.awaiting_keep_revert = False
                 if self._agent:
                     files = list(self._agent.modified_files.keys())
-                    self._agent.clear_snapshots()
+                    # Don't clear snapshots — keep baselines so diffs stay
+                    # cumulative across multiple plan/build cycles.
                     count = len(files)
                     self._log(Text.from_markup(
                         f"   [bold #3fb950]\u2713 Kept {count} file{'s' if count != 1 else ''}[/bold #3fb950]"

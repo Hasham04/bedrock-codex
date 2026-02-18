@@ -19,10 +19,12 @@ import json
 import logging
 from typing import Generator, List, Dict, Optional, Any
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
+from botocore.config import Config
 from dataclasses import dataclass, field
 from config import (
     aws_config, 
-    model_config, 
+    model_config,
+    app_config,
     get_credentials_info,
     get_model_config,
     get_context_window,
@@ -32,6 +34,7 @@ from config import (
     supports_thinking,
     supports_adaptive_thinking,
     supports_caching,
+    supports_context_editing,
     get_cache_ttl_options,
     get_thinking_max_budget,
     get_default_thinking_budget
@@ -130,8 +133,15 @@ class BedrockService:
                 if aws_config.has_session_token():
                     session_kwargs["aws_session_token"] = aws_config.session_token
             
+            # Configure timeouts for Bedrock API calls
+            boto_config = Config(
+                connect_timeout=aws_config.connect_timeout,
+                read_timeout=aws_config.read_timeout,
+                retries={'max_attempts': 3, 'mode': 'adaptive'}
+            )
+            
             session = boto3.Session(**session_kwargs)
-            return session.client("bedrock-runtime")
+            return session.client("bedrock-runtime", config=boto_config)
             
         except NoCredentialsError:
             raise BedrockError("AWS credentials not configured.")
@@ -154,8 +164,15 @@ class BedrockService:
                 if session_token:
                     session_kwargs["aws_session_token"] = session_token
             
+            # Configure timeouts for Bedrock API calls
+            boto_config = Config(
+                connect_timeout=aws_config.connect_timeout,
+                read_timeout=aws_config.read_timeout,
+                retries={'max_attempts': 3, 'mode': 'adaptive'}
+            )
+
             session = boto3.Session(**session_kwargs)
-            self.client = session.client("bedrock-runtime")
+            self.client = session.client("bedrock-runtime", config=boto_config)
             logger.info("Credentials refreshed successfully")
             set_key(env_path, "AWS_ACCESS_KEY_ID", access_key_id)
             set_key(env_path, "AWS_SECRET_ACCESS_KEY", secret_access_key)
@@ -285,6 +302,25 @@ class BedrockService:
             "max_tokens": effective_max_tokens,
             "messages": formatted_messages
         }
+        
+        # --- Server-side context editing (Anthropic beta) ---
+        # NOTE: Disabled — the `context` field is not yet supported on the
+        # Bedrock InvokeModel endpoint (Anthropic direct API only).  Keeping
+        # the code here for when AWS adds support.
+        # use_context_editing = (
+        #     supports_context_editing(model_id)
+        #     and app_config.context_editing_enabled
+        # )
+        # if use_context_editing:
+        #     beta_flags = ["context-management-2025-06-27"]
+        #     body["anthropic_beta"] = beta_flags
+        #     strategies = [
+        #         {"type": "clear_tool_uses_20250919"},
+        #     ]
+        #     if use_thinking:
+        #         strategies.append({"type": "clear_thinking_20251015"})
+        #     body["context"] = {"strategies": strategies}
+        #     logger.debug("Server-side context editing enabled with %d strategies", len(strategies))
         
         # --- Thinking configuration ---
         if use_thinking:
