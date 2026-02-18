@@ -530,7 +530,10 @@ class SSHBackend(Backend):
         """Execute a command on the remote host."""
         with self._lock:
             self._reconnect_if_needed()
-            _, stdout_ch, stderr_ch = self._client.exec_command(cmd, timeout=timeout)
+            # Source shell profile to ensure PATH and environment are set up correctly
+            # This makes interactive shell commands (aliases, functions, PATH additions) available
+            wrapped_cmd = f"bash -l -c {shlex.quote(cmd)}"
+            _, stdout_ch, stderr_ch = self._client.exec_command(wrapped_cmd, timeout=timeout)
         channel = stdout_ch.channel
         self._active_channel = channel  # track for cancel
         # Read OUTSIDE the lock — exec channels are independent of SFTP,
@@ -683,8 +686,12 @@ class SSHBackend(Backend):
                 "Command contains disallowed shell metacharacters (e.g. & | ; $ `). "
                 "Use a single command with arguments only."
             )
-        full_cwd = self._remote_path(cwd) if cwd != "." else self._working_directory
-        cmd = f"cd {full_cwd!r} && {command}"
+        # Always use _remote_path for consistency with file operations
+        full_cwd = self._remote_path(cwd)
+        # Source shell profile to get full environment (aliases, functions, PATH)
+        # Try common profile files in order of precedence
+        profile_sources = "source ~/.bash_profile 2>/dev/null || source ~/.bashrc 2>/dev/null || source ~/.profile 2>/dev/null || true"
+        cmd = f"bash -c '{profile_sources}; cd {full_cwd!r} && {command}'"
         return self._exec(cmd, timeout=timeout)
 
     def run_command_stream(
@@ -699,8 +706,12 @@ class SSHBackend(Backend):
                 "Command contains disallowed shell metacharacters (e.g. & | ; $ `). "
                 "Use a single command with arguments only."
             )
-        full_cwd = self._remote_path(cwd) if cwd != "." else self._working_directory
-        cmd = f"cd {full_cwd!r} && {command}"
+        # Always use _remote_path for consistency with file operations
+        full_cwd = self._remote_path(cwd)
+        # Source shell profile to get full environment (aliases, functions, PATH)
+        # Try common profile files in order of precedence
+        profile_sources = "source ~/.bash_profile 2>/dev/null || source ~/.bashrc 2>/dev/null || source ~/.profile 2>/dev/null || true"
+        cmd = f"bash -c '{profile_sources}; cd {full_cwd!r} && {command}'"
 
         with self._lock:
             self._reconnect_if_needed()

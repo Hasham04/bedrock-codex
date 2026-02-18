@@ -100,6 +100,11 @@
     const $resizeTerminal = document.getElementById("resize-terminal");
     const $sourceControlList = document.getElementById("source-control-list");
     const $sourceControlRefreshBtn = document.getElementById("source-control-refresh-btn");
+    const $modifiedFilesBar = document.getElementById("modified-files-bar");
+    const $modifiedFilesToggle = document.getElementById("modified-files-toggle");
+    const $modifiedFilesList = document.getElementById("modified-files-list");
+    const $modifiedFilesDropdown = document.getElementById("modified-files-dropdown");
+    const $modifiedFilesTotalsTop = document.getElementById("modified-files-totals-top");
     let terminalXterm = null;
     let terminalFitAddon = null;
     let terminalWs = null;
@@ -142,6 +147,7 @@
     // ── State ─────────────────────────────────────────────────
     let ws = null;
     let isRunning = false;
+    let isReplaying = true;  // starts true because session replay happens immediately after connect
     let monacoInstance = null;    // monaco.editor reference
     let diffEditorInstance = null;
     let activeTab = null;         // path of active tab
@@ -524,9 +530,19 @@
     // ── UI State ──────────────────────────────────────────────
     function setRunning(running) {
         isRunning = running;
-        if ($sendBtn) $sendBtn.classList.toggle("hidden", running);
         if ($cancelBtn) $cancelBtn.classList.toggle("hidden", !running);
-        if ($input) { $input.disabled = running; if (!running) $input.focus(); }
+        if ($sendBtn) $sendBtn.classList.toggle("hidden", false);
+        if ($input) {
+            $input.disabled = false;
+            if (running) {
+                $input.placeholder = "Guide the agent… (Enter to send correction)";
+                $input.closest(".chat-input-wrapper")?.classList.add("guidance-mode");
+            } else {
+                $input.placeholder = "Ask anything… (@ to mention files) (Enter to send)";
+                $input.closest(".chat-input-wrapper")?.classList.remove("guidance-mode");
+                $input.focus();
+            }
+        }
     }
 
     function showActionBar(buttons) {
@@ -1518,11 +1534,13 @@
     }
     startGitStatusPolling();
     // Review files bar: toggle expand list
+    const $stickyTodoAddRow = document.getElementById("sticky-todo-add-row");
     if ($stickyTodoToggle && $stickyTodoList && $stickyTodoBar) {
         $stickyTodoToggle.addEventListener("click", () => {
             const expanded = $stickyTodoBar.getAttribute("data-expanded") === "true";
             $stickyTodoBar.setAttribute("data-expanded", expanded ? "false" : "true");
             $stickyTodoList.classList.toggle("hidden", expanded);
+            if ($stickyTodoAddRow) $stickyTodoAddRow.classList.toggle("hidden", expanded);
             $stickyTodoToggle.setAttribute("aria-expanded", expanded ? "false" : "true");
         });
     }
@@ -2663,6 +2681,24 @@
             const truncated = safeText.trim().slice(0, 50);
             $conversationTitle.textContent = truncated ? (truncated + (safeText.length > 50 ? "\u2026" : "")) : "New conversation";
         }
+        scrollChat();
+    }
+
+    function addGuidanceMessage(text) {
+        const div = document.createElement("div");
+        div.className = "message user guidance-msg";
+        const bubble = document.createElement("div");
+        bubble.className = "msg-bubble guidance-bubble";
+        const label = document.createElement("span");
+        label.className = "guidance-label";
+        label.textContent = "Guidance";
+        bubble.appendChild(label);
+        const textEl = document.createElement("div");
+        textEl.className = "user-message-text";
+        textEl.textContent = text;
+        bubble.appendChild(textEl);
+        div.appendChild(bubble);
+        $chatMessages.appendChild(div);
         scrollChat();
     }
 
@@ -3915,17 +3951,29 @@
     let currentPlanSteps = [];
     let currentChecklistItems = [];
 
-    function showPlan(steps, planFile, planText, skipChecklist) {
+    function showPlan(steps, planFile, planText, skipChecklist, showButtons) {
+        showButtons = showButtons !== false; // default to true
         currentPlanSteps = [...steps];
         const bubble = getOrCreateBubble();
         const block = document.createElement("div"); block.className = "plan-block plan-block--tab"; block.id = "active-plan";
 
-        // Compact tab: open plan in editor (no full plan text in panel)
+        // Plan header with title and open button
         let html = `<div class="plan-tab-row">`;
+        html += `<div class="plan-title">Plan</div>`;
         if (planFile) {
+            const fileName = planFile.split('/').pop();
+            html += `<div class="plan-filename">${escapeHtml(fileName)}</div>`;
             html += `<button type="button" class="plan-open-tab" title="Open plan in editor" aria-label="Open in editor" data-path="${escapeHtml(planFile)}">${toolActionIcon("open")}</button>`;
         }
         html += `</div>`;
+
+        if (showButtons) {
+            html += `<div class="plan-actions">`;
+            html += `<button type="button" class="action-btn primary plan-build-btn">\u25B6 Build</button>`;
+            html += `<button type="button" class="action-btn secondary plan-feedback-btn">Feedback</button>`;
+            html += `<button type="button" class="action-btn danger plan-reject-btn">\u2715 Reject</button>`;
+            html += `</div>`;
+        }
 
         block.innerHTML = html;
         block.appendChild(makeCopyBtn(planText || steps.join("\n")));
@@ -3939,11 +3987,21 @@
             });
         }
 
-        showActionBar([
-            { label: "\u25B6 Build", cls: "primary", onClick: () => { hideActionBar(); send({ type: "build", steps: currentPlanSteps }); setRunning(true); }},
-            { label: "\uD83D\uDCAC Feedback", cls: "secondary", onClick: () => { showPlanFeedbackInput(); }},
-            { label: "\u2715 Reject", cls: "danger", onClick: () => { hideActionBar(); send({ type: "reject_plan" }); }},
-        ]);
+        const buildBtn = block.querySelector(".plan-build-btn");
+        if (buildBtn) buildBtn.addEventListener("click", () => {
+            buildBtn.closest(".plan-actions").remove();
+            const editorCtx = gatherEditorContext();
+            send({ type: "build", steps: currentPlanSteps, ...(editorCtx ? { context: editorCtx } : {}) });
+            setRunning(true);
+        });
+        const fbBtn = block.querySelector(".plan-feedback-btn");
+        if (fbBtn) fbBtn.addEventListener("click", () => showPlanFeedbackInput());
+        const rejectBtn = block.querySelector(".plan-reject-btn");
+        if (rejectBtn) rejectBtn.addEventListener("click", () => {
+            block.querySelector(".plan-actions")?.remove();
+            send({ type: "reject_plan" });
+        });
+
         if (!skipChecklist) {
             currentChecklistItems = steps.map((s, i) => ({ id: String(i + 1), content: s, status: "pending" }));
             showAgentChecklist(currentChecklistItems);
@@ -3951,55 +4009,37 @@
         scrollChat();
     }
 
-    function autoResizeTA(ta) { ta.style.height = "auto"; ta.style.height = ta.scrollHeight + "px"; }
-
-    // ── Plan feedback input ────────────────────────────────────
     function showPlanFeedbackInput() {
-        // If already showing, focus it
         const existing = document.querySelector(".plan-feedback-box");
-        if (existing) { existing.querySelector("textarea").focus(); return; }
-
+        if (existing) { existing.querySelector("textarea")?.focus(); return; }
         const planBlock = document.getElementById("active-plan");
         if (!planBlock) return;
-
         const box = document.createElement("div");
         box.className = "plan-feedback-box";
         box.innerHTML = `
             <div class="plan-feedback-label">What would you like changed?</div>
             <textarea class="plan-feedback-input" rows="3" placeholder="e.g. Don\u2019t modify auth.py, use the existing middleware instead\u2026"></textarea>
             <div class="plan-feedback-actions">
-                <button class="plan-feedback-send action-btn primary">Re-plan</button>
-                <button class="plan-feedback-cancel action-btn secondary">Cancel</button>
+                <button class="action-btn primary plan-feedback-send">Re-plan</button>
+                <button class="action-btn secondary plan-feedback-cancel">Cancel</button>
             </div>
         `;
         planBlock.appendChild(box);
-
         const ta = box.querySelector("textarea");
-        const sendBtn = box.querySelector(".plan-feedback-send");
-        const cancelBtn = box.querySelector(".plan-feedback-cancel");
-
         ta.focus();
-
-        sendBtn.addEventListener("click", () => {
-            const feedback = ta.value.trim();
-            if (!feedback) { ta.focus(); return; }
-            hideActionBar();
+        box.querySelector(".plan-feedback-send").addEventListener("click", () => {
+            const text = ta.value.trim();
+            if (!text) return;
             box.remove();
-            send({ type: "replan", content: feedback });
+            send({ type: "plan_feedback", feedback: text });
             setRunning(true);
         });
+        box.querySelector(".plan-feedback-cancel").addEventListener("click", () => box.remove());
+    }
 
-        cancelBtn.addEventListener("click", () => { box.remove(); });
-
-        // Enter to send (Shift+Enter for newline)
-        ta.addEventListener("keydown", (e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                sendBtn.click();
-            }
-        });
-
-        scrollChat();
+    function hidePlan() {
+        currentPlanSteps = [];
+        document.querySelectorAll(".plan-block").forEach(el => el.remove());
     }
 
     // ── Todos: only in bottom sticky dropdown (no in-chat checklist) ───
@@ -4016,6 +4056,7 @@
         if (items.length === 0) {
             $stickyTodoBar.classList.add("hidden");
             $stickyTodoList.classList.add("hidden");
+            if ($stickyTodoAddRow) $stickyTodoAddRow.classList.add("hidden");
             $stickyTodoBar.removeAttribute("data-expanded");
             return;
         }
@@ -4055,7 +4096,9 @@
                 <button type="button" class="sticky-todo-remove" title="Remove" aria-label="Remove">\u00D7</button>
             </div>`;
         }).join("");
-        $stickyTodoList.classList.toggle("hidden", $stickyTodoBar.getAttribute("data-expanded") !== "true");
+        const isExpanded = $stickyTodoBar.getAttribute("data-expanded") === "true";
+        $stickyTodoList.classList.toggle("hidden", !isExpanded);
+        if ($stickyTodoAddRow) $stickyTodoAddRow.classList.toggle("hidden", !isExpanded);
         $stickyTodoList.querySelectorAll(".sticky-todo-remove").forEach((btn) => {
             btn.addEventListener("click", (e) => {
                 e.stopPropagation();
@@ -4621,9 +4664,11 @@
                 showPlan(
                     evt.steps || (evt.data && evt.data.steps) || [],
                     evt.plan_file || (evt.data && evt.data.plan_file) || null,
-                    evt.plan_text || (evt.data && evt.data.plan_text) || ""
+                    evt.plan_text || (evt.data && evt.data.plan_text) || "",
+                    false,
+                    !isReplaying
                 );
-                setRunning(false);
+                if (!isReplaying) setRunning(false);
                 break;
             case "updated_plan":
                 {
@@ -4664,6 +4709,13 @@
                     evt.total || (evt.data && evt.data.total) || 1
                 );
                 break;
+            case "plan_rejected":
+                currentPlanSteps = [];
+                currentChecklistItems = [];
+                document.querySelectorAll(".plan-block").forEach(el => el.remove());
+                updateStickyTodoBar();
+                showInfo("Plan rejected.");
+                break;
             case "diff":
                 showDiffs(evt.files || [], !!evt.cumulative);
                 setRunning(false);
@@ -4672,6 +4724,12 @@
                 break;
             case "no_changes": showInfo("No file changes."); setRunning(false); break;
             case "no_plan": showInfo("Completed directly."); setRunning(false); break;
+            case "guidance_queued":
+                showInfo("Guidance sent — agent will incorporate it.");
+                break;
+            case "guidance_applied":
+                showInfo("Agent received your guidance.");
+                break;
             case "done":
                 setRunning(false);
                 if (evt.data) updateTokenDisplay(evt.data);
@@ -4731,7 +4789,7 @@
                 fetchGitStatus().then(() => { if ($sourceControlList) renderSourceControl(); updateModifiedFilesBar(); });
                 break;
             }
-            case "plan_rejected": showInfo("Plan rejected."); break;
+
             case "cancelled":
                 showInfo("Cancelled.");
                 setRunning(false);
@@ -4762,6 +4820,7 @@
                 sessionStartTime = null;
                 fileChangesThisSession.clear();
                 currentChecklistItems = [];
+                currentPlanSteps = [];
                 updateFileChangesDropdown();
                 updateStickyTodoBar();
                 if ($conversationTitle) $conversationTitle.textContent = evt.session_name || "New conversation";
@@ -4769,13 +4828,32 @@
                 loadAgentSessions();
                 toolRunById.clear();
                 clearPendingImages();
-                hideActionBar(); modifiedFiles.clear(); refreshTree();
+                setRunning(false);
+                hideActionBar();
+                modifiedFiles.clear();
+                clearAllDiffDecorations();
+                // Remove any plan blocks
+                document.querySelectorAll(".plan-block").forEach(el => el.remove());
+                // Clear checklist
+                const todoBar = document.getElementById("sticky-todo-bar");
+                if (todoBar) todoBar.classList.add("hidden");
+                // Stop all live timers
+                _stopThinkingTick();
+                Object.keys(_phaseTickIntervals).forEach(k => { clearInterval(_phaseTickIntervals[k]); delete _phaseTickIntervals[k]; });
+                if (_scoutTickInterval) { clearInterval(_scoutTickInterval); _scoutTickInterval = null; }
+                // Reset context gauge
+                const resetGaugeFill = document.getElementById("context-gauge-fill");
+                if (resetGaugeFill) { resetGaugeFill.style.width = "0%"; resetGaugeFill.className = "gauge-fill"; }
+                refreshTree();
                 break;
             case "session_name_update":
                 if ($conversationTitle && evt.session_name) {
                     $conversationTitle.textContent = evt.session_name;
                 }
                 loadAgentSessions();
+                break;
+            case "info":
+                showInfo(evt.content || "");
                 break;
             case "error":
                 showError(evt.content || "Unknown error");
@@ -4856,6 +4934,7 @@
                 lastToolBlock = null;
                 break;
             case "replay_done":
+                isReplaying = false;
                 scrollChat();
                 break;
             case "resumed":
@@ -4879,7 +4958,7 @@
                     showAgentChecklist(currentChecklistItems);
                 }
                 if (evt.awaiting_build && evt.pending_plan) {
-                    showPlan(evt.pending_plan, evt.plan_file || null, evt.plan_text || "", !!evt.todos?.length);
+                    showPlan(evt.pending_plan, evt.plan_file || null, evt.plan_text || "", !!evt.todos?.length, true);
                 }
                 if (evt.awaiting_keep_revert && evt.has_diffs) {
                     if (evt.diffs && evt.diffs.length > 0) {
@@ -4922,14 +5001,25 @@
     async function submitTask() {
         const text = ($input && $input.value) ? $input.value.trim() : "";
         const hasImages = pendingImages.length > 0;
-        if ((!text && !hasImages) || isRunning) return;
-        if (text.startsWith("/") && /^\/[a-zA-Z]/.test(text) && !hasImages) { handleCommand(text); $input.value = ""; autoResizeInput(); return; }
+        if (!text && !hasImages) return;
 
         if (!ws || ws.readyState !== WebSocket.OPEN) {
             showInfo("Not connected. Waiting for connection…");
             if (typeof showToast === "function") showToast("Not connected");
             return;
         }
+
+        // If agent is running, send as guidance (mid-task correction)
+        if (isRunning) {
+            if (!text) return;
+            if (text.startsWith("/") && /^\/[a-zA-Z]/.test(text)) { handleCommand(text); $input.value = ""; autoResizeInput(); return; }
+            addGuidanceMessage(text);
+            $input.value = ""; autoResizeInput();
+            send({ type: "guidance", content: text });
+            return;
+        }
+
+        if (text.startsWith("/") && /^\/[a-zA-Z]/.test(text) && !hasImages) { handleCommand(text); $input.value = ""; autoResizeInput(); return; }
 
         let imagesPayload = [];
         if (hasImages) {
@@ -5000,6 +5090,16 @@
             if (suppressAgentSwitch) return;
             const nextId = $agentSelect.value || null;
             if (!nextId || nextId === currentSessionId) return;
+            
+            // Clear UI state from previous session
+            hideActionBar();
+            hidePlan();
+            clearAllDiffDecorations();
+            modifiedFiles.clear();
+            fileChangesThisSession.clear();
+            updateModifiedFilesBar();
+            updateFileChangesDropdown();
+            
             currentSessionId = nextId;
             persistSessionId(currentSessionId);
             disconnectWs();

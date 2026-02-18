@@ -2641,7 +2641,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         closure so it can be re-entered after a reconnect."""
         nonlocal _cancel_ack_sent, _agent_task, awaiting_keep_revert
         nonlocal awaiting_build, pending_task, pending_plan, pending_images
-        nonlocal session
+        nonlocal session, _current_thinking_text, _current_text_buffer
         while True:
             raw = await ws.receive_text()
             try:
@@ -2679,6 +2679,16 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     diffs = generate_diffs()
                     if diffs:
                         await wsr.send_json({"type": "diff", "files": diffs, "cumulative": True})
+                continue
+
+            # ── Guidance (mid-task user correction) ─────────────────
+            if msg_type == "guidance":
+                guidance_text = data.get("content", "").strip()
+                if guidance_text and _agent_task and not _agent_task.done():
+                    agent.inject_guidance(guidance_text)
+                    await wsr.send_json({"type": "guidance_queued", "content": guidance_text})
+                elif guidance_text:
+                    await wsr.send_json({"type": "info", "content": "No task is running. Send as a normal message instead."})
                 continue
 
             # ── Keep / Revert ──────────────────────────────────────
@@ -2774,33 +2784,22 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             if msg_type == "build" and awaiting_build:
                 awaiting_build = False
                 edited_steps = data.get("steps") or pending_plan or []
+                build_editor_ctx = data.get("context")
                 _cancel_ack_sent = False
                 _agent_task = asyncio.create_task(
-                    _run_build_bg(pending_task or "", edited_steps, pending_images or [])
+                    _run_build_bg(pending_task or "", edited_steps, pending_images or [], editor_context=build_editor_ctx)
                 )
                 continue
 
             # ── Reject plan ────────────────────────────────────────
-            if msg_type == "reject_plan" and awaiting_build:
+            if msg_type == "reject_plan":
                 awaiting_build = False
-                pending_task = None
                 pending_plan = None
-                pending_images = []
+                pending_task = None
+                pending_images = None
+                save_session()
                 await wsr.send_json({"type": "plan_rejected"})
                 continue
-
-            # ── Re-plan with feedback ──────────────────────────────
-            if msg_type == "replan" and awaiting_build:
-                feedback = data.get("content", "")
-                task = f"{pending_task}\n\nUser feedback: {feedback}" if pending_task else feedback
-                awaiting_build = False
-                pending_task = task
-                pending_plan = None
-
-                # Fall through to task handling below
-                msg_type = "task"
-                data["content"] = task
-                data["images"] = pending_images
 
             # ── Reset ──────────────────────────────────────────────
             if msg_type == "reset":
@@ -2809,6 +2808,13 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     _agent_task.cancel()
                     _agent_task = None
                 agent.reset()
+                pending_plan = None
+                pending_task = None
+                pending_images = None
+                awaiting_build = False
+                awaiting_keep_revert = False
+                _current_thinking_text = ""
+                _current_text_buffer = ""
                 session = store.create_session(wd, model_config.model_id)
                 save_session()
                 await wsr.send_json({
@@ -3028,6 +3034,15 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             ag._todos = todos
             await wsr.send_json({"type": "todos_updated", "todos": todos})
 
+        def _format_error_for_client(exc: BaseException) -> str:
+            """Format an exception for the UI. Avoid showing raw paths or opaque 'Unknown' messages."""
+            name = type(exc).__name__
+            msg = str(exc).strip()
+            if not msg or ".py:" in msg or (len(msg) > 2 and msg[0] == "/" and "/" in msg[1:]):
+                return f"{name} (see server logs for details)"
+            out = f"{name}: {msg}"
+            return out[:500] + "..." if len(out) > 500 else out
+
         async def _run_task_bg(task_text: str, task_images: Optional[List[Dict[str, Any]]] = None, preserve_snapshots: bool = False, editor_context: Optional[Dict[str, Any]] = None):
             """Run a task (plan or direct mode) in the background. preserve_snapshots=True keeps diff/revert cumulative."""
             nonlocal awaiting_build, awaiting_keep_revert, pending_task, pending_plan, pending_images
@@ -3101,9 +3116,14 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                         try:
                             await asyncio.to_thread(save_session)
                         except Exception:
-                            pass  # don't break on save failure; replay will still send plan from agent state
+                            pass
                     else:
                         await wsr.send_json({"type": "no_plan"})
+                    await wsr.send_json({"type": "done", "data": {
+                        "tokens": agent.total_tokens,
+                        "input_tokens": agent._total_input_tokens,
+                        "output_tokens": agent._total_output_tokens,
+                    }})
                 else:
                     # Direct mode — pass scout decision from intent classification
                     # If user has a pending plan (didn't press Build), inject plan into context so
@@ -3166,7 +3186,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
                     # Check if the agent's response contains an updated plan
                     if _is_plan_followup and agent.history:
-                        _detect_and_apply_plan_update(agent, pending_plan)
+                        await _detect_and_apply_plan_update(agent, pending_plan)
 
                     elapsed = round(time.time() - task_start, 1)
                     await wsr.send_json({"type": "phase_end", "content": "direct", "elapsed": elapsed})
@@ -3183,14 +3203,20 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             except Exception as exc:
                 logger.exception("Task error")
                 try:
-                    await wsr.send_json({"type": "error", "content": str(exc)})
+                    await wsr.send_json({"type": "error", "content": _format_error_for_client(exc)})
                 except Exception:
                     pass
             finally:
-                save_session()
-                await _send_status()
+                try:
+                    save_session()
+                except Exception as save_err:
+                    logger.warning("Session save after task failed: %s", save_err)
+                try:
+                    await _send_status()
+                except Exception:
+                    pass
 
-        async def _run_build_bg(task_text: str, steps: list, task_images: Optional[List[Dict[str, Any]]] = None):
+        async def _run_build_bg(task_text: str, steps: list, task_images: Optional[List[Dict[str, Any]]] = None, editor_context: Optional[Dict[str, Any]] = None):
             """Run build phase in the background."""
             nonlocal awaiting_keep_revert
             task_start = time.time()
@@ -3202,9 +3228,25 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 ]
                 await wsr.send_json({"type": "todos_updated", "todos": list(agent._todos)})
 
+                # If the user has an active file open (possibly with edits), let the agent know
+                build_task = task_text
+                if editor_context:
+                    ctx_parts = []
+                    af = editor_context.get("activeFile")
+                    if af and af.get("path"):
+                        ctx_parts.append(f"User currently has {af['path']} open in editor (line {af.get('cursorLine', '?')}).")
+                    sel = editor_context.get("selectedText")
+                    if sel:
+                        ctx_parts.append(f"User has selected text:\n```\n{sel}\n```")
+                    of = editor_context.get("openFiles")
+                    if of:
+                        ctx_parts.append(f"Open files: {', '.join(of[:10])}")
+                    if ctx_parts:
+                        build_task = "[Editor context: " + " ".join(ctx_parts) + "]\n\n" + build_task
+
                 await wsr.send_json({"type": "phase_start", "content": "build"})
                 await agent.run_build(
-                    task=task_text,
+                    task=build_task,
                     plan_steps=steps,
                     on_event=on_event,
                     request_approval=dummy_approval,
@@ -3229,12 +3271,18 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             except Exception as exc:
                 logger.exception("Build error")
                 try:
-                    await wsr.send_json({"type": "error", "content": str(exc)})
+                    await wsr.send_json({"type": "error", "content": _format_error_for_client(exc)})
                 except Exception:
                     pass
             finally:
-                save_session()
-                await _send_status()
+                try:
+                    save_session()
+                except Exception as save_err:
+                    logger.warning("Session save after build failed: %s", save_err)
+                try:
+                    await _send_status()
+                except Exception:
+                    pass
 
         # ── Background file watcher ────────────────────────────
         _file_mtimes: Dict[str, float] = {}

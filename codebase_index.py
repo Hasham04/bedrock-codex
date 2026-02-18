@@ -332,6 +332,7 @@ class CodebaseIndex:
         self.embed_fn = embed_fn
         self.chunks: List[CodeChunk] = []
         self.file_hashes: Dict[str, str] = {}
+        self.file_mtimes: Dict[str, float] = {}  # track file modification times
         self._embeddings_array: Optional[Any] = None
         # Import tracking
         self.file_imports: Dict[str, List[str]] = {}
@@ -344,6 +345,7 @@ class CodebaseIndex:
                 with open(meta_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self.file_hashes = data.get("file_hashes", {})
+                self.file_mtimes = data.get("file_mtimes", {})
                 self.file_imports = data.get("file_imports", {})
                 if self.file_imports:
                     self.reverse_imports = build_import_graph(self.file_imports)
@@ -356,8 +358,37 @@ class CodebaseIndex:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump({
                 "file_hashes": self.file_hashes,
+                "file_mtimes": self.file_mtimes,
                 "file_imports": self.file_imports,
             }, f, indent=0)
+
+    def _get_stale_files(self, backend: Any) -> List[str]:
+        """Get list of files that have been modified since last indexing."""
+        stale_files = []
+        try:
+            files = self._list_indexable_files(backend)
+            for rel_path in files:
+                try:
+                    # Get current file mtime via backend
+                    if hasattr(backend, 'stat'):
+                        stat = backend.stat(rel_path)
+                        current_mtime = stat.mtime if hasattr(stat, 'mtime') else stat.st_mtime
+                    else:
+                        # Fallback for backends without stat method
+                        import os.path
+                        abs_path = os.path.join(self.working_directory, rel_path)
+                        current_mtime = os.path.getmtime(abs_path)
+                    
+                    stored_mtime = self.file_mtimes.get(rel_path, 0)
+                    if current_mtime > stored_mtime:
+                        stale_files.append(rel_path)
+                except Exception:
+                    # If we can't get mtime, treat as stale to be safe
+                    stale_files.append(rel_path)
+        except Exception as e:
+            logger.debug("Error detecting stale files: %s", e)
+        
+        return stale_files
 
     def _list_indexable_files_remote(self, backend: Any) -> List[str]:
         """List relative paths of indexable files via backend (SSH). BFS over list_dir."""
@@ -466,6 +497,20 @@ class CodebaseIndex:
             if force_reindex or self.file_hashes.get(rel) != h:
                 to_index.append((rel, content))
             self.file_hashes[rel] = h
+            # Track file modification time
+            try:
+                if hasattr(backend, 'stat'):
+                    stat = backend.stat(rel)
+                    mtime = stat.mtime if hasattr(stat, 'mtime') else stat.st_mtime
+                else:
+                    import os.path
+                    abs_path = os.path.join(self.working_directory, rel)
+                    mtime = os.path.getmtime(abs_path)
+                self.file_mtimes[rel] = mtime
+            except Exception:
+                # If we can't get mtime, store current time as fallback
+                import time
+                self.file_mtimes[rel] = time.time()
         # Drop chunks for files we're re-indexing
         reindex_paths = {p for p, _ in to_index}
         self.chunks = [c for c in self.chunks if c.path not in reindex_paths]
@@ -580,6 +625,51 @@ class CodebaseIndex:
         sim = (matrix @ q) / (norms.ravel() * q_norm)
         top_indices = np.argsort(sim)[::-1][:top_k]
         return [chunks_with_emb[i] for i in top_indices]
+
+    def retrieve_with_refresh(self, query: str, top_k: int = 10, backend: Optional[Any] = None) -> List[CodeChunk]:
+        """Semantic search with staleness check: refresh stale files before retrieval."""
+        if backend is not None:
+            try:
+                # Check for stale files and re-index them if needed
+                stale_files = self._get_stale_files(backend)
+                if stale_files:
+                    logger.debug("Re-indexing %d stale files", len(stale_files))
+                    # Cap to avoid long delays - only re-index first 50 stale files
+                    stale_files = stale_files[:50]
+                    # Remove chunks for stale files
+                    stale_paths = set(stale_files)
+                    self.chunks = [c for c in self.chunks if c.path not in stale_paths]
+                    # Re-index stale files
+                    for rel_path in stale_files:
+                        try:
+                            content = backend.read_file(rel_path)
+                            h = _file_content_hash(content)
+                            self.file_hashes[rel_path] = h
+                            # Update mtime
+                            try:
+                                if hasattr(backend, 'stat'):
+                                    stat = backend.stat(rel_path)
+                                    mtime = stat.mtime if hasattr(stat, 'mtime') else stat.st_mtime
+                                else:
+                                    import os.path
+                                    abs_path = os.path.join(self.working_directory, rel_path)
+                                    mtime = os.path.getmtime(abs_path)
+                                self.file_mtimes[rel_path] = mtime
+                            except Exception:
+                                import time
+                                self.file_mtimes[rel_path] = time.time()
+                            # Add new chunks
+                            for chunk in chunk_file(rel_path, content):
+                                self.chunks.append(chunk)
+                        except Exception as e:
+                            logger.debug("Failed to refresh stale file %s: %s", rel_path, e)
+                    # Save updated metadata
+                    self._save_metadata()
+            except Exception as e:
+                logger.debug("Error during stale file refresh: %s", e)
+        
+        # Now do normal retrieval
+        return self.retrieve(query, top_k)
 
 
 _global_embed_fn: Optional[Any] = None

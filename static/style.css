@@ -2299,6 +2299,21 @@ body { display: flex; flex-direction: column; }
     gap: 8px;
     margin-bottom: 8px;
 }
+.plan-title {
+    font-weight: 600;
+    color: var(--text-primary);
+    flex-shrink: 0;
+}
+.plan-filename {
+    font-size: 0.9em;
+    color: var(--text-muted);
+    flex: 1;
+    text-align: right;
+    margin-right: 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 .plan-open-tab {
     padding: 0;
     width: 28px;
@@ -2448,27 +2463,7 @@ body { display: flex; flex-direction: column; }
     border-color: var(--purple);
 }
 
-/* ── Plan Feedback Box ─────────────────────────────────────── */
-.plan-feedback-box {
-    margin-top: 10px;
-    padding: 12px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    animation: msgSlideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.plan-feedback-label {
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--text-secondary);
-    margin-bottom: 8px;
-}
-.plan-feedback-actions {
-    display: flex;
-    gap: 6px;
-    margin-top: 8px;
-    justify-content: flex-end;
-}
+
 
 /* ── Plan Step Progress States ─────────────────────────────── */
 .plan-step.step-done {
@@ -2669,6 +2664,84 @@ body { display: flex; flex-direction: column; }
     background: rgba(255, 255, 255, 0.03);
     border-color: rgba(255, 255, 255, 0.1);
 }
+
+/* ── Plan card ── */
+.plan-block {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    margin: 8px 0;
+}
+.plan-tab-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+}
+.plan-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.plan-filename {
+    font-size: 11px;
+    color: var(--accent);
+    background: var(--accent-glow);
+    border: 1px solid var(--border-accent);
+    padding: 2px 8px;
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 200px;
+}
+.plan-open-tab {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 2px 4px;
+    margin-left: auto;
+    border-radius: var(--radius-sm);
+    transition: all var(--transition);
+    display: inline-flex;
+    align-items: center;
+}
+.plan-open-tab:hover { color: var(--accent); background: var(--accent-glow); }
+.plan-actions {
+    display: flex;
+    gap: 8px;
+    padding: 10px 14px;
+}
+.plan-feedback-box {
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+}
+.plan-feedback-label {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-bottom: 6px;
+}
+.plan-feedback-input {
+    width: 100%;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    padding: 8px;
+    resize: vertical;
+    min-height: 48px;
+    box-sizing: border-box;
+}
+.plan-feedback-input:focus { border-color: var(--accent); outline: none; }
+.plan-feedback-actions { display: flex; gap: 6px; margin-top: 6px; }
 
 /* ── File Changes Dropdown ─────────────────────────────────── */
 .file-changes-dropdown {
@@ -2933,14 +3006,21 @@ body { display: flex; flex-direction: column; }
     min-width: 0;
     box-shadow: 0 0 8px var(--green-glow);
 }
+.sticky-todo-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
 .sticky-todo-add-row {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     margin-top: 8px;
     padding-top: 8px;
     border-top: 1px solid var(--border);
 }
+.sticky-todo-add-row.hidden { display: none !important; }
 .sticky-todo-add-input {
     flex: 1;
     min-width: 0;
@@ -2951,6 +3031,7 @@ body { display: flex; flex-direction: column; }
     background: var(--bg-input);
     color: var(--text-primary);
     font-family: inherit;
+    transition: border-color var(--transition-fast);
 }
 .sticky-todo-add-input:focus { outline: none; border-color: var(--accent); }
 .sticky-todo-add-btn {
@@ -2965,8 +3046,9 @@ body { display: flex; flex-direction: column; }
     font-size: 18px;
     line-height: 1;
     cursor: pointer;
+    transition: opacity var(--transition-fast);
 }
-.sticky-todo-add-btn:hover { opacity: 0.9; }
+.sticky-todo-add-btn:hover { opacity: 0.85; }
 
 /* ── Chat Input — Modern glass composer ────────────────────── */
 #chat-input-area {
@@ -2992,6 +3074,30 @@ body { display: flex; flex-direction: column; }
 .chat-input-wrapper:focus-within {
     border-color: var(--border-glow);
     box-shadow: 0 0 0 3px var(--accent-glow), var(--shadow-glow);
+}
+.chat-input-wrapper.guidance-mode {
+    border-color: color-mix(in srgb, var(--yellow, #e2b340) 40%, var(--border));
+}
+.chat-input-wrapper.guidance-mode:focus-within {
+    border-color: var(--yellow, #e2b340);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--yellow, #e2b340) 15%, transparent);
+}
+.chat-input-wrapper.guidance-mode #user-input::placeholder {
+    color: color-mix(in srgb, var(--yellow, #e2b340) 60%, var(--text-muted));
+}
+
+/* Guidance message bubble */
+.guidance-msg .guidance-bubble {
+    border-left: 2px solid var(--yellow, #e2b340);
+}
+.guidance-label {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--yellow, #e2b340);
+    margin-bottom: 2px;
 }
 
 /* @ Mention autocomplete popup */
@@ -3107,7 +3213,6 @@ body { display: flex; flex-direction: column; }
 
 /* System chatbox design: shared by all chat-area inputs and textareas */
 #user-input,
-.plan-feedback-input,
 .clarifying-question-input,
 .agent-checklist-add-input {
     color: var(--text-primary);
@@ -3128,7 +3233,6 @@ body { display: flex; flex-direction: column; }
     border: none;
     padding: 6px 4px;
 }
-.plan-feedback-input,
 .clarifying-question-input,
 .agent-checklist-add-input {
     background: var(--bg-input);
@@ -3136,17 +3240,13 @@ body { display: flex; flex-direction: column; }
     padding: 8px 10px;
 }
 #user-input:focus,
-.plan-feedback-input:focus,
 .clarifying-question-input:focus,
 .agent-checklist-add-input:focus { border-color: var(--accent); }
-.plan-feedback-input:focus,
-.clarifying-question-input:focus,
-.agent-checklist-add-input:focus { border-color: var(--accent); }
+
 #user-input::placeholder,
-.plan-feedback-input::placeholder,
 .clarifying-question-input::placeholder,
 .agent-checklist-add-input::placeholder { color: var(--text-muted); }
-.plan-feedback-input { width: 100%; resize: vertical; min-height: 40px; box-sizing: border-box; }
+
 .clarifying-question-input { width: 100%; max-width: 100%; resize: vertical; margin-bottom: 8px; box-sizing: border-box; }
 .agent-checklist-add-input { flex: 1; min-width: 0; }
 

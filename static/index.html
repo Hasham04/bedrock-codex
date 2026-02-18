@@ -316,13 +316,15 @@
 
                 <!-- Sticky todo bar: todos only here (dropdown above input) -->
                 <div id="sticky-todo-bar" class="sticky-todo-bar hidden">
-                    <button type="button" id="sticky-todo-toggle" class="sticky-todo-toggle" aria-expanded="false">
-                        <span class="sticky-todo-chevron">&#x25BC;</span>
-                        <span id="sticky-todo-count" class="sticky-todo-count">To-dos 0</span>
-                    </button>
+                    <div class="sticky-todo-header">
+                        <button type="button" id="sticky-todo-toggle" class="sticky-todo-toggle" aria-expanded="false">
+                            <span class="sticky-todo-chevron">&#x25BC;</span>
+                            <span id="sticky-todo-count" class="sticky-todo-count">To-dos 0</span>
+                        </button>
+                    </div>
                     <div id="sticky-todo-list" class="sticky-todo-list hidden"></div>
-                    <div class="sticky-todo-add-row">
-                        <input type="text" id="sticky-todo-add-input" class="sticky-todo-add-input" placeholder="Add a task..." maxlength="500" />
+                    <div class="sticky-todo-add-row hidden" id="sticky-todo-add-row">
+                        <input type="text" id="sticky-todo-add-input" class="sticky-todo-add-input" placeholder="Add a task…" maxlength="500" />
                         <button type="button" id="sticky-todo-add-btn" class="sticky-todo-add-btn" title="Add task" aria-label="Add task">+</button>
                     </div>
                 </div>

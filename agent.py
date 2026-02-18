@@ -71,7 +71,7 @@ _MOD_DOING_TASKS = """<doing_tasks>
   - Don't add error handling, fallbacks, or validation for scenarios that can't happen. Trust internal code and framework guarantees. Only validate at system boundaries (user input, external APIs).
   - Don't create helpers, utilities, or abstractions for one-time operations. Don't design for hypothetical future requirements. Three similar lines of code is better than a premature abstraction.
 - Avoid backwards-compatibility hacks like renaming unused `_vars`, re-exporting types, adding `// removed` comments. If something is unused, delete it completely.
-- After every edit: re-read the changed section and run lint_file to verify correctness.
+- After each file edit: re-read the changed section to verify correctness. Run lint_file at the end after all changes.
 </doing_tasks>"""
 
 _MOD_CAREFUL_EXECUTION = """<careful_execution>
@@ -92,6 +92,7 @@ _MOD_TONE_AND_STYLE = """<tone_and_style>
 - Never refer to tool names when speaking to the user. Say "I'll read the file" not "I'll use the Read tool."
 - When uncertain, investigate rather than guessing.
 - Don't apologize repeatedly. If something unexpected happens, explain and proceed.
+- Never narrate internal tool struggles or limitations (e.g., "the file seems to be very large and search is struggling"). Adapt silently and focus on results.
 </tone_and_style>"""
 
 _MOD_TOOL_POLICY = """<tool_policy>
@@ -118,7 +119,7 @@ DISCOVERY STRATEGY:
 FILE OPERATIONS:
 - ALWAYS read a file before editing it. No exceptions.
 - For large files (>500 lines): use offset/limit for targeted reads. Don't read the whole thing.
-- After every edit: re-read the changed section and run lint_file.
+- After each file edit: re-read the changed section. Run lint_file at the end after all changes.
 - Prefer Edit over Write for modifications. Write only for new files or >50% rewrites.
 
 INDEPENDENCE:
@@ -261,7 +262,7 @@ If something breaks:
 </error_recovery>
 
 <verification>
-- After every edit: re-read changed section, lint_file must pass
+- After each file edit: re-read changed section. Run lint_file at the end, must pass
 - Match existing conventions exactly (naming, error handling, patterns, import style)
 - No new dependencies, patterns, or abstractions unless the plan specifies them
 - Security: sanitize inputs, no injection vulnerabilities, no hardcoded secrets
@@ -482,6 +483,31 @@ class PolicyDecision:
 
 _PLAN_RE = re.compile(r"<plan>\s*(.*?)\s*</plan>", re.DOTALL)
 
+def _strip_plan_preamble(text: str) -> str:
+    """Remove conversational preamble before the first plan heading."""
+    lines = text.split("\n")
+    first_heading_idx = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            first_heading_idx = i
+            break
+    if first_heading_idx is None or first_heading_idx == 0:
+        return text
+    # Check if pre-heading text looks conversational (not plan content)
+    preamble = "\n".join(lines[:first_heading_idx]).strip()
+    if not preamble:
+        return text
+    # If preamble contains conversational markers, strip it
+    conversational = any(m in preamble.lower() for m in [
+        "let me", "i'll", "i will", "based on", "looking at",
+        "now i have", "i need", "i can see", "good —", "good -",
+        "here's", "here is", "i've", "i have enough",
+    ])
+    if conversational:
+        return "\n".join(lines[first_heading_idx:])
+    return text
+
 def _extract_plan(text: str) -> Optional[str]:
     """Extract content between <plan>...</plan> tags."""
     m = _PLAN_RE.search(text)
@@ -622,7 +648,9 @@ class CodingAgent:
         self._detected_language = _detect_project_language(self.working_directory)
         self.system_prompt = _compose_system_prompt("direct", self.working_directory, AVAILABLE_TOOL_NAMES, language=self._detected_language)
         self._cancelled = False
+        self._pending_guidance: List[str] = []
         self._current_plan: Optional[List[str]] = None  # plan steps from last plan phase
+        self._current_plan_text: Optional[str] = None  # full plan text from last plan phase
         self._scout_context: Optional[str] = None  # cached scout context for reuse across phases
         self._plan_step_index: int = 0  # current plan step being executed
         self._total_input_tokens = 0
@@ -656,7 +684,11 @@ class CodingAgent:
         self._failure_pattern_cache: Optional[List[Dict[str, Any]]] = None
         self._todos: List[Dict[str, Any]] = []
         self._memory: Dict[str, str] = {}  # key -> value for MemoryWrite/MemoryRead
-        
+        # Stream failure tracking — detect recurring errors and cap rollbacks
+        self._consecutive_stream_errors: int = 0
+        self._last_stream_error_sig: str = ""
+        self._pending_guidance: List[str] = []
+
         # Enhanced caching and state management inspired by modern build systems
         self._verification_cache: Dict[str, Dict[str, Any]] = {}  # file_hash -> verification_results
         self._dependency_graph: Dict[str, List[str]] = {}  # file -> dependent_files
@@ -682,10 +714,23 @@ class CodingAgent:
             except Exception:
                 pass
 
+    def inject_guidance(self, text: str):
+        """Thread-safe: queue a user guidance message to be injected at the next iteration."""
+        self._pending_guidance.append(text)
+
+    def _consume_guidance(self) -> Optional[str]:
+        """Pop all queued guidance messages and combine into one string."""
+        if not self._pending_guidance:
+            return None
+        msgs = list(self._pending_guidance)
+        self._pending_guidance.clear()
+        return "\n\n".join(msgs)
+
     def reset(self):
         """Reset conversation history"""
         self.history = []
         self._cancelled = False
+        self._pending_guidance = []
         self._total_input_tokens = 0
         self._total_output_tokens = 0
         self._cache_read_tokens = 0
@@ -694,6 +739,7 @@ class CodingAgent:
         self._history_len_at_last_call = 0
         self._running_summary = ""
         self._current_plan = None
+        self._current_plan_text = None
         self._scout_context = None
         self._file_snapshots = {}
         self._plan_step_index = 0
@@ -709,6 +755,9 @@ class CodingAgent:
         self._failure_pattern_cache = None
         self._todos = []
         self._memory = {}
+        self._consecutive_stream_errors = 0
+        self._last_stream_error_sig = ""
+        self._pending_guidance = []
 
     def _file_cache_key(self, path: str) -> str:
         """Return cache key for path (backend_id + resolved path so SSH and local never collide)."""
@@ -2410,6 +2459,120 @@ class CodingAgent:
 
         return text
 
+    def _preserve_conversational_context(self, messages: List[Dict[str, Any]]) -> str:
+        """Extract recent conversational context that should be preserved during trimming.
+        
+        Looks for topics, commands, names, and pronoun antecedents from recent messages
+        to help maintain conversational continuity after context compression.
+        """
+        context_items = []
+        pronoun_indicators = ['it', 'that', 'this', 'them', 'those', 'he', 'she', 'they']
+        command_indicators = ['run', 'execute', 'try', 'test', 'check', 'start', 'stop']
+        
+        # Look at last 6 messages for conversational context
+        recent_messages = messages[-6:] if len(messages) > 6 else messages
+        
+        for i, msg in enumerate(recent_messages):
+            content_str = self._extract_text_from_message(msg).strip()
+            if not content_str:
+                continue
+                
+            # Look for pronoun references that might become orphaned
+            content_lower = content_str.lower()
+            has_pronouns = any(word in content_lower for word in pronoun_indicators)
+            has_commands = any(word in content_lower for word in command_indicators)
+            
+            if has_pronouns or has_commands:
+                role = msg.get('role', 'unknown')
+                snippet = content_str[:150]
+                context_items.append(f"Recent {role}: {snippet}")
+        
+        if context_items:
+            return "CONVERSATIONAL CONTEXT:\n" + "\n".join(context_items[-3:])  # Keep last 3 most relevant
+        return ""
+
+    def _detect_context_loss_risk(self, user_msg: str) -> bool:
+        """Detect when a user message might reference lost conversational context.
+        
+        Returns True if the message contains pronouns without clear antecedents,
+        suggesting the user is referring to something that may have been trimmed.
+        """
+        pronouns = ['it', 'that', 'this', 'them', 'those', 'he', 'she', 'they']
+        command_refs = ['run it', 'try it', 'execute it', 'test it', 'check it', 'start it']
+        
+        msg_lower = user_msg.lower().strip()
+        words = msg_lower.split()
+        
+        # Short messages with pronouns are high risk
+        if len(words) <= 10:
+            if any(pronoun in msg_lower for pronoun in pronouns):
+                return True
+            if any(cmd_ref in msg_lower for cmd_ref in command_refs):
+                return True
+        
+        # Look for isolated pronouns at the start of sentences
+        sentences = [s.strip() for s in user_msg.split('.') if s.strip()]
+        for sentence in sentences:
+            sentence_lower = sentence.lower()
+            # Check if sentence starts with a pronoun
+            first_words = sentence_lower.split()[:3]
+            if first_words and any(pronoun in first_words for pronoun in pronouns):
+                return True
+        
+        return False
+
+    def _extract_text_from_message(self, msg: Dict[str, Any]) -> str:
+        """Extract text content from a message structure."""
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return content
+        elif isinstance(content, list):
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+            return " ".join(text_parts)
+        return ""
+
+    def _assistant_signals_completion(self, assistant_text: str) -> bool:
+        """Detect if the assistant is explicitly signaling task completion.
+        
+        Returns True if the text contains clear completion indicators,
+        False if it's just a conversational response that should allow user followup.
+        """
+        if not assistant_text or len(assistant_text.strip()) < 10:
+            return False
+            
+        text_lower = assistant_text.lower().strip()
+        
+        # Strong completion signals
+        completion_phrases = [
+            "task is complete", "task complete", "completed successfully",
+            "all done", "finished", "implementation is complete", 
+            "ready to go", "should be working now", "fixed the issue",
+            "problem is resolved", "issue is resolved", "resolved the problem",
+            "changes have been applied", "successfully implemented",
+            "task has been completed", "work is done"
+        ]
+        
+        # Look for completion signals
+        if any(phrase in text_lower for phrase in completion_phrases):
+            return True
+            
+        # Look for explicit "let me know if..." endings that suggest completion
+        followup_phrases = [
+            "let me know if you need", "let me know if there's",
+            "feel free to", "if you need any", "anything else",
+            "further assistance", "additional help"
+        ]
+        
+        if any(phrase in text_lower for phrase in followup_phrases):
+            return True
+        
+        # Check if the response is addressing a completely different topic
+        # than what was in the last user message (suggests topic change)
+        return False
+
     def _summarize_old_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Create a concise summary of old conversation messages.
         Tries an LLM call (Haiku) for quality; falls back to heuristics."""
@@ -2432,6 +2595,12 @@ class CodingAgent:
                                 text_parts.append(f"[result]: {str(b.get('content', ''))[:300]}")
             
             conversation_text = "\n".join(text_parts)
+            
+            # Add recent conversational context for better continuity
+            context_preservation = self._preserve_conversational_context(messages)
+            if context_preservation:
+                conversation_text = context_preservation + "\n\n" + conversation_text
+            
             # Cap to avoid blowing Haiku's context
             if len(conversation_text) > 30000:
                 conversation_text = conversation_text[:15000] + "\n...\n" + conversation_text[-15000:]
@@ -2447,12 +2616,16 @@ class CodingAgent:
                 system_prompt=(
                     "COMPACTION CONTRACT: This summary must allow the agent to continue the task without re-reading everything.\n"
                     "Include exactly:\n"
-                    "1. **Task**: What the user asked for (exact goal).\n"
-                    "2. **Files touched**: Paths read, edited, or created (with one-line reason each).\n"
-                    "3. **Decisions**: Key design/implementation choices and why.\n"
-                    "4. **Current state**: What is done, what remains, any errors or blockers.\n"
-                    "5. **Next steps**: What the agent should do next (concrete).\n"
-                    "Be concise but reconstruction-grade — the agent will continue from this summary. Use bullet points. Max 500 words."
+                    "1. **Recent discussion**: What was being discussed in the last few messages — topics, commands, names, "
+                    "and specific things the user or assistant referred to. Preserve enough context that pronouns like "
+                    "'it', 'that', 'this', 'them' can be resolved by reading this summary.\n"
+                    "2. **Task**: What the user asked for (exact goal).\n"
+                    "3. **Files touched**: Paths read, edited, or created (with one-line reason each).\n"
+                    "4. **Decisions**: Key design/implementation choices and why.\n"
+                    "5. **Current state**: What is done, what remains, any errors or blockers.\n"
+                    "6. **Next steps**: What the agent should do next (concrete).\n"
+                    "CRITICAL: Section 1 is the most important — without it the agent cannot understand follow-up messages. "
+                    "Be concise but reconstruction-grade. Use bullet points. Max 600 words."
                 ),
                 model_id=app_config.scout_model,
                 config=summary_config,
@@ -2543,10 +2716,9 @@ class CodingAgent:
         # Reserve generous output headroom so the model NEVER runs out of space (Cursor/Claude-style)
         reserved_output = min(80_000, get_max_output_tokens(self.service.model_id) // 2)
         usable = max(1, context_window - reserved_output)
-        # More aggressive thresholds - start trimming much earlier to NEVER hit walls
-        tier1_limit = int(usable * 0.40)  # Start trimming at 40% (was 52%)
-        tier2_limit = int(usable * 0.55)  # Aggressive at 55% (was 70%)
-        tier3_limit = int(usable * 0.70)  # Emergency at 70% (was 85%)
+        tier1_limit = int(usable * 0.60)  # Gentle compression at 60%
+        tier2_limit = int(usable * 0.78)  # Aggressive summarization at 78%
+        tier3_limit = int(usable * 0.90)  # Emergency drop at 90%
 
         current = self._current_token_estimate()
         if current <= tier1_limit:
@@ -2626,11 +2798,11 @@ class CodingAgent:
 
         ratio = current / tier2_limit
         if ratio > 3:
-            keep_last = min(4, len(self.history))
+            keep_last = min(8, len(self.history))   # Increased from 4
         elif ratio > 1.5:
-            keep_last = min(6, len(self.history))
+            keep_last = min(12, len(self.history))  # Increased from 6
         else:
-            keep_last = min(8, len(self.history))
+            keep_last = min(16, len(self.history))  # Increased from 8
 
         # Merge the running summary with newly summarized messages
         keep_first = 1
@@ -3133,6 +3305,7 @@ Keep the whole response under 300 words. If the request is already very clear an
         """
         self._cancelled = False
         self._current_plan = None
+        self._current_plan_text = None
 
         # Run scout for first message — skip if auto-context already has rich context
         scout_context = None
@@ -3445,13 +3618,15 @@ Keep the whole response under 300 words. If the request is already very clear an
                 plan_messages.append({
                     "role": "user",
                     "content": (
-                        "Your previous plan was too shallow. Rewrite the COMPLETE plan now.\n\n"
-                        "STRICT REQUIREMENTS:\n"
-                        "1) Include sections: Why, Approach, Affected Files, Checklist, Steps, Verification.\n"
-                        f"2) Provide at least {min_steps} numbered, actionable Steps.\n"
-                        "3) Each step must include specific file path + target function/class + exact change.\n"
-                        "4) Do NOT output meta/planning chatter (e.g. 'let me check...').\n"
-                        "5) If the request has multiple asks, include all asks in Checklist and Steps.\n"
+                        "Your plan needs more detail to be executable. You are still in PLANNING mode - do not start implementing yet.\n\n"
+                        "IMPROVE THE PLAN with these requirements:\n"
+                        "1) Include all required sections: Why, Approach, Affected Files, Checklist, Implementation Steps, Verification.\n"
+                        f"2) Provide at least {min_steps} detailed, numbered Implementation Steps.\n"
+                        "3) Each step must specify: exact file path + target function/class/method + precise change description.\n"
+                        "4) Remove vague language like 'let me check', 'I will look at' - be concrete and actionable.\n"
+                        "5) If the request has multiple parts, address each part explicitly in both Checklist and Steps.\n"
+                        "6) Remember: another engineer must be able to follow your plan without asking questions.\n\n"
+                        "Output the COMPLETE improved plan now:"
                     ),
                 })
                 repaired_text, _, repaired_content = await _stream_plan_call(plan_messages, None)
@@ -3465,6 +3640,7 @@ Keep the whole response under 300 words. If the request is already very clear an
                 steps = self._parse_plan_steps(plan_text)
 
             self._current_plan = steps
+            self._current_plan_text = plan_text or ""
             self._current_plan_decomposition = self._decompose_plan_steps(steps)
 
             # Write plan to a markdown file on disk (persisted for "Open in Editor" on reload)
@@ -3582,22 +3758,21 @@ Keep the whole response under 300 words. If the request is already very clear an
         return any(v in low for v in verbs)
 
     def _plan_quality_sufficient(self, task: str, plan_text: str, steps: List[str]) -> bool:
-        """Require structured, actionable plans before moving to build."""
+        """Check if plan has minimum structure and actionable content."""
+        if not plan_text or not steps:
+            return False
+        
+        # Accept plans with any reasonable structure
         low = (plan_text or "").lower()
-        has_steps_section = ("## steps" in low) or ("## implementation steps" in low)
-        if not has_steps_section:
-            return False
-        required_sections = ("## affected files", "## verification")
-        if not all(sec in low for sec in required_sections):
-            return False
-
-        multi_item = self._task_looks_multi_item(task)
-        min_steps = 3 if multi_item else 1
-        if len(steps) < min_steps:
+        has_structure = any(marker in low for marker in [
+            "## steps", "## implementation", "## plan", "## approach", "1.", "- "
+        ])
+        if not has_structure:
             return False
 
+        # Require at least one actionable step
         actionable_count = sum(1 for s in steps if self._is_actionable_plan_step(s))
-        return actionable_count >= min_steps
+        return actionable_count >= 1
 
     def _write_plan_file(self, task: str, plan_text: str) -> Optional[str]:
         """Write the plan as a markdown file under .bedrock-codex/plans/.
@@ -3610,7 +3785,8 @@ Keep the whole response under 300 words. If the request is already very clear an
             filename = f"plan-{timestamp}-{slug}.md"
             # Use forward-slash relative path — backend.write_file handles mkdir
             rel_path = f".bedrock-codex/plans/{filename}"
-            self.backend.write_file(rel_path, plan_text)
+            cleaned = _strip_plan_preamble(plan_text)
+            self.backend.write_file(rel_path, cleaned)
             logger.info(f"Plan written to {rel_path}")
             return rel_path
         except Exception as e:
@@ -3670,14 +3846,13 @@ Keep the whole response under 300 words. If the request is already very clear an
         self._deterministic_verification_done = False
         self._verification_gate_attempts = 0
 
-        await on_event(AgentEvent(type="phase_start", content="build"))
-
         # Switch to the build-specific system prompt for plan execution
         saved_prompt = self.system_prompt
         self.system_prompt = _format_build_system_prompt(self.working_directory, language=self._detected_language)
 
         # Build the user message with the approved plan and scout context
-        plan_block = "\n".join(plan_steps)
+        # Use full plan text instead of just steps for better context
+        plan_block = self._current_plan_text or "\n".join(plan_steps)
         decomposition = self._decompose_plan_steps(plan_steps)
         self._current_plan_decomposition = decomposition
         worker_insights = await self._run_parallel_manager_workers(task, decomposition)
@@ -3854,6 +4029,15 @@ Keep the whole response under 300 words. If the request is already very clear an
             self._file_snapshots = {}  # fresh snapshot tracking per run
         self._deterministic_verification_done = False
         self._verification_gate_attempts = 0
+
+        # Check for potential context loss (pronouns without antecedents)
+        if len(self.history) > 0 and self._detect_context_loss_risk(task):
+            await on_event(AgentEvent(
+                type="context_clarification", 
+                content="I may have lost some conversational context due to memory management. "
+                "Could you clarify what you're referring to? For example, if you mentioned 'it' or 'that', "
+                "what specific thing are you talking about?"
+            ))
 
         # Run scout for first message — skip if auto-context already has rich context
         scout_context = None
@@ -4625,6 +4809,21 @@ Keep the whole response under 300 words. If the request is already very clear an
         while iteration < self.max_iterations and not self._cancelled:
             iteration += 1
 
+            # Check for user guidance injected mid-task
+            guidance = self._consume_guidance()
+            if guidance:
+                self.history.append({
+                    "role": "user",
+                    "content": (
+                        f"[USER GUIDANCE — mid-task correction from the user. "
+                        f"Incorporate this into your current work immediately.]\n\n{guidance}"
+                    ),
+                })
+                await on_event(AgentEvent(
+                    type="guidance_applied",
+                    content=guidance,
+                ))
+
             # Soft limit: when approaching max iterations, tell the model to wrap up
             soft_limit = int(self.max_iterations * 0.85)
             if iteration == soft_limit:
@@ -4811,6 +5010,8 @@ Keep the whole response under 300 words. If the request is already very clear an
                     producer_thread.join(timeout=5)
                     stream_succeeded = True
                     self._history_len_at_last_call = len(self.history)
+                    self._consecutive_stream_errors = 0
+                    self._last_stream_error_sig = ""
                     break  # exit retry loop — stream completed
 
                 except (BedrockError, Exception) as stream_err:
@@ -4839,38 +5040,54 @@ Keep the whole response under 300 words. If the request is already very clear an
                         # Rollback: clean up history so it's valid for the API.
                         # The API requires every tool_use to have a matching
                         # tool_result in the immediately following user message.
-                        # Remove the last assistant msg if it has orphaned tool_use
-                        # blocks, and any trailing user message from this turn.
+
+                        # Track recurring errors to prevent unbounded rollbacks
+                        error_sig = err_str[:200]
+                        if error_sig == self._last_stream_error_sig:
+                            self._consecutive_stream_errors += 1
+                        else:
+                            self._consecutive_stream_errors = 1
+                            self._last_stream_error_sig = error_sig
+
                         rollback_count = 0
 
-                        # First: remove trailing user message (could be from this
-                        # iteration's task submission, or partial tool results)
-                        if (self.history
-                                and self.history[-1].get("role") == "user"):
-                            self.history.pop()
-                            rollback_count += 1
+                        if self._consecutive_stream_errors >= 3:
+                            # Same error 3+ times — rollbacks aren't helping.
+                            # Use repair (inserts dummy tool_results) instead
+                            # of popping more messages.
+                            logger.warning(
+                                f"Recurring stream error ({self._consecutive_stream_errors}x) "
+                                "— repairing history instead of rolling back"
+                            )
+                            self._repair_history()
+                        else:
+                            # Normal rollback: remove trailing user + orphaned
+                            # assistant tool_use from this turn only
+                            if (self.history
+                                    and self.history[-1].get("role") == "user"):
+                                self.history.pop()
+                                rollback_count += 1
 
-                        # Second: if the last message is now an assistant with
-                        # tool_use blocks, those are orphaned — remove it too
-                        if self.history:
-                            last = self.history[-1]
-                            if last.get("role") == "assistant":
-                                content = last.get("content", [])
-                                has_orphan_tool_use = (
-                                    isinstance(content, list)
-                                    and any(
-                                        isinstance(b, dict)
-                                        and b.get("type") == "tool_use"
-                                        for b in content
+                            if self.history:
+                                last = self.history[-1]
+                                if last.get("role") == "assistant":
+                                    content = last.get("content", [])
+                                    has_orphan_tool_use = (
+                                        isinstance(content, list)
+                                        and any(
+                                            isinstance(b, dict)
+                                            and b.get("type") == "tool_use"
+                                            for b in content
+                                        )
                                     )
-                                )
-                                if has_orphan_tool_use:
-                                    self.history.pop()
-                                    rollback_count += 1
+                                    if has_orphan_tool_use:
+                                        self.history.pop()
+                                        rollback_count += 1
 
                         logger.info(
                             f"Rolled back {rollback_count} messages after stream "
-                            f"failure ({len(self.history)} remain)"
+                            f"failure ({len(self.history)} remain, "
+                            f"consecutive={self._consecutive_stream_errors})"
                         )
 
                         # Restore token counters to pre-attempt snapshot
@@ -4952,6 +5169,15 @@ Keep the whole response under 300 words. If the request is already very clear an
 
             if not tool_uses:
                 assistant_text = self._extract_assistant_text(assistant_content)
+                
+                # Before declaring the task "done", check if the assistant is actually
+                # signaling completion vs just giving a conversational response
+                if not self._assistant_signals_completion(assistant_text):
+                    # Assistant gave a conversational response without tools but didn't
+                    # explicitly signal task completion. This suggests the user may be
+                    # asking about something new or the assistant misunderstood.
+                    # Give the user a chance to respond instead of auto-completing.
+                    break  # Exit the agent loop and wait for user input
 
                 # Hard gate: if we just processed tool results, require structured
                 # user-visible reasoning trace before final completion.
@@ -5072,6 +5298,18 @@ Keep the whole response under 300 words. If the request is already very clear an
                     ),
                 }
                 capped_results.append(verify_hint)
+
+            # Inject any pending user guidance alongside tool results
+            mid_guidance = self._consume_guidance()
+            if mid_guidance:
+                capped_results.append({
+                    "type": "text",
+                    "text": (
+                        f"[USER GUIDANCE — mid-task correction from the user. "
+                        f"Incorporate this into your current work immediately.]\n\n{mid_guidance}"
+                    ),
+                })
+                await on_event(AgentEvent(type="guidance_applied", content=mid_guidance))
 
             self.history.append({"role": "user", "content": capped_results})
 
