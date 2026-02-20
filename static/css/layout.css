@@ -1,0 +1,145 @@
+/* ── Top Bar ───────────────────────────────────────────────── */
+#top-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    height: var(--top-bar-height);
+    background: var(--bg-glass);
+    backdrop-filter: blur(16px) saturate(1.5);
+    -webkit-backdrop-filter: blur(16px) saturate(1.5);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    z-index: 10;
+    gap: 8px;
+    -webkit-app-region: drag;
+}
+.top-left, .top-center, .top-right { display: flex; align-items: center; gap: 8px; }
+.top-left { flex: 1; min-width: 0; }
+.top-center { flex-shrink: 0; }
+.top-right { flex: 1; justify-content: flex-end; }
+
+.logo {
+    font-weight: 600; font-size: 13px; color: var(--text-primary); white-space: nowrap;
+    letter-spacing: -0.01em;
+}
+
+.path-badge {
+    font-size: 10.5px; font-family: var(--font-mono);
+    color: var(--text-muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    max-width: 300px;
+}
+.session-badge {
+    font-size: 10px; padding: 2px 8px;
+    background: var(--bg-glass); border-radius: 20px;
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(8px);
+    letter-spacing: 0.2px;
+}
+.model-badge {
+    font-size: 10px; padding: 2px 10px;
+    background: var(--accent-glow); border: 1px solid var(--border-accent);
+    border-radius: 20px; color: var(--accent); font-weight: 600;
+    letter-spacing: 0.2px;
+}
+.token-badge {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+    padding: 2px 9px;
+    border-radius: 20px;
+    background: var(--bg-glass);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(8px);
+    letter-spacing: 0.3px;
+}
+.status-dot {
+    width: 7px; height: 7px; border-radius: 50%; display: inline-block;
+    transition: all 0.3s ease;
+}
+.status-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green-glow); }
+.status-dot.disconnected { background: var(--red); box-shadow: 0 0 6px var(--red-glow); }
+.status-dot.connecting { background: var(--orange); animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.3} }
+
+/* ── Reconnect Banner ─────────────────────────────────────── */
+#reconnect-banner {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: rgba(255, 165, 0, 0.12);
+    border: 1px solid rgba(255, 165, 0, 0.3);
+    border-radius: var(--radius);
+    color: var(--orange);
+    font-size: 12px;
+    font-weight: 500;
+    margin: 0 8px 8px;
+    z-index: 10;
+}
+.reconnect-spinner {
+    width: 14px; height: 14px;
+    border: 2px solid rgba(255, 165, 0, 0.3);
+    border-top-color: var(--orange);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.icon-btn {
+    background: transparent; border: 1px solid var(--border);
+    border-radius: var(--radius-sm); color: var(--text-muted);
+    cursor: pointer; padding: 4px 6px; display: flex; align-items: center;
+    transition: all var(--transition);
+}
+.icon-btn:hover {
+    color: var(--accent); border-color: var(--border-accent);
+    background: var(--accent-glow);
+    box-shadow: 0 0 8px var(--accent-glow);
+}
+
+.icon-btn-sm {
+    background: transparent; border: none; color: var(--text-muted);
+    cursor: pointer; padding: 2px; display: flex; align-items: center;
+    transition: all var(--transition);
+    border-radius: 4px;
+}
+.icon-btn-sm:hover { color: var(--accent); background: var(--accent-glow); }
+
+/* ── IDE Container (3-panel) ───────────────────────────────── */
+#ide-container {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+    min-height: 0;
+}
+
+/* ── Responsive breakpoints ───────────────────────────────── */
+@media (max-width: 900px) {
+    #file-explorer, #resize-left { display: none; }
+    :root { --chat-width: 340px; }
+}
+@media (max-width: 700px) {
+    #chat-panel { position: absolute; inset: 0; width: 100% !important; z-index: 50; }
+    #editor-panel { display: none; }
+    #resize-right { display: none; }
+    :root { --chat-width: 100%; }
+}
+
+/* ── File Explorer (left) ──────────────────────────────────── */
+#file-explorer {
+    --source-control-height: 180px;
+    width: var(--explorer-width);
+    min-width: 160px;
+    max-width: 720px;
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    overflow: hidden;
+}
+

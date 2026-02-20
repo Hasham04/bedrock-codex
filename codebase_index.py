@@ -12,9 +12,10 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -334,9 +335,14 @@ class CodebaseIndex:
         self.file_hashes: Dict[str, str] = {}
         self.file_mtimes: Dict[str, float] = {}  # track file modification times
         self._embeddings_array: Optional[Any] = None
+        self._dirty_paths: Set[str] = set()
         # Import tracking
         self.file_imports: Dict[str, List[str]] = {}
         self.reverse_imports: Dict[str, List[str]] = {}
+
+    def notify_file_changed(self, rel_path: str) -> None:
+        """Mark a file as dirty so the next retrieval refreshes it."""
+        self._dirty_paths.add(rel_path)
 
     def _load_metadata(self) -> None:
         meta_path = os.path.join(self.index_dir, "meta.json")
@@ -627,48 +633,59 @@ class CodebaseIndex:
         return [chunks_with_emb[i] for i in top_indices]
 
     def retrieve_with_refresh(self, query: str, top_k: int = 10, backend: Optional[Any] = None) -> List[CodeChunk]:
-        """Semantic search with staleness check: refresh stale files before retrieval."""
+        """Semantic search with staleness check: refresh dirty/stale files before retrieval."""
+        paths_to_refresh: set = set(self._dirty_paths)
+
+        # Also check mtime-based staleness when backend is available
         if backend is not None:
             try:
-                # Check for stale files and re-index them if needed
                 stale_files = self._get_stale_files(backend)
-                if stale_files:
-                    logger.debug("Re-indexing %d stale files", len(stale_files))
-                    # Cap to avoid long delays - only re-index first 50 stale files
-                    stale_files = stale_files[:50]
-                    # Remove chunks for stale files
-                    stale_paths = set(stale_files)
-                    self.chunks = [c for c in self.chunks if c.path not in stale_paths]
-                    # Re-index stale files
-                    for rel_path in stale_files:
-                        try:
-                            content = backend.read_file(rel_path)
-                            h = _file_content_hash(content)
-                            self.file_hashes[rel_path] = h
-                            # Update mtime
-                            try:
-                                if hasattr(backend, 'stat'):
-                                    stat = backend.stat(rel_path)
-                                    mtime = stat.mtime if hasattr(stat, 'mtime') else stat.st_mtime
-                                else:
-                                    import os.path
-                                    abs_path = os.path.join(self.working_directory, rel_path)
-                                    mtime = os.path.getmtime(abs_path)
-                                self.file_mtimes[rel_path] = mtime
-                            except Exception:
-                                import time
-                                self.file_mtimes[rel_path] = time.time()
-                            # Add new chunks
-                            for chunk in chunk_file(rel_path, content):
-                                self.chunks.append(chunk)
-                        except Exception as e:
-                            logger.debug("Failed to refresh stale file %s: %s", rel_path, e)
-                    # Save updated metadata
-                    self._save_metadata()
+                paths_to_refresh.update(stale_files)
             except Exception as e:
-                logger.debug("Error during stale file refresh: %s", e)
-        
-        # Now do normal retrieval
+                logger.debug("Error detecting stale files: %s", e)
+
+        # Cap to avoid long delays
+        refresh_list = list(paths_to_refresh)[:50]
+
+        if refresh_list:
+            logger.debug("Refreshing %d files in index", len(refresh_list))
+            refresh_set = set(refresh_list)
+            # Remove old chunks for these files
+            self.chunks = [c for c in self.chunks if c.path not in refresh_set]
+            self._embeddings_array = None
+
+            new_chunks: List[CodeChunk] = []
+            for rel_path in refresh_list:
+                try:
+                    if backend is not None:
+                        content = backend.read_file(rel_path)
+                    else:
+                        abs_path = os.path.join(self.working_directory, rel_path)
+                        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                            content = f.read()
+                    h = _file_content_hash(content)
+                    self.file_hashes[rel_path] = h
+                    self.file_mtimes[rel_path] = time.time()
+                    for chunk in chunk_file(rel_path, content):
+                        new_chunks.append(chunk)
+                except Exception as e:
+                    logger.debug("Failed to refresh file %s: %s", rel_path, e)
+
+            # Embed new chunks so they appear in search results
+            if new_chunks and self.embed_fn:
+                try:
+                    texts = [c.text for c in new_chunks]
+                    embeddings = self.embed_fn(texts, input_type="search_document")
+                    for i, c in enumerate(new_chunks):
+                        if i < len(embeddings):
+                            c.embedding = embeddings[i]
+                except Exception as e:
+                    logger.warning("Embedding refresh failed: %s", e)
+
+            self.chunks.extend(new_chunks)
+            self._dirty_paths.clear()
+            self._save_metadata()
+
         return self.retrieve(query, top_k)
 
 
@@ -685,14 +702,25 @@ def get_embed_fn() -> Optional[Any]:
     return _global_embed_fn
 
 
+_index_cache: Dict[str, "CodebaseIndex"] = {}
+
+
 def get_index(
     working_directory: str,
     embed_fn: Optional[Any] = None,
     backend: Optional[Any] = None,
 ) -> CodebaseIndex:
     """Get or create the codebase index for this workspace.
-    For SSH backends, index is stored in a local cache (~/.bedrock-codex/indexes/<key>).
+    Cached by normalized working directory so all callers share one instance.
     """
+    norm_wd = os.path.normpath(os.path.abspath(working_directory))
+    cached = _index_cache.get(norm_wd)
+    if cached is not None:
+        # Update embed_fn if a newer one is provided
+        if embed_fn is not None:
+            cached.embed_fn = embed_fn
+        return cached
+
     index_dir: Optional[str] = None
     if backend is not None and getattr(backend, "_host", None) is not None:
         cache_root = os.path.join(_index_cache_root(), "indexes")
@@ -704,4 +732,23 @@ def get_index(
         embed_fn=embed_fn if embed_fn is not None else _global_embed_fn,
     )
     index.load_from_disk()
+    _index_cache[norm_wd] = index
     return index
+
+
+def notify_file_changed_global(rel_path: str, working_directory: str = ".") -> None:
+    """Notify all known index instances that a file has changed.
+    Called by file mutation tools (write_file, edit_file, symbol_edit).
+    """
+    norm_wd = os.path.normpath(os.path.abspath(working_directory))
+    cached = _index_cache.get(norm_wd)
+    if cached is not None:
+        cached.notify_file_changed(rel_path)
+    # Also notify the background index if it exists
+    try:
+        import web.state as _ws
+        bg_idx = getattr(_ws, "_bg_codebase_index", None)
+        if bg_idx is not None and bg_idx is not cached:
+            bg_idx.notify_file_changed(rel_path)
+    except Exception:
+        pass

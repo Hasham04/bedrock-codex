@@ -44,5 +44,11 @@ from tools.schemas import (  # noqa: F401
     TOOL_NAME_NORMALIZE,
     TOOL_IMPLEMENTATIONS,
     ASK_USER_QUESTION_DEFINITION,
+    NATIVE_TEXT_EDITOR,
+    NATIVE_BASH,
+    NATIVE_EDITOR_NAME,
+    NATIVE_BASH_NAME,
+    NATIVE_WEB_SEARCH_NAME,
+    EDITOR_WRITE_COMMANDS,
 )
 from tools.dispatch import execute_tool, needs_approval  # noqa: F401

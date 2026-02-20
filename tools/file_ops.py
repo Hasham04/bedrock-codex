@@ -142,6 +142,11 @@ def write_file(path: str, content: str,
             pass
         b.write_file(path, content)
         invalidate_file_cache(path)
+        try:
+            from codebase_index import notify_file_changed_global
+            notify_file_changed_global(path, working_directory)
+        except Exception:
+            pass
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         summary = f"{'Created' if is_new else 'Wrote'} {line_count} lines to {path}"
         if is_new:
@@ -188,6 +193,11 @@ def edit_file(path: str, old_string: str, new_string: str,
             replaced = 1
         b.write_file(path, new_content)
         invalidate_file_cache(path)
+        try:
+            from codebase_index import notify_file_changed_global
+            notify_file_changed_global(path, working_directory)
+        except Exception:
+            pass
         diff_text = _compact_diff(content, new_content, path)
         summary = f"Applied edit to {path}" + (f" ({replaced} replacements)" if replaced > 1 else "")
         if diff_text:
@@ -332,6 +342,11 @@ def symbol_edit(path: str, symbol: str, new_string: str, kind: str = "all", occu
         new_content = before + replacement + after
         b.write_file(path, new_content)
         invalidate_file_cache(path)
+        try:
+            from codebase_index import notify_file_changed_global
+            notify_file_changed_global(path, working_directory)
+        except Exception:
+            pass
         diff_text = _compact_diff(content, new_content, path)
         summary = f"Applied symbol_edit to {path} ({symbol}, lines {start}-{end})"
         if diff_text:

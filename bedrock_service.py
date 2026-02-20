@@ -303,24 +303,34 @@ class BedrockService:
             "messages": formatted_messages
         }
         
-        # --- Server-side context editing (Anthropic beta) ---
-        # NOTE: Disabled — the `context` field is not yet supported on the
-        # Bedrock InvokeModel endpoint (Anthropic direct API only).  Keeping
-        # the code here for when AWS adds support.
-        # use_context_editing = (
-        #     supports_context_editing(model_id)
-        #     and app_config.context_editing_enabled
-        # )
-        # if use_context_editing:
-        #     beta_flags = ["context-management-2025-06-27"]
-        #     body["anthropic_beta"] = beta_flags
-        #     strategies = [
-        #         {"type": "clear_tool_uses_20250919"},
-        #     ]
-        #     if use_thinking:
-        #         strategies.append({"type": "clear_thinking_20251015"})
-        #     body["context"] = {"strategies": strategies}
-        #     logger.debug("Server-side context editing enabled with %d strategies", len(strategies))
+        # --- Beta flags for experimental features ---
+        beta_flags = []
+        
+        # Add 1M context beta flag when extended context is active
+        context_window = get_context_window(model_id)
+        if context_window >= 1000000:
+            beta_flags.append("context-1m-2025-08-07")
+            logger.info("1M extended context enabled (context_window=%d)", context_window)
+        
+        # Server-side context editing (disabled for now on Bedrock)
+        use_context_editing = (
+            supports_context_editing(model_id)
+            and app_config.context_editing_enabled
+        )
+        if use_context_editing:
+            beta_flags.append("context-management-2025-06-27")
+            strategies = [
+                {"type": "clear_tool_uses_20250919"},
+            ]
+            if use_thinking:
+                strategies.append({"type": "clear_thinking_20251015"})
+            body["context"] = {"strategies": strategies}
+            logger.debug("Server-side context editing enabled with %d strategies", len(strategies))
+        
+        # Add beta flags to request if any are active
+        if beta_flags:
+            body["anthropic_beta"] = beta_flags
+            logger.info(f"Request includes beta flags: {beta_flags}")
         
         # --- Thinking configuration ---
         if use_thinking:
@@ -481,12 +491,19 @@ class BedrockService:
             
             logger.info(f"Invoking model: {model_identifier}")
             
-            response = self.client.invoke_model(
-                modelId=model_identifier,
-                body=json.dumps(request_body),
-                contentType="application/json",
-                accept="application/json"
-            )
+            invoke_kwargs = {
+                "modelId": model_identifier,
+                "body": json.dumps(request_body),
+                "contentType": "application/json",
+                "accept": "application/json",
+            }
+            # Attach guardrails if configured
+            gid = getattr(app_config, "guardrail_id", "")
+            if gid:
+                invoke_kwargs["guardrailIdentifier"] = gid
+                invoke_kwargs["guardrailVersion"] = getattr(app_config, "guardrail_version", "DRAFT")
+            
+            response = self.client.invoke_model(**invoke_kwargs)
             
             response_body = json.loads(response["body"].read())
             return self._parse_response(response_body, current_model)
@@ -532,12 +549,18 @@ class BedrockService:
             
             logger.info(f"Streaming from model: {model_identifier}")
             
-            response = self.client.invoke_model_with_response_stream(
-                modelId=model_identifier,
-                body=json.dumps(request_body),
-                contentType="application/json",
-                accept="application/json"
-            )
+            stream_kwargs = {
+                "modelId": model_identifier,
+                "body": json.dumps(request_body),
+                "contentType": "application/json",
+                "accept": "application/json",
+            }
+            gid = getattr(app_config, "guardrail_id", "")
+            if gid:
+                stream_kwargs["guardrailIdentifier"] = gid
+                stream_kwargs["guardrailVersion"] = getattr(app_config, "guardrail_version", "DRAFT")
+            
+            response = self.client.invoke_model_with_response_stream(**stream_kwargs)
             
             current_block_type = "text"
             current_thinking_signature = None
@@ -561,6 +584,25 @@ class BedrockService:
                             "data": {
                                 "id": block.get("id", ""),
                                 "name": block.get("name", ""),
+                            }
+                        }
+                    elif current_block_type == "server_tool_use":
+                        yield {
+                            "type": "server_tool_use_start",
+                            "content": "",
+                            "data": {
+                                "id": block.get("id", ""),
+                                "name": block.get("name", ""),
+                                "input": block.get("input", {}),
+                            }
+                        }
+                    elif current_block_type == "web_search_tool_result":
+                        yield {
+                            "type": "web_search_result",
+                            "content": "",
+                            "data": {
+                                "tool_use_id": block.get("tool_use_id", ""),
+                                "content": block.get("content", []),
                             }
                         }
                 
@@ -598,6 +640,10 @@ class BedrockService:
                         yield {"type": "text_end", "content": ""}
                     elif current_block_type == "tool_use":
                         yield {"type": "tool_use_end", "content": ""}
+                    elif current_block_type == "server_tool_use":
+                        yield {"type": "server_tool_use_end", "content": ""}
+                    elif current_block_type == "web_search_tool_result":
+                        yield {"type": "web_search_result_end", "content": ""}
                 
                 elif event_type == "message_start":
                     # Extract input token usage from message_start (includes cache metrics)
@@ -702,6 +748,171 @@ class BedrockService:
                 logger.warning(f"Embed API error: {e}")
                 all_embeddings.extend([[0.0] * 1024 for _ in batch])
         return all_embeddings
+
+    # ------------------------------------------------------------------
+    # Token Counting API
+    # ------------------------------------------------------------------
+
+    def count_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        system_prompt: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        model_id: Optional[str] = None,
+    ) -> int:
+        """Use Bedrock's CountTokens API for accurate token counting.
+        Falls back to heuristic (len/3.5) on failure."""
+        current_model = model_id or self.model_id
+        # CountTokens requires base model ID without cross-region prefix
+        base_model = current_model
+        if base_model.startswith("us.") or base_model.startswith("eu."):
+            base_model = base_model[3:]
+
+        body: Dict[str, Any] = {"messages": messages}
+        if system_prompt:
+            body["system"] = system_prompt if isinstance(system_prompt, list) else [{"type": "text", "text": system_prompt}]
+        if tools:
+            body["tools"] = tools
+
+        try:
+            response = self.client.count_tokens(
+                modelId=base_model,
+                input={"invokeModel": {"body": json.dumps(body)}},
+            )
+            total = response.get("totalTokens", 0)
+            if total > 0:
+                return total
+        except Exception as e:
+            logger.debug(f"CountTokens API failed (falling back to heuristic): {e}")
+
+        # Fallback: heuristic
+        total_chars = len(system_prompt)
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        for key in ("text", "thinking", "content"):
+                            val = block.get(key, "")
+                            if isinstance(val, str):
+                                total_chars += len(val)
+                        inp = block.get("input")
+                        if isinstance(inp, dict):
+                            total_chars += len(json.dumps(inp))
+        return max(1, int(total_chars / 3.5))
+
+    # ------------------------------------------------------------------
+    # Guardrails API
+    # ------------------------------------------------------------------
+
+    def apply_guardrail(
+        self,
+        text: str,
+        source: str = "OUTPUT",
+        guardrail_id: Optional[str] = None,
+        guardrail_version: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Apply a Bedrock Guardrail to text content for filtering.
+        Returns dict with 'action' (GUARDRAIL_INTERVENED or NONE) and 'outputs'."""
+        from config import app_config
+        gid = guardrail_id or getattr(app_config, "guardrail_id", "")
+        gver = guardrail_version or getattr(app_config, "guardrail_version", "DRAFT")
+        if not gid:
+            return {"action": "NONE", "outputs": [{"text": text}]}
+        try:
+            response = self.client.apply_guardrail(
+                guardrailIdentifier=gid,
+                guardrailVersion=gver,
+                source=source,
+                content=[{"text": {"text": text}}],
+            )
+            return {
+                "action": response.get("action", "NONE"),
+                "outputs": response.get("outputs", [{"text": text}]),
+                "assessments": response.get("assessments", []),
+            }
+        except Exception as e:
+            logger.warning(f"Guardrail apply failed: {e}")
+            return {"action": "NONE", "outputs": [{"text": text}]}
+
+    # ------------------------------------------------------------------
+    # Knowledge Bases Retrieve API
+    # ------------------------------------------------------------------
+
+    def retrieve_from_knowledge_base(
+        self,
+        query: str,
+        kb_id: Optional[str] = None,
+        max_results: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve relevant chunks from a Bedrock Knowledge Base.
+        Returns list of {content, location, score} dicts."""
+        from config import app_config
+        knowledge_base_id = kb_id or getattr(app_config, "knowledge_base_id", "")
+        if not knowledge_base_id:
+            return []
+        try:
+            kb_client = boto3.client(
+                "bedrock-agent-runtime",
+                region_name=self.region,
+            )
+            response = kb_client.retrieve(
+                knowledgeBaseId=knowledge_base_id,
+                retrievalQuery={"text": query},
+                retrievalConfiguration={
+                    "vectorSearchConfiguration": {
+                        "numberOfResults": max_results,
+                    }
+                },
+            )
+            results = []
+            for item in response.get("retrievalResults", []):
+                content = item.get("content", {}).get("text", "")
+                location = item.get("location", {})
+                score = item.get("score", 0.0)
+                results.append({
+                    "content": content,
+                    "location": location,
+                    "score": score,
+                })
+            return results
+        except Exception as e:
+            logger.warning(f"Knowledge Base retrieve failed: {e}")
+            return []
+
+    # ------------------------------------------------------------------
+    # Prompt Management
+    # ------------------------------------------------------------------
+
+    def get_managed_prompt(
+        self,
+        prompt_id: Optional[str] = None,
+        prompt_version: Optional[str] = None,
+    ) -> Optional[str]:
+        """Fetch a system prompt from Bedrock Prompt Management.
+        Returns the prompt text, or None if not configured/available."""
+        from config import app_config
+        pid = prompt_id or getattr(app_config, "prompt_id", "")
+        pver = prompt_version or getattr(app_config, "prompt_version", "")
+        if not pid:
+            return None
+        try:
+            agent_client = boto3.client("bedrock-agent", region_name=self.region)
+            kwargs: Dict[str, Any] = {"promptIdentifier": pid}
+            if pver:
+                kwargs["promptVersion"] = pver
+            response = agent_client.get_prompt(**kwargs)
+            variants = response.get("variants", [])
+            if variants:
+                template = variants[0].get("templateConfiguration", {})
+                text_config = template.get("text", {})
+                return text_config.get("text", None)
+            return None
+        except Exception as e:
+            logger.warning(f"Prompt Management fetch failed: {e}")
+            return None
 
     def test_connection(self) -> tuple:
         """Test the Bedrock connection"""

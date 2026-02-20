@@ -31,7 +31,7 @@ from bedrock_service import BedrockService, BedrockError
 from agent import CodingAgent, AgentEvent, _compose_system_prompt, AVAILABLE_TOOL_NAMES, classify_intent
 from sessions import SessionStore, Session
 from config import (
-    get_model_name, get_model_config, model_config, app_config,
+    get_model_name, get_model_config, get_context_window, model_config, app_config,
     supports_thinking, supports_adaptive_thinking, supports_caching,
 )
 
@@ -373,7 +373,7 @@ class BedrockCodexApp(App):
         ]
         lines.append(Text.from_markup("  ".join(detail_parts)))
 
-        ctx = model_cfg.get("context_window", 0)
+        ctx = get_context_window(model_config.model_id)
         out = model_cfg.get("max_output_tokens", 0)
         lines.append(Text.from_markup(
             f"[#6e7681]context: {ctx:,}  output: {out:,}  dir: {self.working_directory}[/#6e7681]"
@@ -677,7 +677,7 @@ class BedrockCodexApp(App):
             tbl.add_column(style="#c9d1d9")
             tbl.add_row("Name", get_model_name(model_config.model_id))
             tbl.add_row("ID", model_config.model_id)
-            tbl.add_row("Context", f"{model_cfg.get('context_window', 0):,}")
+            tbl.add_row("Context", f"{get_context_window(model_config.model_id):,}")
             tbl.add_row("Max Output", f"{model_cfg.get('max_output_tokens', 0):,}")
             tbl.add_row("Thinking", "adaptive" if supports_adaptive_thinking(model_config.model_id)
                          else ("enabled" if supports_thinking(model_config.model_id) else "no"))
@@ -907,7 +907,7 @@ class BedrockCodexApp(App):
 
         try:
             intent = classify_intent(task, self._agent.service)
-            if app_config.plan_phase_enabled and intent.get("plan"):
+            if app_config.plan_phase_enabled and intent.get("plan") and not self.awaiting_build:
                 # --- Plan phase: generate plan, show it, wait for user ---
                 plan_steps = await self._agent.run_plan(
                     task=task,

@@ -58,36 +58,79 @@ def semantic_retrieve(
     working_directory: str = ".",
     **kw: Any,
 ) -> ToolResult:
-    """Semantic search over the codebase index."""
+    """Semantic search over the codebase index, optionally augmented by Bedrock Knowledge Bases."""
+    all_lines: List[str] = []
+
+    # --- Bedrock Knowledge Bases (if configured) ---
+    try:
+        from config import app_config
+        kb_id = getattr(app_config, "knowledge_base_id", "")
+        if kb_id:
+            try:
+                import web.state as _ws
+                service = getattr(_ws, "_bedrock_service", None)
+                if service and hasattr(service, "retrieve_from_knowledge_base"):
+                    kb_results = service.retrieve_from_knowledge_base(query.strip(), kb_id=kb_id, max_results=min(5, top_k))
+                    if kb_results:
+                        all_lines.append(f"Knowledge Base results ({len(kb_results)}):")
+                        all_lines.append("")
+                        for i, r in enumerate(kb_results, 1):
+                            loc = r.get("location", {})
+                            uri = loc.get("s3Location", {}).get("uri", "") or loc.get("uri", "")
+                            score = r.get("score", 0.0)
+                            all_lines.append(f"--- KB Result {i} (score={score:.3f}) {uri} ---")
+                            all_lines.append(r.get("content", "")[:2000])
+                            all_lines.append("")
+            except Exception as e:
+                logger.debug(f"Knowledge Base query failed: {e}")
+    except Exception:
+        pass
+
+    # --- Local codebase index ---
     try:
         from config import app_config
         if not getattr(app_config, "codebase_index_enabled", True):
+            if all_lines:
+                return ToolResult(success=True, output="\n".join(all_lines))
             return ToolResult(success=False, output="", error="Codebase index is disabled.")
         from codebase_index import get_index, get_embed_fn
         is_ssh = backend is not None and getattr(backend, "_host", None) is not None
         wd = working_directory if is_ssh else os.path.abspath(working_directory)
         embed_fn = get_embed_fn()
-        index = get_index(wd, embed_fn=embed_fn, backend=backend)
-        if not index.chunks and embed_fn and backend:
-            index.build(backend, force_reindex=False)
-        if not index.chunks:
+        idx = None
+        try:
+            import web.state as _ws
+            idx = getattr(_ws, "_bg_codebase_index", None)
+        except Exception:
+            pass
+        if idx is None:
+            idx = get_index(wd, embed_fn=embed_fn, backend=backend)
+        if not idx.chunks and embed_fn and backend:
+            idx.build(backend, force_reindex=False)
+        if not idx.chunks:
+            if all_lines:
+                return ToolResult(success=True, output="\n".join(all_lines))
             return ToolResult(
                 success=False,
                 output="",
-                error="Index empty. Ensure CODEBASE_INDEX_ENABLED=true and the project has been indexed (e.g. run a task once to trigger index build).",
+                error="Index empty. Ensure CODEBASE_INDEX_ENABLED=true and the project has been indexed.",
             )
         k = max(1, min(20, top_k))
-        chunks = index.retrieve(query.strip(), top_k=k)
-        if not chunks:
-            return ToolResult(success=True, output="No relevant chunks found for this query. Try a different query or use search/Read.")
-        lines = [f"Semantic retrieval (top {len(chunks)}):", ""]
-        for i, c in enumerate(chunks, 1):
-            lines.append(f"--- Result {i}: {c.path}:{c.start_line}-{c.end_line} [{c.kind}] {c.name} ---")
-            lines.append(c.to_search_snippet())
-            lines.append("")
-        return ToolResult(success=True, output="\n".join(lines))
+        chunks = idx.retrieve_with_refresh(query.strip(), top_k=k, backend=backend)
+        if not chunks and not all_lines:
+            return ToolResult(success=True, output="No relevant chunks found for this query. Try a different query or use search.")
+        if chunks:
+            all_lines.append(f"Codebase retrieval (top {len(chunks)}):")
+            all_lines.append("")
+            for i, c in enumerate(chunks, 1):
+                all_lines.append(f"--- Result {i}: {c.path}:{c.start_line}-{c.end_line} [{c.kind}] {c.name} ---")
+                all_lines.append(c.to_search_snippet())
+                all_lines.append("")
+        return ToolResult(success=True, output="\n".join(all_lines))
     except Exception as e:
         logger.exception("semantic_retrieve failed")
+        if all_lines:
+            return ToolResult(success=True, output="\n".join(all_lines))
         return ToolResult(success=False, output="", error=str(e))
 
 

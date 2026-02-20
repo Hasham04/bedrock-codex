@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .events import PolicyDecision
 from config import app_config
+from tools.schemas import NATIVE_BASH_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +151,14 @@ class VerificationMixin:
             lines.append(
                 f"- [{row.get('kind','failure')}] x{row.get('count',1)}: {str(row.get('detail',''))[:180]}"
             )
-        return "Avoid repeating these known failure patterns:\n" + "\n".join(lines)
+        header = (
+            "Avoid repeating these known failure patterns:\n"
+        )
+        footer = (
+            "\nIf you encounter one of these patterns, try an alternative approach "
+            "rather than repeating the same failing operation."
+        )
+        return header + "\n".join(lines) + footer
     
     # ------------------------------------------------------------------
     # Policy Engine
@@ -158,7 +166,7 @@ class VerificationMixin:
     
     def _policy_decision(self, tool_name: str, tool_input: Dict[str, Any]) -> PolicyDecision:
         """Policy engine: block or require approval for risky operations."""
-        if tool_name == "Bash":
+        if tool_name == NATIVE_BASH_NAME:
             cmd = tool_input.get("command", "")
             # Patterns that could affect shared systems
             shared_impact_patterns = [

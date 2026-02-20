@@ -16,6 +16,7 @@ from web.state import (
     _project_tree_cache,
     _PROJECT_TREE_TTL,
     _AUTO_CONTEXT_CHAR_BUDGET,
+    get_auto_context_budget,
     _bg_codebase_index,
     _bg_index_ready,
 )
@@ -60,6 +61,7 @@ def _assemble_auto_context(
     modified_files: Optional[set] = None,
     backend: Optional[Backend] = None,
     user_query: Optional[str] = None,
+    model_id: Optional[str] = None,
 ) -> str:
     """Assemble auto-context that gets injected into the agent conversation.
 
@@ -80,7 +82,7 @@ def _assemble_auto_context(
     from backend import LocalBackend as _LB
     b = backend or _LB(os.path.abspath(working_directory))
     sections: List[str] = []
-    budget = _AUTO_CONTEXT_CHAR_BUDGET
+    budget = get_auto_context_budget(model_id) if model_id else _AUTO_CONTEXT_CHAR_BUDGET
     editor_context = editor_context or {}
 
     def add_section(label: str, content: str) -> bool:
@@ -182,7 +184,7 @@ def _assemble_auto_context(
         try:
             idx = _state._bg_codebase_index
             if idx and idx.chunks:
-                results = idx.retrieve(user_query, top_k=5)
+                results = idx.retrieve_with_refresh(user_query, top_k=5, backend=b)
                 if results:
                     sem_lines = ["# Relevant code (semantic search)"]
                     for chunk in results:

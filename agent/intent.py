@@ -11,20 +11,21 @@ from config import app_config
 logger = logging.getLogger(__name__)
 
 
-CLASSIFY_SYSTEM = """You are a task classifier for a coding agent. Analyze the user's message and return ONLY this JSON:
+CLASSIFY_SYSTEM = """You are a task classifier for a coding agent. Analyze the user's message and return ONLY valid JSON:
 {"scout": true/false, "plan": true/false, "question": true/false, "complexity": "trivial"|"simple"|"complex"}
 
-**Guidelines**:
-- **Trivial**: Greetings, yes/no, single commands, short confirmations
-- **Simple**: Single-file edits, questions about specific code, explanations
-- **Complex**: Multi-file changes, architecture work, new features, refactors, audits, reviews, analysis tasks spanning the codebase
+**Complexity levels**:
+- **Trivial**: Greetings, yes/no, single commands, short confirmations, "do it"
+- **Simple**: Single-file edits, questions about specific code, explanations, rename a variable, fix a typo
+- **Complex**: Multi-file changes, architecture work, new features, refactors, audits, reviews, analysis tasks, anything spanning multiple subsystems, migrations, deprecations, backward-compatible changes, cross-service modifications, anything touching shared libraries or interfaces
 
-Audit, review, analysis, and investigation tasks that span the entire codebase or multiple subsystems are ALWAYS complex.
+Audit, review, analysis, and investigation tasks are ALWAYS complex.
 
-**question** = true when the user is asking a question, requesting an explanation, or having a conversation (NOT requesting code changes). Questions should be answered directly and quickly.
-
-**Scout needed when**: Need to understand codebase structure or find existing code to answer
-**Plan needed when**: Multi-step coordination across multiple files required (NOT for questions)
+**Field rules**:
+- **question** = true ONLY when the user is asking a question or requesting an explanation (NOT requesting code changes). Questions are answered directly without planning.
+- **scout** = true when the agent needs to explore the codebase to understand structure, find files, or locate relevant code. Scout is cheap — when in doubt, set true.
+- **plan** = true when multi-step coordination across multiple files is required. NEVER true for questions. NEVER true for execution commands.
+- **plan** = false when: the user says "implement", "execute", "go ahead", "do it", "build it", "apply the plan", or similar — they want EXECUTION, not a new plan. Also false for single-file edits that don't need coordination.
 
 **Examples**:
 - "Fix the bug in auth.py" → {"scout": true, "plan": false, "question": false, "complexity": "simple"}
@@ -33,14 +34,23 @@ Audit, review, analysis, and investigation tasks that span the entire codebase o
 - "Run the tests" → {"scout": false, "plan": false, "question": false, "complexity": "trivial"}
 - "Explain how recursion works" → {"scout": false, "plan": false, "question": true, "complexity": "simple"}
 - "Hi, how are you?" → {"scout": false, "plan": false, "question": true, "complexity": "trivial"}
-- "What's the difference between REST and GraphQL?" → {"scout": false, "plan": false, "question": true, "complexity": "simple"}
 - "Can you explain what this error means?" → {"scout": true, "plan": false, "question": true, "complexity": "simple"}
 - "Refactor the database layer to use connection pooling" → {"scout": true, "plan": true, "question": false, "complexity": "complex"}
 - "Do an end to end audit of this codebase" → {"scout": true, "plan": true, "question": false, "complexity": "complex"}
 - "Review this code for security issues" → {"scout": true, "plan": true, "question": false, "complexity": "complex"}
-- "Analyze the architecture and find all bugs" → {"scout": true, "plan": true, "question": false, "complexity": "complex"}
+- "Implement the plan" → {"scout": false, "plan": false, "question": false, "complexity": "complex"}
+- "Go ahead and implement it" → {"scout": false, "plan": false, "question": false, "complexity": "complex"}
+- "Do it" → {"scout": false, "plan": false, "question": false, "complexity": "trivial"}
+- "Implement the plan also change the UI to use a single pill" → {"scout": true, "plan": false, "question": false, "complexity": "complex"}
+- "Add a button to the header and update the tests" → {"scout": true, "plan": true, "question": false, "complexity": "complex"}
+- "Migrate the auth system from sessions to JWT" → {"scout": true, "plan": true, "question": false, "complexity": "complex"}
+- "Deprecate the old API endpoint" → {"scout": true, "plan": true, "question": false, "complexity": "complex"}
+- "Make this change backward compatible" → {"scout": true, "plan": true, "question": false, "complexity": "complex"}
+- "Update the shared utils to support the new format" → {"scout": true, "plan": true, "question": false, "complexity": "complex"}
+- "Debug why the login is failing" → {"scout": true, "plan": false, "question": false, "complexity": "complex"}
 
-When uncertain: scout=true (cheap), plan=false, question=false, complexity="complex"."""
+When uncertain: scout=true (cheap), plan=false, question=false, complexity="complex".
+Return ONLY the JSON object, no explanation."""
 
 # Cache for the classifier — avoids re-calling for the same message
 _classify_cache: Dict[str, Dict[str, Any]] = {}
@@ -129,10 +139,21 @@ def _classify_fallback(task: str) -> Dict[str, Any]:
                    any(stripped.startswith(q) for q in question_starters))
     if is_question:
         return {"scout": True, "plan": False, "question": True, "complexity": "simple"}
+    execute_indicators = (
+        "implement the plan", "implement it", "execute the plan", "execute it",
+        "go ahead", "do it", "build it", "apply the plan", "apply the changes",
+        "just implement", "just execute", "just do it",
+    )
+    if any(kw in stripped for kw in execute_indicators):
+        return {"scout": False, "plan": False, "question": False, "complexity": "complex"}
     complex_indicators = (
         "audit", "refactor", "review", "analyze", "analyse", "overhaul",
         "redesign", "end to end", "end-to-end", "codebase", "rip apart",
         "find all bugs", "security review", "architecture",
+        "migrate", "migration", "deprecate", "backward compatible",
+        "backward-compatible", "breaking change", "cross-service",
+        "shared library", "api contract", "interface change",
+        "upgrade", "downgrade", "rollback strategy",
     )
     if any(kw in stripped for kw in complex_indicators):
         return {"scout": True, "plan": True, "question": False, "complexity": "complex"}

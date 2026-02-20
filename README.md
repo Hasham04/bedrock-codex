@@ -29,7 +29,7 @@ It is not a simple chatbot UI. It is an agentic system that can:
 ### Web IDE (recommended)
 
 ```bash
-python web.py --dir .
+python -m web --dir .
 ```
 
 Open: `http://127.0.0.1:8765`
@@ -68,8 +68,8 @@ Required IAM permissions:
 Start local server, then connect from the welcome page, or start directly in SSH mode:
 
 ```bash
-python web.py --ssh user@host --dir /path/on/remote
-python web.py --ssh user@host --key ~/.ssh/id_rsa --ssh-port 22 --dir /opt/app
+python -m web --ssh user@host --dir /path/on/remote
+python -m web --ssh user@host --key ~/.ssh/id_rsa --ssh-port 22 --dir /opt/app
 ```
 
 All reads/writes/commands run on the selected backend (local or SSH).
@@ -78,16 +78,21 @@ All reads/writes/commands run on the selected backend (local or SSH).
 
 | Tool | Purpose |
 |---|---|
-| `read_file` | Read file content (supports scoped reads) |
-| `write_file` | Create/overwrite files |
-| `edit_file` | Exact-context string edits |
-| `symbol_edit` | Symbol-level refactors via AST/tree-sitter where available |
-| `search` | Project-wide regex search |
-| `find_symbol` | Symbol definition/reference navigation |
-| `list_directory` | Directory listing |
-| `glob_find` | Glob-based file discovery |
-| `lint_file` | Per-file lint/typecheck detection and execution |
-| `run_command` | Shell command execution (with streaming support) |
+| `str_replace_based_edit_tool` | Read/create/edit files with exact-context string replacements (native Anthropic tool) |
+| `bash` | Shell command execution with live streaming support (native Anthropic tool) |
+| `symbol_edit` | Symbol-aware refactors via AST/tree-sitter parsing with regex fallback |
+| `search` | Project-wide regex search across files |
+| `find_symbol` | Symbol definition/reference navigation (language-aware) |
+| `list_directory` | Directory listing with file details |
+| `Glob` | Glob-based file discovery (e.g., `**/*.py`) |
+| `project_tree` | Recursive project structure view (respects .gitignore) |
+| `lint_file` | Auto-detect and run appropriate linters per file type |
+| `semantic_retrieve` | Semantic codebase search by meaning (requires index) |
+| `WebSearch` | Web search for documentation and current information |
+| `WebFetch` | Fetch content from URLs |
+| `TodoWrite` / `TodoRead` | Task checklist management |
+| `MemoryWrite` / `MemoryRead` | Session memory for facts and preferences |
+| `AskUserQuestion` | Structured clarifying questions with multiple-choice options |
 
 ## Core Workflow
 
@@ -117,11 +122,22 @@ ENABLE_THINKING=true
 THINKING_BUDGET=120000
 USE_ADAPTIVE_THINKING=true
 
+# Context window (1M extended context via Anthropic beta flag)
+ENABLE_EXTENDED_CONTEXT=true        # Use 1M context instead of 200K (default: true)
+CONTEXT_EDITING_ENABLED=false       # Server-side context compaction (default: false)
+
 # Agent execution
 MAX_TOOL_ITERATIONS=200
 PLAN_PHASE_ENABLED=true
 SCOUT_ENABLED=true
 AUTO_APPROVE_COMMANDS=false
+
+# Verification & quality gates
+DETERMINISTIC_VERIFICATION_GATE=true        # Lint + test gate before completion
+DETERMINISTIC_VERIFICATION_RUN_TESTS=true   # Run impacted tests in verification gate
+VERIFICATION_ORCHESTRATOR_ENABLED=true      # Language-aware linters (ruff, tsc, eslint)
+POLICY_ENGINE_ENABLED=true                  # Block/approve risky operations
+BLOCK_DESTRUCTIVE_COMMANDS=true             # Block rm -rf, git reset --hard, etc.
 
 # Advanced execution features
 LIVE_COMMAND_STREAMING=true
@@ -130,18 +146,39 @@ PARALLEL_SUBAGENTS_ENABLED=true
 PARALLEL_SUBAGENTS_MAX_WORKERS=3
 TEST_IMPACT_SELECTION_ENABLED=true
 TEST_RUN_FULL_AFTER_IMPACT=true
+
+# Enterprise features
+CODEBASE_INDEX_ENABLED=true          # Semantic search index for semantic_retrieve
+EMBEDDING_MODEL_ID=cohere.embed-english-v3
+LEARNING_LOOP_ENABLED=true           # Learn from failure patterns
 ```
 
 ## Architecture
 
 ```text
-web.py              FastAPI + WebSocket bridge + session/replay orchestration
-agent.py            Core coding engine (scout/plan/build, verification, policy, learning)
-tools.py            Tool schemas + implementations (including symbol-aware edits)
-backend.py          LocalBackend + SSHBackend abstraction
-bedrock_service.py  Bedrock streaming client and prompt formatting
-sessions.py         Session persistence store
-static/             Browser IDE frontend (explorer/editor/chat/tool timeline)
+web/                      FastAPI + WebSocket bridge + session/replay orchestration
+├── chat.py              WebSocket agent endpoint and message loop
+├── api_files.py         File/search/replace REST endpoints
+├── api_git.py           Git status, diff, and stats endpoints
+├── api_sessions.py      Session listing and creation
+├── terminal.py          Terminal WebSocket and PTY management
+├── context.py           Auto-context assembly and mention resolution
+├── state.py             Shared mutable state and configuration
+├── cli.py               CLI entry point and argument parsing
+agent/                    Modular coding engine (mixins for scout/plan/build/verification/recovery)
+├── core.py              Agent orchestration and mixin composition
+├── planning.py          Plan generation with quality gates and step parsing
+├── building.py          Build execution (single-shot and phased)
+├── execution.py         Core tool-use loop and streaming
+├── progressive_verification.py  Lint + test verification pipeline
+├── context.py           Session state, file snapshots, todos, memory
+├── recovery.py          Error recovery and failure pattern learning
+└── scout.py             Codebase exploration and auto-context
+tools/                    Tool definitions, dispatch, and implementations
+backend.py               LocalBackend + SSHBackend abstraction
+bedrock_service.py       Bedrock streaming client and prompt formatting
+sessions.py              Session persistence store
+static/                  Browser IDE frontend (explorer/editor/chat/tool timeline)
 ```
 
 ## Troubleshooting
@@ -151,7 +188,7 @@ static/             Browser IDE frontend (explorer/editor/chat/tool timeline)
 Run on another port:
 
 ```bash
-python web.py --dir . --port 8766
+python -m web --dir . --port 8766
 ```
 
 ### Bedrock "on-demand throughput isn't supported" for scout model

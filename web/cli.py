@@ -11,6 +11,8 @@ import os
 import web.state as _state
 from backend import LocalBackend
 
+_DIR_SENTINEL = object()  # detect whether --dir was explicitly passed
+
 
 def main():
     import uvicorn
@@ -18,13 +20,16 @@ def main():
     parser = argparse.ArgumentParser(description="Bedrock Codex — Web GUI")
     parser.add_argument("--port", type=int, default=8765, help="Server port (default: 8765)")
     parser.add_argument("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
-    parser.add_argument("--dir", default=".", help="Working directory for the agent")
+    parser.add_argument("--dir", default=_DIR_SENTINEL, help="Working directory for the agent")
     parser.add_argument("--ssh", default=None, help="SSH remote: user@host (e.g. deploy@192.168.1.50)")
     parser.add_argument("--key", default=None, help="SSH private key path (default: ~/.ssh/id_rsa)")
     parser.add_argument("--ssh-port", type=int, default=22, help="SSH port (default: 22)")
     args = parser.parse_args()
 
-    _state._working_directory = os.path.abspath(os.path.expanduser(args.dir))
+    dir_was_explicit = args.dir is not _DIR_SENTINEL
+    dir_value = args.dir if dir_was_explicit else "."
+
+    _state._working_directory = os.path.abspath(os.path.expanduser(dir_value))
 
     if args.ssh:
         # SSH remote mode — always explicit
@@ -36,7 +41,7 @@ def main():
         else:
             user, host = None, parts[0]
 
-        remote_dir = args.dir if args.dir != "." else "/home/" + (user or "root")
+        remote_dir = dir_value if dir_was_explicit else "/home/" + (user or "root")
 
         try:
             _state._backend = SSHBackend(
@@ -55,8 +60,14 @@ def main():
             raise SystemExit(1)
     else:
         # Local mode
-        # If --dir was explicitly passed (not default "."), skip the welcome screen
-        _state._explicit_dir = args.dir != "."
+        # If --dir was explicitly passed (even --dir .), skip the welcome screen.
+        # Also skip welcome if sessions already exist for this directory.
+        _state._explicit_dir = dir_was_explicit
+        if not _state._explicit_dir:
+            from sessions import SessionStore
+            _store = SessionStore()
+            if _store.list_sessions(_state._working_directory):
+                _state._explicit_dir = True
 
         if _state._explicit_dir and not os.path.isdir(_state._working_directory):
             print(f"\n  Error: directory not found: {_state._working_directory}")

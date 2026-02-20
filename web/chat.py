@@ -31,7 +31,6 @@ from config import (
 )
 
 from web.state import (
-    _working_directory, _backend, _ssh_info,
     _reconnect_sessions, _active_save_fns,
     _WSRef,
 )
@@ -79,21 +78,21 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
     # ── Normal / fresh connection ───────────────────────────────
     wsr = _WSRef(ws)
 
-    is_ssh = _ssh_info is not None
+    is_ssh = _state._ssh_info is not None
     # For SSH projects, _working_directory is composite (user@host:port:dir)
     # For local, normalize to absolute path
     if is_ssh:
-        wd = _working_directory
+        wd = _state._working_directory
         # The actual filesystem directory for the agent is the remote dir
-        agent_wd = _ssh_info["directory"]
+        agent_wd = _state._ssh_info["directory"]
     else:
-        wd = os.path.abspath(_working_directory)
+        wd = os.path.abspath(_state._working_directory)
         agent_wd = wd
 
     # Initialise services
     try:
         bedrock_service = BedrockService()
-        backend = _backend or LocalBackend(agent_wd)
+        backend = _state._backend or LocalBackend(agent_wd)
         agent = CodingAgent(
             bedrock_service,
             working_directory=agent_wd,
@@ -113,6 +112,15 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
     store = SessionStore()
     session: Optional[Session] = None
+
+    # Flush the previous session to disk before loading
+    # (e.g. when switching sessions via the dropdown)
+    if requested_session_id and requested_session_id in _active_save_fns:
+        try:
+            _active_save_fns[requested_session_id]()
+        except Exception:
+            pass
+
     if requested_session_id:
         loaded = store.load(requested_session_id)
         if loaded and loaded.working_directory == wd:
@@ -129,6 +137,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         "ssh_info",
         "awaiting_build",
         "awaiting_keep_revert",
+        "kept_file_contents",
         "pending_task",
         "pending_plan",
         "pending_images",
@@ -138,6 +147,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
     _restored_ui_state: Dict[str, Any] = {}
     if session is None:
         session = store.create_session(wd, model_config.model_id)
+        store.save(session)
     else:
         # Restore agent/session state even for empty-history sessions.
         # Otherwise, switching to a newly created agent session would
@@ -161,30 +171,24 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             state = agent.to_dict()
             session.history = state["history"]
             session.token_usage = state["token_usage"]
-            session.extra_state = {
-                "approved_commands": state.get("approved_commands", []),
-                "running_summary": state.get("running_summary", ""),
-                "current_plan": state.get("current_plan"),
-                "plan_file_path": state.get("plan_file_path"),
-                "plan_text": state.get("plan_text", ""),
-                "scout_context": state.get("scout_context"),
-                "file_snapshots": state.get("file_snapshots", {}),
-                "plan_step_index": state.get("plan_step_index", 0),
-                "todos": state.get("todos", []),
-                "memory": state.get("memory", {}),
-                # UI state for reconnection
+            # Persist all agent state keys from to_dict() plus UI state.
+            session.extra_state = {k: v for k, v in state.items()
+                                   if k not in ("history", "token_usage")}
+            # UI state for reconnection
+            session.extra_state.update({
                 "awaiting_build": awaiting_build,
                 "awaiting_keep_revert": awaiting_keep_revert,
+                "kept_file_contents": _kept_file_contents,
                 "pending_task": pending_task,
                 "pending_plan": pending_plan,
-                "pending_images": pending_images,
+                "pending_images": [{k: v for k, v in img.items() if k != "data"} for img in (pending_images or [])],
                 # In-progress stream buffers (survive server restart)
                 "current_thinking_text": _current_thinking_text,
                 "current_text_buffer": _current_text_buffer,
-            }
+            })
             # Persist SSH connection info so it can be reused on reopen
-            if _ssh_info:
-                session.extra_state["ssh_info"] = _ssh_info
+            if _state._ssh_info:
+                session.extra_state["ssh_info"] = _state._ssh_info
             session.working_directory = wd
             try:
                 store.save(session)
@@ -202,10 +206,11 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
     awaiting_build: bool = bool(_restored_ui_state.get("awaiting_build"))
     # Only show Keep/Revert if we have pending snapshots and user hasn't already resolved (Keep/Revert).
     # If we saved awaiting_keep_revert=False (user clicked Keep/Revert), never show the bar again.
-    awaiting_keep_revert: bool = (
-        bool(agent._file_snapshots)
-        and _restored_ui_state.get("awaiting_keep_revert") is not False
-    )
+    awaiting_keep_revert: bool = _restored_ui_state.get("awaiting_keep_revert", False)
+    # Track file contents at the time of Keep so we can exclude unchanged files from the next diff.
+    # Maps abs_path -> content_at_keep_time.  Files re-modified after Keep will have different
+    # current content and will reappear in the diff.
+    _kept_file_contents: Dict[str, str] = dict(_restored_ui_state.get("kept_file_contents") or {})
     task_start: Optional[float] = None
     _last_save_time: float = time.time()
     _agent_task: Optional[asyncio.Task] = None
@@ -226,7 +231,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         "linter_errors", "open_files", "recent_files",
     ]
     _STRIP_XML_RE = re.compile(
-        r"<(" + "|".join(_INTERNAL_XML_TAGS) + r")>[\s\S]*?</\1>",
+        r"<(" + "|".join(_INTERNAL_XML_TAGS) + r")(?:\s[^>]*)?>[\s\S]*?</\1>",
         re.IGNORECASE,
     )
     _INSTRUCTION_SUFFIXES = [
@@ -282,6 +287,8 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         - Filters out compressed/trimmed content markers
         """
         if not agent.history:
+            # Even with empty history, we must send replay_done so frontend knows restoration is complete
+            await wsr.send_json({"type": "replay_done"})
             return
 
         # Build a map of tool_use_id -> tool_result for pairing
@@ -371,6 +378,23 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                                     "data": {"tool_use_id": tool_id, "success": tr["success"]},
                                 })
                                 emitted_tool_results.add(tool_id)
+                        elif btype == "server_tool_use":
+                            await wsr.send_json({
+                                "type": "server_tool_use",
+                                "data": {
+                                    "id": block.get("id", ""),
+                                    "name": block.get("name", ""),
+                                    "input": block.get("input", {}),
+                                },
+                            })
+                        elif btype == "web_search_tool_result":
+                            await wsr.send_json({
+                                "type": "web_search_result",
+                                "data": {
+                                    "tool_use_id": block.get("tool_use_id", ""),
+                                    "content": block.get("content", []),
+                                },
+                            })
 
         await wsr.send_json({"type": "replay_done"})
 
@@ -409,6 +433,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     pass
             state_msg["plan_file"] = plan_file
             state_msg["plan_text"] = plan_text or ""
+            state_msg["plan_title"] = getattr(agent, "_plan_title", "") or ""
         if awaiting_keep_revert and agent._file_snapshots:
             # Generate and send actual diffs for the keep/revert bar
             diffs = generate_diffs()
@@ -460,11 +485,13 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 steps = [l.strip() for l in event.content.strip().split("\n") if l.strip()]
             plan_file = event.data.get("plan_file") if event.data else None
             plan_text = event.data.get("plan_text", "") if event.data else ""
+            plan_title = event.data.get("plan_title", "") if event.data else ""
             msg = {
                 "type": "plan",
                 "steps": steps,
                 "plan_file": plan_file,
                 "plan_text": plan_text,
+                "plan_title": plan_title,
             }
 
         await wsr.send_json(msg)
@@ -523,6 +550,11 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                         new_content = f.read()
                 except FileNotFoundError:
                     new_content = ""
+
+            # Skip files that haven't changed since the user last clicked Keep.
+            if abs_path in _kept_file_contents and new_content == _kept_file_contents[abs_path]:
+                continue
+
             new_lines = new_content.splitlines(keepends=True)
             # Resolve original content: dict means "created file", None means "new file"
             is_created = original is None or (isinstance(original, dict) and original.get("created"))
@@ -574,9 +606,10 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
     async def _message_loop():
         """Read and dispatch incoming WS messages. Extracted as a reusable
         closure so it can be re-entered after a reconnect."""
-        nonlocal _cancel_ack_sent, _agent_task, awaiting_keep_revert
+        nonlocal _cancel_ack_sent, _agent_task, awaiting_keep_revert, _kept_file_contents
         nonlocal awaiting_build, pending_task, pending_plan, pending_images
         nonlocal session, _current_thinking_text, _current_text_buffer
+        nonlocal _save_interval_task
         while True:
             raw = await ws.receive_text()
             try:
@@ -632,6 +665,18 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 # Preserve snapshots so diffs stay cumulative across multiple
                 # plan/build cycles.  Only dismiss the UI — a later Revert can
                 # still undo everything back to the original baseline.
+                # Record current content of each file so the next diff only shows
+                # files that were modified after this Keep.
+                is_ssh = getattr(agent.backend, "_host", None) is not None
+                for abs_path in agent.modified_files:
+                    try:
+                        if is_ssh:
+                            _kept_file_contents[abs_path] = agent.backend.read_file(abs_path)
+                        else:
+                            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                                _kept_file_contents[abs_path] = f.read()
+                    except Exception:
+                        _kept_file_contents[abs_path] = ""
                 awaiting_keep_revert = False
                 feedback = "[System] The user accepted your changes."
                 if kept_paths:
@@ -647,6 +692,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 reverted = agent.revert_all()
                 reverted_rel = [os.path.relpath(p, wd) for p in reverted]
                 awaiting_keep_revert = False
+                _kept_file_contents.clear()
                 feedback = "[System] The user reverted your changes. The following files were reverted to their previous state: "
                 feedback += ", ".join(reverted_rel[:20]) if reverted_rel else "(none)"
                 if len(reverted_rel) > 20:
@@ -657,6 +703,14 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     "type": "reverted",
                     "files": reverted_rel,
                 })
+                continue
+
+            if msg_type == "keep" and not awaiting_keep_revert:
+                await wsr.send_json({"type": "info", "content": "No pending changes to accept."})
+                continue
+
+            if msg_type == "revert" and not awaiting_keep_revert:
+                await wsr.send_json({"type": "info", "content": "No pending changes to revert."})
                 continue
 
             # ── Revert to specific plan step ──────────────────────
@@ -727,6 +781,21 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 )
                 continue
 
+            # ── Plan feedback (re-plan with user corrections) ──────
+            if msg_type == "plan_feedback" and awaiting_build:
+                feedback_text = (data.get("feedback") or "").strip()
+                if not feedback_text:
+                    await wsr.send_json({"type": "info", "content": "Empty feedback — please provide details."})
+                    continue
+                awaiting_build = False
+                original_task = pending_task or ""
+                combined = f"{original_task}\n\n[User feedback on plan]: {feedback_text}"
+                _cancel_ack_sent = False
+                _agent_task = asyncio.create_task(
+                    _run_task_bg(combined, pending_images, editor_context=data.get("context"))
+                )
+                continue
+
             # ── Reject plan ────────────────────────────────────────
             if msg_type == "reject_plan":
                 awaiting_build = False
@@ -743,6 +812,17 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     agent.cancel()
                     _agent_task.cancel()
                     _agent_task = None
+                # Stop periodic save to prevent an in-flight background
+                # save from overwriting the new (empty) session file after
+                # we reset.  Wait for any running to_thread(save_session)
+                # to finish so the file is stable before we write fresh state.
+                if _save_interval_task and not _save_interval_task.done():
+                    _save_interval_task.cancel()
+                    try:
+                        await _save_interval_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    _save_interval_task = None
                 agent.reset()
                 pending_plan = None
                 pending_task = None
@@ -751,8 +831,16 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 awaiting_keep_revert = False
                 _current_thinking_text = ""
                 _current_text_buffer = ""
+                old_session_id = session.session_id if session else None
                 session = store.create_session(wd, model_config.model_id)
                 save_session()
+                # Update the shutdown save registry so the new session_id
+                # is persisted if the server is killed before the next save.
+                if old_session_id and old_session_id != session.session_id:
+                    _active_save_fns.pop(old_session_id, None)
+                _active_save_fns[session.session_id] = save_session
+                # Restart periodic save with the clean state.
+                _save_interval_task = asyncio.create_task(_periodic_save_loop())
                 await wsr.send_json({
                     "type": "reset_done",
                     "session_id": session.session_id,
@@ -792,18 +880,21 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                         # Fire-and-forget: generate a proper title in background
                         _title_source = task_text
 
+                        _title_session_id = session.session_id
+
                         async def _generate_session_title(source_text: str):
                             try:
                                 loop = asyncio.get_event_loop()
                                 title = await loop.run_in_executor(
                                     None, bedrock_service.generate_title, source_text
                                 )
-                                if title and session:
+                                if title and session and session.session_id == _title_session_id:
                                     session.name = title
                                     save_session()
                                     try:
                                         await wsr.send_json({
                                             "type": "session_name_update",
+                                            "session_id": session.session_id,
                                             "session_name": title,
                                         })
                                     except Exception:
@@ -824,15 +915,15 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         # Send initial info
         mcfg = get_model_config(model_config.model_id)
         # Display-friendly working directory
-        if is_ssh and _ssh_info:
-            display_wd = f"{_ssh_info['user']}@{_ssh_info['host']}:{_ssh_info['directory']}"
+        if is_ssh and _state._ssh_info:
+            display_wd = f"{_state._ssh_info['user']}@{_state._ssh_info['host']}:{_state._ssh_info['directory']}"
         else:
             display_wd = wd
         await wsr.send_json({
             "type": "init",
             "model_name": get_model_name(model_config.model_id),
             "working_directory": display_wd,
-            "context_window": mcfg.get("context_window", 0),
+            "context_window": get_context_window(model_config.model_id),
             "thinking": supports_thinking(model_config.model_id),
             "caching": supports_caching(model_config.model_id),
             "session_id": session.session_id if session else "",
@@ -864,7 +955,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         if _state._bg_index_task is None or _state._bg_index_task.done():
             _state._bg_index_ready.clear()
             _state._bg_index_task = asyncio.create_task(
-                _build_index_background(_backend or backend, agent_wd)
+                _build_index_background(_state._backend or backend, agent_wd)
             )
 
         # ── Background task helpers ─────────────────────────────
@@ -959,6 +1050,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 "steps": new_steps,
                 "plan_text": plan_text_full,
                 "plan_file": getattr(ag, "_plan_file_path", None),
+                "plan_title": getattr(ag, "_plan_title", "") or "",
             })
 
             # Also update the checklist
@@ -989,23 +1081,35 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             # Run auto-context, mention resolution, and intent classification in parallel
             async def _auto_ctx_task():
                 try:
-                    return await asyncio.to_thread(
-                        _assemble_auto_context,
-                        _working_directory,
-                        editor_context,
-                        agent.modified_files if hasattr(agent, "modified_files") else None,
-                        backend=_backend,
-                        user_query=task_text,
+                    return await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _assemble_auto_context,
+                            _state._working_directory,
+                            editor_context,
+                            agent.modified_files if hasattr(agent, "modified_files") else None,
+                            backend=_state._backend,
+                            user_query=task_text,
+                        ),
+                        timeout=60.0,
                     )
+                except asyncio.TimeoutError:
+                    logger.warning("Auto-context assembly timed out after 60s")
+                    return ""
                 except Exception as e:
                     logger.debug(f"Auto-context assembly failed: {e}")
                     return ""
 
             async def _mentions_task():
                 try:
-                    return await asyncio.to_thread(
-                        _resolve_mentions, task_text, _working_directory, backend=_backend
+                    return await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _resolve_mentions, task_text, _state._working_directory, backend=_state._backend
+                        ),
+                        timeout=10.0,
                     )
+                except asyncio.TimeoutError:
+                    logger.warning("Mention resolution timed out after 10s")
+                    return task_text
                 except Exception as e:
                     logger.debug(f"Mention resolution failed: {e}")
                     return task_text
@@ -1028,7 +1132,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
             try:
                 is_question = intent.get("question", False)
-                if app_config.plan_phase_enabled and intent.get("plan") and not is_question:
+                if app_config.plan_phase_enabled and intent.get("plan") and not is_question and not awaiting_build:
                     # Plan phase — inject auto-context into plan task too
                     plan_task = (auto_ctx + "\n\n" + task_text) if auto_ctx else task_text
                     plan_steps = await agent.run_plan(
@@ -1060,7 +1164,19 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                         "output_tokens": agent._total_output_tokens,
                     }})
                 else:
-                    # Direct mode — pass scout decision from intent classification
+                    # Direct mode — but first check if the user is asking to execute the pending plan
+                    if awaiting_build and pending_plan and not is_question:
+                        _exec_kws = ("implement", "execute", "go ahead", "do it", "build",
+                                     "apply", "run it", "start building", "proceed")
+                        _lower = task_text.lower().strip()
+                        if any(kw in _lower for kw in _exec_kws):
+                            awaiting_build = False
+                            _cancel_ack_sent = False
+                            _agent_task = asyncio.create_task(
+                                _run_build_bg(pending_task or task_text, pending_plan, pending_images or [], editor_context=editor_context)
+                            )
+                            return
+
                     # If user has a pending plan (didn't press Build), inject plan into context so
                     # follow-up questions ("change step 2 to...") have the plan in scope.
                     task_for_run = task_text
@@ -1096,11 +1212,15 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                         agent.service.model_id = app_config.fast_model
                         logger.info(f"Smart routing: using fast model for {complexity} task")
 
-                    # Smart scout skip: if auto-context includes active file and task is targeted, skip scout
+                    # Smart scout skip: if auto-context already provides structure or semantic context, skip scout
                     enable_scout = intent.get("scout", True)
-                    if auto_ctx and active_file_in_context(auto_ctx) and not intent.get("explore", False):
+                    if auto_ctx and (
+                        active_file_in_context(auto_ctx)
+                        or "<project_structure>" in auto_ctx
+                        or "<semantic_context>" in auto_ctx
+                    ):
                         enable_scout = False
-                        logger.info("Smart scout skip: auto-context provides sufficient file context")
+                        logger.info("Smart scout skip: auto-context provides sufficient context")
 
                     await wsr.send_json({"type": "phase_start", "content": "direct"})
                     try:
@@ -1309,15 +1429,15 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             try:
                 # Re-send init + replay so the frontend rebuilds the chat
                 mcfg = get_model_config(model_config.model_id)
-                if is_ssh and _ssh_info:
-                    display_wd = f"{_ssh_info['user']}@{_ssh_info['host']}:{_ssh_info['directory']}"
+                if is_ssh and _state._ssh_info:
+                    display_wd = f"{_state._ssh_info['user']}@{_state._ssh_info['host']}:{_state._ssh_info['directory']}"
                 else:
                     display_wd = wd
                 await wsr.send_json({
                     "type": "init",
                     "model_name": get_model_name(model_config.model_id),
                     "working_directory": display_wd,
-                    "context_window": mcfg.get("context_window", 0),
+                    "context_window": get_context_window(model_config.model_id),
                     "thinking": supports_thinking(model_config.model_id),
                     "caching": supports_caching(model_config.model_id),
                     "session_id": session.session_id if session else "",
@@ -1388,6 +1508,16 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             _agent_task.cancel()
         logger.exception(f"WebSocket error: {e}")
         save_session()
+        _state._active_agent = None
+        if session and session.session_id:
+            _active_save_fns.pop(session.session_id, None)
+    finally:
+        # Unconditional last-resort save — catches CancelledError (Ctrl+C)
+        # and any path that might skip save_session() above.
+        try:
+            save_session()
+        except Exception:
+            pass
         _state._active_agent = None
         if session and session.session_id:
             _active_save_fns.pop(session.session_id, None)

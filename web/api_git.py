@@ -16,7 +16,7 @@ from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
 from backend import Backend, LocalBackend
-from web.state import _backend, _working_directory
+import web.state as _state
 
 logger = logging.getLogger(__name__)
 
@@ -65,15 +65,15 @@ def _parse_git_status_porcelain(stdout: str) -> Dict[str, str]:
 @router.get("/api/git-status")
 async def api_git_status():
     """Return git status for the project. Path -> 'M'|'A'|'D'|'U'. Empty if not a git repo or SSH."""
-    if _backend is None:
+    if _state._backend is None:
         return {"status": {}}
-    if getattr(_backend, "_host", None) is not None:
+    if getattr(_state._backend, "_host", None) is not None:
         # SSH: support multiple repos — find all .git, run git status in each, merge with workspace-relative paths
         try:
-            wd = _backend.working_directory.rstrip("/")
+            wd = _state._backend.working_directory.rstrip("/")
             # 1) If workspace is inside a repo, use that repo first
             out_root, err_root, rc_root = await asyncio.to_thread(
-                _backend.run_command, "git rev-parse --show-toplevel 2>/dev/null", ".", 5
+                _state._backend.run_command, "git rev-parse --show-toplevel 2>/dev/null", ".", 5
             )
             repo_roots = []  # list of (repo_root_abs, repo_rel_to_wd)
             if rc_root == 0 and out_root and out_root.strip():
@@ -84,7 +84,7 @@ async def api_git_status():
                     repo_roots.append((repo_root, posixpath.relpath(repo_root, wd).replace("\\", "/")))
             # 2) Find all .git in subdirs (multiple repos under workspace)
             find_out, _, _ = await asyncio.to_thread(
-                _backend.run_command, "find . -maxdepth 5 -type d -name .git 2>/dev/null", ".", 5
+                _state._backend.run_command, "find . -maxdepth 5 -type d -name .git 2>/dev/null", ".", 5
             )
             seen_rel = set()
             for line in (find_out or "").strip().splitlines():
@@ -99,7 +99,7 @@ async def api_git_status():
                     continue
                 seen_rel.add(repo_root_rel)
                 out_abs, _, rc_abs = await asyncio.to_thread(
-                    _backend.run_command, "cd " + shlex.quote(repo_root_rel) + " && pwd", ".", 5
+                    _state._backend.run_command, "cd " + shlex.quote(repo_root_rel) + " && pwd", ".", 5
                 )
                 if rc_abs == 0 and out_abs and out_abs.strip():
                     repo_abs = out_abs.strip().rstrip("/")
@@ -109,7 +109,7 @@ async def api_git_status():
             if len(repo_roots) == 1 and repo_roots[0][1] is None:
                 repo_root = repo_roots[0][0]
                 out, err, rc = await asyncio.to_thread(
-                    _backend.run_command, "git status --porcelain", repo_root, 10
+                    _state._backend.run_command, "git status --porcelain", repo_root, 10
                 )
                 if rc != 0:
                     return {"status": {}, "error": (err or "").strip() or f"exit {rc}"}
@@ -121,7 +121,7 @@ async def api_git_status():
             # 3) No repos found: try git status from workspace (e.g. workspace is repo root)
             if not repo_roots:
                 out, err, rc = await asyncio.to_thread(
-                    _backend.run_command, "git status --porcelain", ".", 10
+                    _state._backend.run_command, "git status --porcelain", ".", 10
                 )
                 if rc == 0 and out:
                     return {"status": _parse_git_status_porcelain(out)}
@@ -130,7 +130,7 @@ async def api_git_status():
             merged = {}
             for repo_abs, repo_rel in repo_roots:
                 out, err, rc = await asyncio.to_thread(
-                    _backend.run_command, "git status --porcelain", repo_abs, 10
+                    _state._backend.run_command, "git status --porcelain", repo_abs, 10
                 )
                 if rc != 0:
                     continue
@@ -151,9 +151,9 @@ async def api_git_status():
             return {"status": {}, "error": str(e)}
     # Local: support multiple repos — find all .git under workspace, run git status in each, merge
     try:
-        wd = os.path.realpath(_backend.working_directory.rstrip(os.sep))
+        wd = os.path.realpath(_state._backend.working_directory.rstrip(os.sep))
         out_root, _, rc_root = await asyncio.to_thread(
-            _backend.run_command, "git rev-parse --show-toplevel 2>/dev/null", ".", 5
+            _state._backend.run_command, "git rev-parse --show-toplevel 2>/dev/null", ".", 5
         )
         repo_roots = []  # list of (repo_abs, repo_rel_to_wd or None if wd inside repo)
         if rc_root == 0 and out_root and out_root.strip():
@@ -176,7 +176,7 @@ async def api_git_status():
                     repo_roots.append((repo_abs, rel if rel != "." else None))
         if not repo_roots:
             out, err, rc = await asyncio.to_thread(
-                _backend.run_command, "git status --porcelain", ".", 10
+                _state._backend.run_command, "git status --porcelain", ".", 10
             )
             if rc == 0 and out:
                 return {"status": _parse_git_status_porcelain(out)}
@@ -184,7 +184,7 @@ async def api_git_status():
         merged = {}
         for repo_abs, repo_rel in repo_roots:
             out, err, rc = await asyncio.to_thread(
-                _backend.run_command, "git status --porcelain", repo_abs, 10
+                _state._backend.run_command, "git status --porcelain", repo_abs, 10
             )
             if rc != 0:
                 continue
@@ -205,28 +205,28 @@ async def api_git_status():
 @router.get("/api/git-file-diff")
 async def api_git_file_diff(path: str = Query(...)):
     """Return original (HEAD) and current (working tree) content for a file. For inline git diffs."""
-    if _backend is None:
+    if _state._backend is None:
         return JSONResponse({"error": "No project"}, status_code=400)
     path = (path or "").strip()
     if ".." in path or path.startswith("/"):
         return JSONResponse({"error": "Invalid path"}, status_code=400)
-    wd = _backend.working_directory
+    wd = _state._backend.working_directory
     try:
-        current = await asyncio.to_thread(_backend.read_file, path)
+        current = await asyncio.to_thread(_state._backend.read_file, path)
     except FileNotFoundError:
         current = ""
     original = ""
     try:
-        if getattr(_backend, "_host", None) is not None:
+        if getattr(_state._backend, "_host", None) is not None:
             # SSH: run git show; path is workspace-relative (may be in nested repo)
             cmd = "git show HEAD:" + shlex.quote(path)
             out, err, rc = await asyncio.to_thread(
-                _backend.run_command, cmd, ".", 5
+                _state._backend.run_command, cmd, ".", 5
             )
             if rc != 0 or out is None:
                 # Find which repo contains this path (multiple repos: use innermost match)
                 find_out, _, _ = await asyncio.to_thread(
-                    _backend.run_command, "find . -maxdepth 5 -type d -name .git 2>/dev/null", ".", 5
+                    _state._backend.run_command, "find . -maxdepth 5 -type d -name .git 2>/dev/null", ".", 5
                 )
                 candidates = []  # (repo_rel, path_in_repo)
                 for line in (find_out or "").strip().splitlines():
@@ -244,7 +244,7 @@ async def api_git_file_diff(path: str = Query(...)):
                 for _, repo_rel, path_in_repo in candidates:
                     cmd2 = "git show HEAD:" + shlex.quote(path_in_repo)
                     out2, _, rc2 = await asyncio.to_thread(
-                        _backend.run_command, cmd2, repo_rel if repo_rel != "." else ".", 5
+                        _state._backend.run_command, cmd2, repo_rel if repo_rel != "." else ".", 5
                     )
                     if rc2 == 0 and out2 is not None:
                         original = out2
@@ -319,32 +319,49 @@ def _parse_git_diff_numstat(stdout: str) -> List[Dict[str, Any]]:
 @router.get("/api/git-diff-stats")
 async def api_git_diff_stats():
     """Return per-file and total diff stats (additions/deletions) for working tree vs HEAD.
+    Uses ``git diff HEAD --numstat`` to capture both staged and unstaged changes,
+    and counts lines in untracked files so newly created files show accurate counts.
     Used by the Cursor-style modified files dropdown."""
-    if _backend is None:
+    if _state._backend is None:
         return {"files": [], "total_additions": 0, "total_deletions": 0}
-    wd = _backend.working_directory
+    wd = _state._backend.working_directory
     files: List[Dict[str, Any]] = []
     total_additions = 0
     total_deletions = 0
     try:
-        if getattr(_backend, "_host", None) is not None:
+        if getattr(_state._backend, "_host", None) is not None:
+            # --- SSH backend ---
             out, err, rc = await asyncio.to_thread(
-                _backend.run_command, "git diff --numstat", ".", 15
+                _state._backend.run_command, "git diff HEAD --numstat", ".", 15
             )
-            if rc != 0 or not out:
-                # Include untracked (e.g. new files) via status + diff
-                out2, _, _ = await asyncio.to_thread(
-                    _backend.run_command, "git status --porcelain", ".", 10
-                )
-                for line in (out2 or "").strip().splitlines():
-                    path = line[2:].lstrip().replace("\\", "/").strip()
-                    if path and " -> " not in path:
-                        files.append({"path": path, "additions": 0, "deletions": 0})
-            else:
+            if rc == 0 and out:
                 files = _parse_git_diff_numstat(out)
+            # Untracked files — get paths then count lines
+            ut_out, _, ut_rc = await asyncio.to_thread(
+                _state._backend.run_command,
+                "git ls-files --others --exclude-standard", ".", 10
+            )
+            if ut_rc == 0 and ut_out:
+                tracked_paths = {f["path"] for f in files}
+                for upath in ut_out.strip().splitlines():
+                    upath = upath.strip().replace("\\", "/")
+                    if not upath or upath in tracked_paths:
+                        continue
+                    wc_out, _, wc_rc = await asyncio.to_thread(
+                        _state._backend.run_command,
+                        "wc -l < " + shlex.quote(upath), ".", 5
+                    )
+                    lc = 0
+                    if wc_rc == 0 and wc_out:
+                        try:
+                            lc = int(wc_out.strip())
+                        except ValueError:
+                            pass
+                    files.append({"path": upath, "additions": lc, "deletions": 0})
         else:
+            # --- Local backend ---
             r = subprocess.run(
-                ["git", "diff", "--numstat"],
+                ["git", "diff", "HEAD", "--numstat"],
                 cwd=wd,
                 capture_output=True,
                 text=True,
@@ -352,21 +369,28 @@ async def api_git_diff_stats():
             )
             if r.returncode == 0 and r.stdout:
                 files = _parse_git_diff_numstat(r.stdout)
-            else:
-                # Fallback: list from status so we at least show modified paths
-                r2 = subprocess.run(
-                    ["git", "status", "--porcelain"],
-                    cwd=wd,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                if r2.returncode == 0 and r2.stdout:
-                    for line in r2.stdout.strip().splitlines():
-                        if len(line) >= 3:
-                            path = line[2:].lstrip().split(" -> ")[-1].strip().replace("\\", "/")
-                            if path:
-                                files.append({"path": path, "additions": 0, "deletions": 0})
+            # Untracked files — get paths then count lines
+            r_ut = subprocess.run(
+                ["git", "ls-files", "--others", "--exclude-standard"],
+                cwd=wd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if r_ut.returncode == 0 and r_ut.stdout:
+                tracked_paths = {f["path"] for f in files}
+                for upath in r_ut.stdout.strip().splitlines():
+                    upath = upath.strip().replace("\\", "/")
+                    if not upath or upath in tracked_paths:
+                        continue
+                    full = os.path.join(wd, upath)
+                    lc = 0
+                    try:
+                        with open(full, "r", errors="replace") as fh:
+                            lc = sum(1 for _ in fh)
+                    except (OSError, UnicodeDecodeError):
+                        pass
+                    files.append({"path": upath, "additions": lc, "deletions": 0})
         for f in files:
             total_additions += f.get("additions", 0)
             total_deletions += f.get("deletions", 0)

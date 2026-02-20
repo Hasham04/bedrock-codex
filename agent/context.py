@@ -11,6 +11,7 @@ from typing import Dict, List, Any, Optional
 from pathlib import Path
 
 from config import app_config
+from tools.schemas import NATIVE_EDITOR_NAME, NATIVE_BASH_NAME, EDITOR_WRITE_COMMANDS
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +33,12 @@ class ContextMixin:
         self._current_plan_decomposition: List[Dict[str, Any]] = []
         self._plan_file_path: str = ""
         self._plan_text: str = ""
+        self._plan_title: str = ""
         self._plan_step_index: int = 0
 
-        # Scout context for sharing between phases
+        # Context for sharing between phases
         self._scout_context: str = ""
+        self._plan_context_summary: str = ""
 
         # Session management
         self._session_checkpoints: List[Dict[str, Any]] = []
@@ -76,8 +79,10 @@ class ContextMixin:
         self._current_plan_decomposition = []
         self._plan_file_path = ""
         self._plan_text = ""
+        self._plan_title = ""
         self._plan_step_index = 0
         self._scout_context = ""
+        self._plan_context_summary = ""
         self._session_checkpoints = []
         self._checkpoint_counter = 0
         self._step_checkpoints = {}
@@ -93,7 +98,11 @@ class ContextMixin:
     def _snapshot_file(self, tool_name: str, tool_input: Dict[str, Any]) -> None:
         """Capture the original content of a file before it's modified.
         Only snapshots once per file per build run — first write wins."""
-        if tool_name not in ("Write", "Edit", "symbol_edit"):
+        is_native_write = (
+            tool_name == NATIVE_EDITOR_NAME
+            and tool_input.get("command") in EDITOR_WRITE_COMMANDS
+        )
+        if not is_native_write and tool_name != "symbol_edit":
             return
 
         rel_path = tool_input.get("path", "")
@@ -268,12 +277,17 @@ class ContextMixin:
 
     def _approval_key(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
         """Return a hashable key that uniquely identifies an operation for approval purposes."""
-        if tool_name == "Bash":
+        if tool_name == NATIVE_BASH_NAME:
             return f"cmd:{tool_input.get('command', '')}"
-        elif tool_name in ("Write", "Edit", "symbol_edit"):
+        is_file_tool = (
+            (tool_name == NATIVE_EDITOR_NAME and tool_input.get("command") in EDITOR_WRITE_COMMANDS)
+            or tool_name == "symbol_edit"
+        )
+        if is_file_tool:
             path = tool_input.get("path", "")
             resolved = self.backend.resolve_path(path)
-            return f"{tool_name}:{self._backend_id}:{resolved}"
+            cmd = tool_input.get("command", tool_name)
+            return f"{cmd}:{self._backend_id}:{resolved}"
         return f"{tool_name}:{json.dumps(tool_input, sort_keys=True)}"
 
     def was_previously_approved(self, tool_name: str, tool_input: Dict[str, Any]) -> bool:
@@ -294,7 +308,7 @@ class ContextMixin:
         """Collect contextual reminders based on current agent state.
 
         These are injected into the system prompt to nudge the model
-        toward better behavior, similar to Claude Code's 40+ reminders.
+        toward better behavior based on the current situation.
         """
         reminders: List[str] = []
 
@@ -302,9 +316,13 @@ class ContextMixin:
         if self._current_plan and self._current_plan_decomposition:
             total_steps = len(self._current_plan_decomposition)
             if self._plan_step_index < total_steps:
-                reminders.append("There is an active implementation plan. Follow the plan steps in order.")
+                remaining = total_steps - self._plan_step_index
+                reminders.append(
+                    f"Active plan: step {self._plan_step_index + 1}/{total_steps} "
+                    f"({remaining} remaining). Follow plan steps in order. Note any deviations."
+                )
             else:
-                reminders.append("The current implementation plan is complete. Verify all changes work correctly.")
+                reminders.append("Implementation plan is complete. Verify all changes work correctly before finishing.")
 
         # File modification tracking
         if self._file_snapshots:
@@ -316,6 +334,29 @@ class ContextMixin:
                     msg += f" and {new_count} new file(s)"
                 msg += ". The user can keep or revert these changes."
                 reminders.append(msg)
+
+        # Remind about todos that may need attention
+        if self._todos:
+            in_progress = [t for t in self._todos if t.get("status") == "in_progress"]
+            pending = [t for t in self._todos if t.get("status") == "pending"]
+            if in_progress:
+                reminders.append(f"You have {len(in_progress)} task(s) in progress. Complete them before starting new work.")
+            elif pending and not in_progress:
+                reminders.append(f"You have {len(pending)} pending task(s). Set one to in_progress and begin.")
+
+        # Token budget awareness — nudge conciseness when context is getting large
+        if self._total_input_tokens > 150_000:
+            reminders.append(
+                "Context window is getting large. Be concise in tool calls — "
+                "use offset/limit for reads, avoid re-reading files already in context."
+            )
+
+        # Remind to run tests when files have been modified and a test command is known
+        if self._file_snapshots and self._memory.get("test_cmd"):
+            reminders.append(
+                f"You have modified {len(self._file_snapshots)} file(s) and know the test command. "
+                "Run tests to verify your changes before finishing."
+            )
 
         return reminders
 
@@ -389,6 +430,7 @@ class ContextMixin:
             "current_plan_decomposition": self._current_plan_decomposition,
             "plan_file_path": self._plan_file_path,
             "plan_text": self._plan_text,
+            "plan_title": self._plan_title,
             "scout_context": self._scout_context,
             "file_snapshots": snapshots,
             "session_checkpoints": checkpoints,
@@ -429,6 +471,7 @@ class ContextMixin:
         self._current_plan = data.get("current_plan", "")
         self._plan_file_path = data.get("plan_file_path", "")
         self._plan_text = data.get("plan_text", "")
+        self._plan_title = data.get("plan_title", "")
         self._scout_context = data.get("scout_context", "")
         self._plan_step_index = int(data.get("plan_step_index", 0))
         self._deterministic_verification_done = bool(data.get("deterministic_verification_done", False))
@@ -470,3 +513,8 @@ class ContextMixin:
         raw_snapshots = data.get("file_snapshots", {})
         if isinstance(raw_snapshots, dict):
             self._file_snapshots = dict(raw_snapshots)
+
+        # Validate history structure after restore — fix orphaned tool_use blocks
+        # that may have been persisted from a mid-stream-failure save.
+        if hasattr(self, '_repair_history'):
+            self._repair_history()

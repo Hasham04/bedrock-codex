@@ -11,16 +11,47 @@ import queue
 import re
 import threading
 import time
+from collections import defaultdict
 from typing import List, Dict, Any, Optional, Callable, Awaitable
 
 from bedrock_service import GenerationConfig, BedrockError
-from tools import TOOL_DEFINITIONS, SAFE_TOOLS, execute_tool, ToolResult, ASK_USER_QUESTION_DEFINITION
+from tools import (
+    TOOL_DEFINITIONS, SAFE_TOOLS, execute_tool, ToolResult, ASK_USER_QUESTION_DEFINITION,
+    NATIVE_EDITOR_NAME, NATIVE_BASH_NAME, NATIVE_WEB_SEARCH_NAME, EDITOR_WRITE_COMMANDS,
+)
 from config import app_config, get_context_window
 
 from .events import AgentEvent
 
 logger = logging.getLogger(__name__)
 _PATH_RE = re.compile(r'"path"\s*:\s*"([^"]+)"')
+
+
+# ---------------------------------------------------------------------------
+# Native tool classification helpers
+# ---------------------------------------------------------------------------
+
+def _is_file_write_tool(tu: Dict[str, Any]) -> bool:
+    """True if this tool_use performs a file-modifying operation."""
+    name = tu.get("name", "")
+    if name == NATIVE_EDITOR_NAME:
+        return tu.get("input", {}).get("command") in EDITOR_WRITE_COMMANDS
+    return name == "symbol_edit"
+
+
+def _is_file_read_tool(tu: Dict[str, Any]) -> bool:
+    """True if this tool_use is a read-only file view."""
+    return (tu.get("name", "") == NATIVE_EDITOR_NAME
+            and tu.get("input", {}).get("command") == "view")
+
+
+def _is_bash_tool(name: str) -> bool:
+    return name == NATIVE_BASH_NAME
+
+
+def _get_tool_path(tu: Dict[str, Any]) -> str:
+    """Extract the file path from a tool_use block (works for native + custom tools)."""
+    return tu.get("input", {}).get("path", "?")
 
 
 class ExecutionMixin:
@@ -95,7 +126,7 @@ class ExecutionMixin:
                 })
 
             # Trim history if approaching context window limit
-            self._trim_history()
+            await self._trim_history()
 
             # Validate history — fix orphaned tool_use blocks
             self._repair_history()
@@ -106,6 +137,7 @@ class ExecutionMixin:
             max_retries = app_config.stream_max_retries
             retry_backoff = app_config.stream_retry_backoff
             stream_succeeded = False
+            _guidance_interrupted = False
 
             # Snapshot token counters so we can rollback on retry
             snapshot_input = self._total_input_tokens
@@ -124,6 +156,8 @@ class ExecutionMixin:
                     current_text = ""
                     current_thinking = ""
                     current_thinking_signature: Optional[str] = None
+                    server_tool_block: Optional[Dict[str, Any]] = None
+                    web_search_result_block: Optional[Dict[str, Any]] = None
 
                     # Rollback token counters to pre-attempt snapshot
                     self._total_input_tokens = snapshot_input
@@ -163,8 +197,12 @@ class ExecutionMixin:
 
                     # Consume chunks from the queue in the async loop
                     loop = asyncio.get_event_loop()
+                    _guidance_interrupted = False
                     while True:
                         if self._cancelled:
+                            break
+                        if self._guidance_interrupt:
+                            _guidance_interrupted = True
                             break
 
                         chunk = await loop.run_in_executor(None, chunk_queue.get)
@@ -279,6 +317,41 @@ class ExecutionMixin:
                                 ))
                                 current_tool_use = None
 
+                        # --- Server-side tool events (web_search) ---
+                        elif chunk_type == "server_tool_use_start":
+                            server_tool_data = chunk.get("data", {})
+                            server_tool_block = {
+                                "type": "server_tool_use",
+                                "id": server_tool_data.get("id", ""),
+                                "name": server_tool_data.get("name", ""),
+                                "input": server_tool_data.get("input", {}),
+                            }
+                            await on_event(AgentEvent(
+                                type="server_tool_use",
+                                content=server_tool_data.get("name", ""),
+                                data=server_tool_data,
+                            ))
+                        elif chunk_type == "server_tool_use_end":
+                            if server_tool_block:
+                                assistant_content.append(server_tool_block)
+                                server_tool_block = None
+                        elif chunk_type == "web_search_result":
+                            ws_data = chunk.get("data", {})
+                            web_search_result_block = {
+                                "type": "web_search_tool_result",
+                                "tool_use_id": ws_data.get("tool_use_id", ""),
+                                "content": ws_data.get("content", []),
+                            }
+                            await on_event(AgentEvent(
+                                type="web_search_result",
+                                content="",
+                                data=ws_data,
+                            ))
+                        elif chunk_type == "web_search_result_end":
+                            if web_search_result_block:
+                                assistant_content.append(web_search_result_block)
+                                web_search_result_block = None
+
                         # --- Usage / cache metrics ---
                         elif chunk_type == "usage_start":
                             usage = chunk.get("usage", {})
@@ -292,6 +365,19 @@ class ExecutionMixin:
                             last_stop_reason = chunk.get("stop_reason") or None
 
                     producer_thread.join(timeout=5)
+
+                    # If guidance arrived mid-stream, discard partial response and restart
+                    if _guidance_interrupted:
+                        assistant_content = []
+                        tool_calls = []
+                        current_text = ""
+                        current_tool_use = None
+                        await on_event(AgentEvent(
+                            type="guidance_interrupt",
+                            content="Guidance received — restarting with your correction.",
+                        ))
+                        break  # exit retry loop — will be caught below
+
                     stream_succeeded = True
                     self._history_len_at_last_call = len(self.history)
                     self._consecutive_stream_errors = 0
@@ -392,7 +478,7 @@ class ExecutionMixin:
                                 "Re-send your message or break the task into smaller steps."
                             )
                             try:
-                                self._trim_history()
+                                await self._trim_history()
                             except Exception:
                                 pass
                         else:
@@ -424,6 +510,10 @@ class ExecutionMixin:
             if self._cancelled:
                 await on_event(AgentEvent(type="cancelled"))
                 break
+
+            # Guidance interrupt — discard partial response, loop back so _consume_guidance picks it up
+            if _guidance_interrupted:
+                continue
 
             # Add assistant message to history (includes thinking blocks for continuity)
             if assistant_content:
@@ -489,8 +579,6 @@ class ExecutionMixin:
                             content="Requesting structured reasoning trace before completion...",
                         ))
                         continue
-                else:
-                    reasoning_trace_repairs = 0
 
                 # Deterministic verification gate before done (max 2 attempts)
                 if not hasattr(self, '_verification_gate_attempts'):
@@ -554,23 +642,17 @@ class ExecutionMixin:
             tool_results = await self._execute_tools_parallel(
                 tool_uses, on_event, request_approval, request_question_answer=request_question_answer
             )
-            reasoning_trace_repairs = 0
 
             # Cap tool results before they enter history (prevention > cure)
             capped_results = self._cap_tool_results(tool_results)
 
             # Post-edit verification nudge: if any write tools were used,
             # append a system hint reminding the model to verify its changes.
-            write_tools_used = {
-                tu.get("name") for tu in tool_uses
-                if tu.get("name") in ("Edit", "Write", "symbol_edit")
-            }
-            if write_tools_used:
-                modified_files = [
-                    tu.get("input", {}).get("path", "?")
-                    for tu in tool_uses
-                    if tu.get("name") in ("Edit", "Write", "symbol_edit")
-                ]
+            write_tool_uses = [tu for tu in tool_uses if _is_file_write_tool(tu)]
+            if write_tool_uses:
+                modified_files = [p for p in (_get_tool_path(tu) for tu in write_tool_uses) if p != "?"]
+                if not modified_files:
+                    modified_files = ["(unknown path)"]
                 files_str = ", ".join(modified_files)
                 verify_hint = {
                     "type": "text",
@@ -582,6 +664,18 @@ class ExecutionMixin:
                     ),
                 }
                 capped_results.append(verify_hint)
+
+            # Strategy escalation: detect repeated failures and suggest alternative approaches
+            escalation = self._suggest_strategy_escalation(capped_results)
+            if escalation:
+                capped_results.append({
+                    "type": "text",
+                    "text": f"[STRATEGY HINT]\n{escalation}",
+                })
+                await on_event(AgentEvent(
+                    type="strategy_escalation",
+                    content=escalation,
+                ))
 
             # Inject any pending user guidance alongside tool results
             mid_guidance = self._consume_guidance()
@@ -753,7 +847,7 @@ class ExecutionMixin:
 
             if not app_config.live_command_streaming:
                 return await loop.run_in_executor(
-                    None, lambda: execute_tool("Bash", tool_input, self.working_directory, backend=self.backend, extra_context={"todos": self._todos})
+                    None, lambda: execute_tool(NATIVE_BASH_NAME, tool_input, self.working_directory, backend=self.backend, extra_context={"todos": self._todos})
                 )
 
             partial_sent = {"value": False}
@@ -843,8 +937,8 @@ class ExecutionMixin:
                 name = tu["name"]
                 inp = tu["input"]
 
-                # File cache: return cached content for Read if file hasn't been modified
-                if name == "Read" and not inp.get("offset") and not inp.get("limit"):
+                # File cache: return cached content for view commands (no range) if file hasn't been modified
+                if _is_file_read_tool(tu) and not inp.get("view_range"):
                     path = inp.get("path", "")
                     cache_key = self._file_cache_key(path)
 
@@ -864,8 +958,8 @@ class ExecutionMixin:
                     None, lambda _tu=tu: execute_tool(_tu["name"], _tu["input"], self.working_directory, backend=self.backend, extra_context={"todos": self._todos})
                 )
 
-                # Cache successful full-file reads
-                if name == "Read" and result.success and not inp.get("offset") and not inp.get("limit"):
+                # Cache successful full-file views
+                if _is_file_read_tool(tu) and result.success and not inp.get("view_range"):
                     path = inp.get("path", "")
                     cache_key = self._file_cache_key(path)
                     self._file_cache[cache_key] = (result.output, time.time())
@@ -903,12 +997,10 @@ class ExecutionMixin:
         #   Commands: require explicit approval unless configured otherwise.
         if dangerous_calls:
             file_write_calls = [
-                tu for tu in dangerous_calls
-                if tu["name"] in ("Write", "Edit", "symbol_edit")
+                tu for tu in dangerous_calls if _is_file_write_tool(tu)
             ]
             command_calls = [
-                tu for tu in dangerous_calls
-                if tu["name"] not in ("Write", "Edit", "symbol_edit")
+                tu for tu in dangerous_calls if not _is_file_write_tool(tu)
             ]
 
             # Policy engine + explicit approvals for risky file writes
@@ -997,26 +1089,32 @@ class ExecutionMixin:
                         )
 
                         # ── Auto-retry on edit failure ──
-                        # If Edit failed with "not found" or "multiple occurrences",
+                        # If str_replace failed with "not found" or "multiple occurrences",
                         # re-read the file and include content in the error for immediate retry
-                        if not result.success and tu["name"] == "Edit":
+                        _is_str_replace = (
+                            tu["name"] == NATIVE_EDITOR_NAME
+                            and tu["input"].get("command") == "str_replace"
+                        )
+                        if not result.success and _is_str_replace:
                             err = result.error or ""
                             if "not found" in err.lower() or "occurrences" in err.lower():
                                 path = tu["input"].get("path", "")
                                 try:
                                     fresh = await loop.run_in_executor(
                                         None, lambda: execute_tool(
-                                            "Read", {"path": path},
+                                            NATIVE_EDITOR_NAME, {"command": "view", "path": path},
                                             self.working_directory, backend=self.backend,
                                             extra_context={"todos": self._todos},
                                         )
                                     )
                                     if fresh.success:
-                                        # Cap to avoid blowing context
                                         content = fresh.output
-                                        if len(content) > 8000:
+                                        ctx_factor = max(get_context_window(self.service.model_id) / 200_000, 1.0)
+                                        auto_read_cap = int(8000 * ctx_factor)
+                                        auto_read_lines = int(150 * ctx_factor)
+                                        if len(content) > auto_read_cap:
                                             lines = content.split("\n")
-                                            content = "\n".join(lines[:150]) + f"\n... ({len(lines) - 150} lines omitted)"
+                                            content = "\n".join(lines[:auto_read_lines]) + f"\n... ({len(lines) - auto_read_lines} lines omitted)"
                                         result = ToolResult(
                                             success=False,
                                             output="",
@@ -1029,8 +1127,8 @@ class ExecutionMixin:
                                 except Exception:
                                     pass  # fall through with original error
 
-                        # ── Auto-lint after successful edit ──
-                        if result.success and tu["name"] in ("Edit", "Write", "symbol_edit"):
+                        # ── Auto-lint after successful file write ──
+                        if result.success and _is_file_write_tool(tu):
                             path = tu["input"].get("path", "")
                             try:
                                 lint_result = await loop.run_in_executor(
@@ -1060,10 +1158,12 @@ class ExecutionMixin:
 
                             # If this was a created file (snapshot was None), store content
                             # so Revert can bring the file back if the agent later deletes it
-                            if tu["name"] == "Write" and path:
+                            _is_create = (tu["name"] == NATIVE_EDITOR_NAME
+                                          and tu["input"].get("command") == "create")
+                            if _is_create and path:
                                 abs_path = self.backend.resolve_path(path)
                                 if self._file_snapshots.get(abs_path) is None:
-                                    written = tu["input"].get("content", "")
+                                    written = tu["input"].get("file_text", "") or tu["input"].get("content", "")
                                     if isinstance(written, str) and len(written) < 1_000_000:
                                         try:
                                             written.encode("utf-8")
@@ -1204,8 +1304,8 @@ class ExecutionMixin:
 
                     self.remember_approval(tool_name, tool_input)
 
-                # Emit command_start for Bash so the UI shows "running"
-                if tool_name == "Bash":
+                # Emit command_start for bash so the UI shows "running"
+                if _is_bash_tool(tool_name):
                     await on_event(AgentEvent(
                         type="command_start",
                         content=tool_input.get("command", "?"),
@@ -1225,7 +1325,7 @@ class ExecutionMixin:
                     ))
 
                 cmd_start = time.time()
-                if tool_name == "Bash":
+                if _is_bash_tool(tool_name):
                     result = await _run_command_with_streaming(tool_id, tool_input)
                 else:
                     result = await loop.run_in_executor(
@@ -1240,9 +1340,9 @@ class ExecutionMixin:
                     last_cp = self._session_checkpoints[-1].get("id", "latest")
                     result_text += f"\n\n[checkpoint] You can rewind with checkpoint id: {last_cp}"
 
-                # Extract exit code from Bash output
+                # Extract exit code from bash output
                 exit_code = None
-                if tool_name == "Bash":
+                if _is_bash_tool(tool_name):
                     ec_match = re.search(r"\[exit code: (\d+)\]", result_text)
                     if ec_match:
                         exit_code = int(ec_match.group(1))
@@ -1281,18 +1381,26 @@ class ExecutionMixin:
 
     def _format_tool_description(self, name: str, inputs: Dict) -> str:
         """Format a human-readable description of a tool call for approval"""
-        if name == "Write":
-            content = inputs.get("content", "")
-            line_count = content.count("\n") + 1
-            return f"Write {line_count} lines to {inputs.get('path', '?')}"
-        elif name == "Edit":
-            return f"Edit {inputs.get('path', '?')}: replace string"
+        if name == NATIVE_EDITOR_NAME:
+            cmd = inputs.get("command", "")
+            path = inputs.get("path", "?")
+            if cmd == "create":
+                content = inputs.get("file_text", "")
+                line_count = content.count("\n") + 1
+                return f"Create {path} ({line_count} lines)"
+            elif cmd == "str_replace":
+                return f"Edit {path}: replace string"
+            elif cmd == "insert":
+                return f"Insert into {path} at line {inputs.get('insert_line', '?')}"
+            elif cmd == "view":
+                return f"View {path}"
+            return f"Editor: {cmd} {path}"
         elif name == "symbol_edit":
             return (
                 f"Symbol edit {inputs.get('path', '?')}: "
                 f"{inputs.get('symbol', '?')} ({inputs.get('kind', 'all')})"
             )
-        elif name == "Bash":
+        elif name == NATIVE_BASH_NAME:
             return f"Run: {inputs.get('command', '?')}"
         elif name == "plan_review":
             step_count = len(inputs.get("plan_steps", []) or [])
@@ -1314,21 +1422,25 @@ class ExecutionMixin:
 
     def _adaptive_result_cap(self) -> int:
         """Return the max chars per tool result based on how full the context is.
-        Generous when there's room; tight when approaching the limit."""
+        Base caps scale proportionally with context window size so larger
+        windows (e.g. 1M tokens) get much more generous limits."""
         context_window = get_context_window(self.service.model_id)
         current = self._current_token_estimate()
         usage = current / context_window if context_window > 0 else 0
+        factor = max(context_window / 200_000, 1.0)
+        def _s(base: int) -> int:
+            return int(base * factor)
 
         if usage < 0.25:
-            return 50000   # ~14k tokens — very generous, full file reads
+            return _s(50000)
         elif usage < 0.40:
-            return 30000   # ~8.5k tokens — moderate
+            return _s(30000)
         elif usage < 0.55:
-            return 20000   # ~5.7k tokens — getting tighter
+            return _s(20000)
         elif usage < 0.70:
-            return 14000   # ~4k tokens — compact
+            return _s(14000)
         else:
-            return 8000    # ~2.3k tokens — tight, preserve room
+            return _s(8000)
 
 
     def _cap_tool_results(self, tool_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

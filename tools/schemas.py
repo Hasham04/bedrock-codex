@@ -7,53 +7,48 @@ from tools.search_ops import search, find_symbol, list_directory, glob_find, pro
 from tools.external_ops import run_command, semantic_retrieve, web_fetch, web_search, todo_write, todo_read
 
 
+# ---------------------------------------------------------------------------
+# Anthropic native tools (schema-less — Claude is trained on these)
+# ---------------------------------------------------------------------------
+
+NATIVE_TEXT_EDITOR: Dict[str, Any] = {
+    "type": "text_editor_20250728",
+    "name": "str_replace_based_edit_tool",
+}
+
+NATIVE_BASH: Dict[str, Any] = {
+    "type": "bash_20250124",
+    "name": "bash",
+}
+
+# Names used by native tools — needed for dispatch, approval, etc.
+NATIVE_EDITOR_NAME = "str_replace_based_edit_tool"
+NATIVE_BASH_NAME = "bash"
+NATIVE_WEB_SEARCH_NAME = "WebSearch"
+
+# Editor sub-commands that modify files (vs read-only "view")
+EDITOR_WRITE_COMMANDS = frozenset({"str_replace", "create", "insert"})
+
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
+    NATIVE_TEXT_EDITOR,
+    NATIVE_BASH,
     {
         "type": "custom",
-        "name": "Read",
-        "description": "Read the contents of a file with line numbers. You MUST read a file before editing it — never propose changes to code you haven't read. For large files (>500 lines), returns a structural overview (imports, classes, functions) plus head/tail; use offset and limit to read specific sections. Batch multiple file reads in ONE request (5-12 files) — they execute in parallel. It is okay to read a file that does not exist; an error will be returned. After semantic_retrieve results, use targeted reads with offset/limit on the returned file paths. NEVER use cat, head, or tail via Bash — always use this tool for reading files.",
+        "name": "WebSearch",
+        "description": "Search the web for current information. Returns top results with title, URL, and snippet. Use when you need up-to-date information, documentation, or to verify facts. Requires the duckduckgo-search package.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path relative to working directory. If the file does not exist, returns an error."},
-                "offset": {"type": "integer", "description": "Starting line number (1-indexed). Use with limit for targeted reading of large files."},
-                "limit": {"type": "integer", "description": "Number of lines to read from offset. Combine with offset for windowed reads."},
+                "query": {"type": "string", "description": "Search query string"},
+                "max_results": {"type": "integer", "description": "Number of results to return (default: 5, max: 10)"},
             },
-            "required": ["path"],
-        },
-    },
-    {
-        "type": "custom",
-        "name": "Write",
-        "description": "Create a new file or completely overwrite an existing file. Shows a diff of changes for existing files. ALWAYS prefer Edit for partial modifications — only use Write for NEW files or when more than 50% of the content changes. NEVER proactively create documentation files (README, CHANGELOG) unless explicitly asked. NEVER write files that contain secrets (.env, credentials). After writing, run lint_file to verify no syntax errors. Creates parent directories automatically if needed. NEVER use echo/heredoc via Bash to create files — always use this tool.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path relative to working directory. Parent directories are created if needed."},
-                "content": {"type": "string", "description": "The full content to write. For existing files, a diff is shown."},
-            },
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "type": "custom",
-        "name": "Edit",
-        "description": "Make a targeted edit by replacing an exact string in a file. The old_string must match EXACTLY one location including all whitespace and indentation. Include 3-5 lines of surrounding context to ensure uniqueness. If it fails with 'multiple occurrences', either add more context lines OR set replace_all=true to replace every occurrence (ideal for renames). If it fails with 'not found', re-read the file — content may have changed. After editing, run lint_file to verify. NEVER use sed/awk — always use this tool.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path (relative to working directory)"},
-                "old_string": {"type": "string", "description": "The exact string to find (must be unique unless replace_all is true)"},
-                "new_string": {"type": "string", "description": "The replacement string"},
-                "replace_all": {"type": "boolean", "description": "If true, replace ALL occurrences of old_string in the file. Use for renames and bulk replacements. Default: false."},
-            },
-            "required": ["path", "old_string", "new_string"],
+            "required": ["query"],
         },
     },
     {
         "type": "custom",
         "name": "symbol_edit",
-        "description": "Perform a symbol-aware edit of a function/class/type definition block using AST parsing (Python) or tree-sitter (JS/TS) with regex fallback. Safer than plain Edit for replacing entire function or class bodies. Use kind=function|class|all to narrow the match. Use occurrence when multiple symbols share the same name (e.g. overloaded methods). Always read the file first to verify the symbol exists.",
+        "description": "Perform a symbol-aware edit of a function/class/type definition block using AST parsing (Python) or tree-sitter (JS/TS) with regex fallback. Safer than plain str_replace for replacing entire function or class bodies. Use kind=function|class|all to narrow the match. Use occurrence when multiple symbols share the same name (e.g. overloaded methods). Always read the file first to verify the symbol exists.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -64,19 +59,6 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "occurrence": {"type": "integer", "description": "1-based match index if multiple symbols share same name"},
             },
             "required": ["path", "symbol", "new_string"],
-        },
-    },
-    {
-        "type": "custom",
-        "name": "Bash",
-        "description": "Execute a shell command in the working directory. Use for: running tests, installing packages, git operations, builds, and system commands that have no dedicated tool. Always check both stdout and stderr. Non-zero exit codes indicate failure — diagnose the error rather than retrying blindly. NEVER use Bash for file operations that have dedicated tools: use Read (not cat/head/tail), Edit (not sed/awk), Write (not echo/heredoc), search (not grep/rg), Glob (not find). When chaining dependent commands, use && (not ;). Set timeout for long-running processes. Output is capped at 20K chars with head/tail preserved.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "The shell command to execute. Use && to chain dependent commands."},
-                "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30). Increase for builds, test suites."},
-            },
-            "required": ["command"],
         },
     },
     {
@@ -168,7 +150,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "find_symbol",
-        "description": "Symbol-aware navigation — finds definitions and references using language-aware patterns (Python, JS/TS, Java, Rust, Go). Use BEFORE editing ambiguous symbols to see all locations where a symbol is defined or used. Essential for safe refactoring: shows every call site before you rename or modify. Use kind='definition' to find where it's declared, kind='reference' for usages, kind='all' for both.",
+        "description": "Symbol-aware navigation — finds definitions and references using language-aware patterns (Python, JS/TS, Java, Rust, Go). CRITICAL for safe refactoring: before modifying ANY public function, class, or type, use this to find ALL call sites. Use kind='definition' to find where it's declared, kind='reference' for usages, kind='all' for both. In large codebases, a function may have dozens of callers across many files — modifying it without checking references is the #1 cause of breaking changes. When find_symbol returns >10 reference sites, consider whether your change needs a different strategy (additive change, wrapper, phased migration).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -220,7 +202,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "custom",
         "name": "lint_file",
-        "description": "Auto-detect and run the project's linter/type-checker on a file. Supports: ruff/flake8/py_compile (Python), tsc (TypeScript), eslint (JavaScript), cargo check (Rust), go vet (Go), ruby -c (Ruby), bash -n (Shell). Run after EVERY edit to catch syntax errors, type errors, and style violations before moving on. If linting reveals errors you introduced, fix them immediately.",
+        "description": "Auto-detect and run the project's linter/type-checker on a file. Supports: ruff/flake8/py_compile (Python), tsc (TypeScript), eslint (JavaScript), cargo check (Rust), go vet (Go), ruby -c (Ruby), bash -n (Shell). MANDATORY after EVERY edit — never skip this, even for 'small' changes. Batch lint calls: after editing 3 files, call lint_file on all 3 in one response. If linting reveals errors you introduced, fix them immediately before proceeding. After editing a file that EXPORTS interfaces (functions, classes, types used by other files), also lint the direct consumers to catch type errors or import breakage that only manifest in the importing file.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -242,37 +224,32 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "required": ["url"],
         },
     },
-    {
-        "type": "custom",
-        "name": "WebSearch",
-        "description": "Search the web for current information. Use when you need up-to-date docs, error messages, library APIs, or general lookup that may not be in your training data. Returns relevant snippets and links. Be specific in queries — include version numbers and dates when relevant. Prefer WebFetch when you have a specific known URL.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query (e.g. 'python asyncio timeout best practice')"},
-                "max_results": {"type": "integer", "description": "Max results to return (default 5, max 10)"},
-            },
-            "required": ["query"],
-        },
-    },
 ]
 
 
-# Map API/implementation names to canonical tool names
+# Map legacy/API names to canonical tool names (for backward compat)
 TOOL_NAME_NORMALIZE = {
-    "read_file": "Read",
-    "write_file": "Write",
-    "edit_file": "Edit",
+    "read_file": NATIVE_EDITOR_NAME,
+    "write_file": NATIVE_EDITOR_NAME,
+    "edit_file": NATIVE_EDITOR_NAME,
     "glob_find": "Glob",
-    "run_command": "Bash",
+    "run_command": NATIVE_BASH_NAME,
+    # Legacy names from old tool definitions / saved sessions
+    "Read": NATIVE_EDITOR_NAME,
+    "Write": NATIVE_EDITOR_NAME,
+    "Edit": NATIVE_EDITOR_NAME,
+    "Bash": NATIVE_BASH_NAME,
+    "WebSearch": NATIVE_WEB_SEARCH_NAME,
+    "web_search": NATIVE_WEB_SEARCH_NAME,
 }
 
 
 TOOL_IMPLEMENTATIONS = {
-    "Read": read_file,
-    "Write": write_file,
-    "Edit": edit_file,
-    "Bash": run_command,
+    # Native tools are dispatched through execute_tool with special routing
+    NATIVE_EDITOR_NAME: None,   # Handled by dispatch.py routing logic
+    NATIVE_BASH_NAME: None,     # Handled by dispatch.py routing logic
+    # Custom tools
+    "WebSearch": web_search,
     "Glob": glob_find,
     "symbol_edit": symbol_edit,
     "search": search,
@@ -282,15 +259,23 @@ TOOL_IMPLEMENTATIONS = {
     "lint_file": lint_file,
     "semantic_retrieve": semantic_retrieve,
     "WebFetch": web_fetch,
-    "WebSearch": web_search,
     "TodoWrite": todo_write,
     "TodoRead": todo_read,
 }
 
-TOOLS_REQUIRING_APPROVAL = {"Write", "Edit", "symbol_edit", "Bash"}
-SAFE_TOOLS = {"Read", "search", "find_symbol", "list_directory", "project_tree", "Glob", "lint_file", "semantic_retrieve", "WebFetch", "WebSearch", "TodoWrite", "TodoRead"}
+TOOLS_REQUIRING_APPROVAL = {NATIVE_EDITOR_NAME, NATIVE_BASH_NAME, "symbol_edit"}
+SAFE_TOOLS = {
+    NATIVE_WEB_SEARCH_NAME,
+    "search", "find_symbol", "list_directory", "project_tree", "Glob",
+    "lint_file", "semantic_retrieve", "WebFetch", "TodoWrite", "TodoRead",
+}
+# Note: str_replace_based_edit_tool with command="view" is safe (read-only),
+# but the tool as a whole can also write, so it stays in TOOLS_REQUIRING_APPROVAL.
+# The dispatch/execution layer handles the view-is-safe exception.
+
 SCOUT_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
-    t for t in TOOL_DEFINITIONS if t["name"] in SAFE_TOOLS
+    t for t in TOOL_DEFINITIONS
+    if t.get("name") in SAFE_TOOLS or t.get("name") == NATIVE_EDITOR_NAME
 ]
 
 ASK_USER_QUESTION_DEFINITION: Dict[str, Any] = {

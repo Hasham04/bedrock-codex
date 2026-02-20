@@ -3,6 +3,7 @@ Session and project management REST API endpoints.
 """
 
 import asyncio
+import json
 import logging
 import os
 import posixpath
@@ -24,14 +25,32 @@ from config import (
     supports_caching,
 )
 from web.state import (
-    _working_directory, _backend, _explicit_dir, _user_opened_project,
-    _ssh_info, STATIC_DIR, _BOOT_TS,
+    STATIC_DIR, _BOOT_TS, _LAST_PROJECT_FILE,
 )
 import web.state as _state
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _persist_last_project(path: str) -> None:
+    """Write last-opened project path to disk."""
+    try:
+        os.makedirs(os.path.dirname(_LAST_PROJECT_FILE), exist_ok=True)
+        with open(_LAST_PROJECT_FILE, "w") as f:
+            json.dump({"path": path}, f)
+    except Exception:
+        pass
+
+
+def _load_last_project() -> Optional[str]:
+    """Read last-opened project path from disk."""
+    try:
+        with open(_LAST_PROJECT_FILE) as f:
+            return json.load(f).get("path")
+    except Exception:
+        return None
 
 
 @router.get("/")
@@ -43,7 +62,8 @@ async def index():
         html = f.read()
     # Replace static version tags with the boot timestamp
     html = html.replace("style.css?v=", f"style.css?v={_BOOT_TS}&_v=")
-    html = html.replace("app.js?v=", f"app.js?v={_BOOT_TS}&_v=")
+    for _js in ("state", "utils", "explorer", "editor", "terminal", "chat", "ws", "welcome"):
+        html = html.replace(f"js/{_js}.js?v=", f"js/{_js}.js?v={_BOOT_TS}&_v=")
     resp = HTMLResponse(html)
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
@@ -52,26 +72,34 @@ async def index():
 @router.get("/api/info")
 async def info():
     """Return model and config info for the frontend."""
+    # If no explicit dir and no user-opened project yet, check persisted last project
+    if not _state._explicit_dir and not _state._user_opened_project:
+        last = _load_last_project()
+        if last and os.path.isdir(last):
+            _state._working_directory = last
+            _state._backend = LocalBackend(last)
+            _state._user_opened_project = True
+
     mcfg = get_model_config(model_config.model_id)
     return {
         "model_name": get_model_name(model_config.model_id),
         "model_id": model_config.model_id,
-        "context_window": mcfg.get("context_window", 0),
+        "context_window": get_context_window(model_config.model_id),
         "max_output_tokens": mcfg.get("max_output_tokens", 0),
         "thinking": supports_thinking(model_config.model_id),
         "caching": supports_caching(model_config.model_id),
-        "working_directory": os.path.abspath(_working_directory),
+        "working_directory": os.path.abspath(_state._working_directory),
         "plan_phase_enabled": app_config.plan_phase_enabled,
-        "show_welcome": not _explicit_dir and not _user_opened_project,
+        "show_welcome": not _state._explicit_dir and not _state._user_opened_project,
     }
 
 
 @router.get("/api/sessions")
 async def list_sessions():
     def _session_wd_key() -> str:
-        if _ssh_info is not None:
-            return _working_directory
-        return os.path.abspath(_working_directory)
+        if _state._ssh_info is not None:
+            return _state._working_directory
+        return os.path.abspath(_state._working_directory)
 
     store = SessionStore()
     sessions = store.list_sessions(_session_wd_key())
@@ -90,9 +118,9 @@ async def list_sessions():
 @router.post("/api/sessions/new")
 async def create_session(request: Request):
     def _session_wd_key() -> str:
-        if _ssh_info is not None:
-            return _working_directory
-        return os.path.abspath(_working_directory)
+        if _state._ssh_info is not None:
+            return _state._working_directory
+        return os.path.abspath(_state._working_directory)
 
     def _unique_name(store: SessionStore, wd_key: str, raw_name: str) -> str:
         base = (raw_name or "agent").strip() or "agent"
@@ -275,6 +303,7 @@ async def ssh_connect(request: Request):
         display = f"{user}@{host}:{directory}"
         logger.info(f"SSH connected to {display}")
         _state._user_opened_project = True
+        _persist_last_project(_state._working_directory)
         return {"ok": True, "path": _state._working_directory}
     except Exception as e:
         logger.error(f"SSH connection failed: {e}")
@@ -298,4 +327,5 @@ async def set_directory(body: dict):
     _state._backend = LocalBackend(resolved)
     _state._ssh_info = None  # Clear SSH info when switching to local
     _state._user_opened_project = True
+    _persist_last_project(resolved)
     return {"ok": True, "path": resolved}

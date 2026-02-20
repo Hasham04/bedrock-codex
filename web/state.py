@@ -18,6 +18,7 @@ from backend import Backend
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+_LAST_PROJECT_FILE = os.path.join(os.path.expanduser("~"), ".bedrock-codex", "last_project.json")
 
 # ============================================================
 # Globals
@@ -112,7 +113,14 @@ atexit.register(_atexit_save_all)
 _project_tree_cache: Dict[str, Tuple[float, str]] = {}
 _PROJECT_TREE_TTL = 60.0  # refresh every 60s
 
-_AUTO_CONTEXT_CHAR_BUDGET = 16000  # ~4000 tokens
+_AUTO_CONTEXT_CHAR_BUDGET = 16000  # base value for 200K context; see get_auto_context_budget()
+
+
+def get_auto_context_budget(model_id: str) -> int:
+    """Scale auto-context char budget with context window size."""
+    from config import get_context_window
+    factor = max(get_context_window(model_id) / 200_000, 1.0)
+    return int(_AUTO_CONTEXT_CHAR_BUDGET * factor)
 
 # Background codebase index — built once on first WS connect, then reused
 _bg_index_task: Optional[asyncio.Task] = None

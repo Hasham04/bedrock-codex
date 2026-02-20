@@ -20,7 +20,6 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 
 from backend import Backend, LocalBackend, SSHBackend
-from web.state import _backend, _working_directory
 import web.state as _state
 
 logger = logging.getLogger(__name__)
@@ -31,9 +30,9 @@ router = APIRouter()
 @router.get("/api/terminal-cwd")
 async def terminal_cwd():
     """Return current working directory for the integrated terminal (project root)."""
-    if _backend is None:
+    if _state._backend is None:
         return {"ok": False, "cwd": None}
-    return {"ok": True, "cwd": _backend.working_directory}
+    return {"ok": True, "cwd": _state._backend.working_directory}
 
 
 def _terminal_cwd_ok(backend, requested_cwd: str) -> Tuple[bool, str]:
@@ -71,7 +70,7 @@ def _terminal_cwd_ok(backend, requested_cwd: str) -> Tuple[bool, str]:
 @router.post("/api/terminal-run")
 async def terminal_run(request: Request):
     """Run a shell command in the given cwd (default project root). Returns stdout, stderr, returncode, cwd."""
-    if _backend is None:
+    if _state._backend is None:
         return JSONResponse({"ok": False, "error": "No project open. Open a local folder or connect via SSH first."}, status_code=400)
     try:
         body = await request.json()
@@ -81,13 +80,13 @@ async def terminal_run(request: Request):
     if not command:
         return JSONResponse({"ok": False, "error": "No command"}, status_code=400)
     requested_cwd = (body.get("cwd") or "").strip() or "."
-    ok, cwd = _terminal_cwd_ok(_backend, requested_cwd)
+    ok, cwd = _terminal_cwd_ok(_state._backend, requested_cwd)
     if not ok:
         return JSONResponse({"ok": False, "error": "Directory not under project root"}, status_code=400)
     timeout = min(int(body.get("timeout", 60)), 300)
     try:
         stdout, stderr, returncode = await asyncio.to_thread(
-            _backend.run_command, command, cwd, timeout
+            _state._backend.run_command, command, cwd, timeout
         )
         return {
             "ok": True,
@@ -105,7 +104,7 @@ async def terminal_run(request: Request):
 @router.post("/api/terminal-complete")
 async def terminal_complete(request: Request):
     """Return tab-completion candidates for the terminal. Body: prefix, cwd, type ('path'|'command')."""
-    if _backend is None:
+    if _state._backend is None:
         return JSONResponse({"ok": False, "error": "No project open."}, status_code=400)
     try:
         body = await request.json()
@@ -116,14 +115,14 @@ async def terminal_complete(request: Request):
     if complete_type not in ("path", "command"):
         complete_type = "path"
     requested_cwd = (body.get("cwd") or "").strip() or "."
-    ok, cwd = _terminal_cwd_ok(_backend, requested_cwd)
+    ok, cwd = _terminal_cwd_ok(_state._backend, requested_cwd)
     if not ok:
         return JSONResponse({"ok": False, "error": "Directory not under project root"}, status_code=400)
 
     try:
         if complete_type == "command":
             out, err, rc = await asyncio.to_thread(
-                _backend.run_command, "bash -c 'compgen -c'", cwd, 5
+                _state._backend.run_command, "bash -c 'compgen -c'", cwd, 5
             )
             candidates = [line for line in (out or "").splitlines() if line.strip()]
             if prefix:
@@ -141,7 +140,7 @@ async def terminal_complete(request: Request):
                 list_path = cwd
                 filter_prefix = prefix
             try:
-                entries = await asyncio.to_thread(_backend.list_dir, list_path)
+                entries = await asyncio.to_thread(_state._backend.list_dir, list_path)
             except Exception:
                 entries = []
             completions = []
@@ -222,15 +221,15 @@ async def websocket_terminal(ws: WebSocket):
         await asyncio.sleep(0.05)
         await ws.close()
 
-    if _backend is None:
+    if _state._backend is None:
         logger.warning("terminal ws: rejected (no project open)")
         await _send_error_and_close("No project open. Open a project first.")
         return
 
-    is_local = isinstance(_backend, LocalBackend)
-    is_ssh = isinstance(_backend, SSHBackend)
+    is_local = isinstance(_state._backend, LocalBackend)
+    is_ssh = isinstance(_state._backend, SSHBackend)
     if not is_local and not is_ssh:
-        logger.warning("terminal ws: rejected (backend type %s)", type(_backend).__name__)
+        logger.warning("terminal ws: rejected (backend type %s)", type(_state._backend).__name__)
         await _send_error_and_close("Full terminal is not available for this backend.")
         return
 
@@ -241,7 +240,7 @@ async def websocket_terminal(ws: WebSocket):
     ssh_channel: Optional[Any] = None
 
     if is_local:
-        cwd = os.path.abspath(os.path.expanduser(str(_working_directory)))
+        cwd = os.path.abspath(os.path.expanduser(str(_state._working_directory)))
         if not os.path.isdir(cwd):
             logger.warning("terminal ws: local project dir not found: %s", cwd)
             await _send_error_and_close(f"Project directory not found: {cwd}")
@@ -277,7 +276,7 @@ async def websocket_terminal(ws: WebSocket):
         reader_thread.start()
     else:
         # SSH: open interactive shell with PTY
-        backend = _backend
+        backend = _state._backend
         cwd = (backend.working_directory or "").rstrip("/") or "/"
         with backend._lock:
             backend._reconnect_if_needed()

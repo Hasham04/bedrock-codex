@@ -19,8 +19,8 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from backend import Backend, LocalBackend
+import web.state as _state
 from web.state import (
-    _backend, _working_directory, _active_agent, _ssh_info,
     _IGNORE_DIRS, _IGNORE_EXTENSIONS,
     _MAX_FILE_SIZE, _MAX_IMAGE_ATTACHMENTS, _MAX_IMAGE_BYTES,
     _MAX_IMAGE_TOTAL_BYTES, _ALLOWED_IMAGE_MEDIA_TYPES,
@@ -89,11 +89,11 @@ async def list_files(path: str = "", recursive: bool = False):
     - recursive=true: flat list of ALL files (for fuzzy file search in explorer).
     """
     import posixpath
-    b = _backend or LocalBackend(os.path.abspath(_working_directory))
+    b = _state._backend or LocalBackend(os.path.abspath(_state._working_directory))
     is_ssh = hasattr(b, '_client')  # SSHBackend has _client attr
 
     if recursive:
-        return await asyncio.to_thread(_list_all_files_recursive, os.path.abspath(_working_directory), is_ssh, backend=b)
+        return await asyncio.to_thread(_list_all_files_recursive, os.path.abspath(_state._working_directory), is_ssh, backend=b)
 
     try:
         entries = await asyncio.to_thread(b.list_dir, path or ".")
@@ -290,7 +290,7 @@ async def api_find_symbol(symbol: str = Query(...), kind: str = Query("definitio
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(
-                _find_symbol, symbol, kind=kind, working_directory=_working_directory
+                _find_symbol, symbol, kind=kind, working_directory=_state._working_directory
             ),
             timeout=10.0,
         )
@@ -322,7 +322,7 @@ async def read_file(path: str = Query(...)):
     path = (path or "").strip().replace("\\", "/")
     if not path or path.endswith("/") or ".." in path or path.startswith("/"):
         return JSONResponse({"error": "Invalid path or directory"}, status_code=400)
-    b = _backend or LocalBackend(os.path.abspath(_working_directory))
+    b = _state._backend or LocalBackend(os.path.abspath(_state._working_directory))
     try:
         if await asyncio.to_thread(b.is_dir, path):
             return JSONResponse({"error": "Cannot read a directory"}, status_code=400)
@@ -345,7 +345,7 @@ async def read_file(path: str = Query(...)):
 @router.put("/api/file")
 async def write_file(request: Request):
     """Save file content from the editor."""
-    b = _backend or LocalBackend(os.path.abspath(_working_directory))
+    b = _state._backend or LocalBackend(os.path.abspath(_state._working_directory))
     body = await request.json()
     rel_path = (body.get("path", "") or "").strip().replace("\\", "/")
     content = body.get("content", "")
@@ -378,7 +378,7 @@ async def delete_file(request: Request):
     rel_path = _validate_rel_path(body.get("path", ""))
     if not rel_path:
         return JSONResponse({"ok": False, "error": "Invalid path"}, status_code=400)
-    b = _backend or LocalBackend(os.path.abspath(_working_directory))
+    b = _state._backend or LocalBackend(os.path.abspath(_state._working_directory))
     try:
         is_dir = await asyncio.to_thread(b.is_dir, rel_path)
         exists = is_dir or await asyncio.to_thread(b.file_exists, rel_path)
@@ -406,7 +406,7 @@ async def rename_file(request: Request):
     new_path = _validate_rel_path(body.get("new_path", ""))
     if not old_path or not new_path:
         return JSONResponse({"ok": False, "error": "Invalid path"}, status_code=400)
-    b = _backend or LocalBackend(os.path.abspath(_working_directory))
+    b = _state._backend or LocalBackend(os.path.abspath(_state._working_directory))
     try:
         src_exists = await asyncio.to_thread(b.file_exists, old_path)
         if not src_exists:
@@ -443,7 +443,7 @@ async def mkdir_file(request: Request):
     rel_path = _validate_rel_path(body.get("path", ""))
     if not rel_path:
         return JSONResponse({"ok": False, "error": "Invalid path"}, status_code=400)
-    b = _backend or LocalBackend(os.path.abspath(_working_directory))
+    b = _state._backend or LocalBackend(os.path.abspath(_state._working_directory))
     try:
         import shlex
         stdout, stderr, rc = await asyncio.to_thread(
@@ -462,9 +462,9 @@ async def mkdir_file(request: Request):
 
 def _get_effective_wd() -> str:
     """Get the effective working directory (remote dir for SSH, absolute path for local)."""
-    if _ssh_info:
-        return _ssh_info["directory"]
-    return os.path.abspath(_working_directory)
+    if _state._ssh_info:
+        return _state._ssh_info["directory"]
+    return os.path.abspath(_state._working_directory)
 
 
 @router.get("/api/file-diff")
@@ -475,7 +475,7 @@ async def file_diff(path: str = Query(...)):
     if safe is None:
         return JSONResponse({"error": "Invalid path"}, status_code=400)
 
-    agent = _active_agent
+    agent = _state._active_agent
     if not agent:
         return JSONResponse({"error": "No active agent"}, status_code=404)
 
@@ -490,7 +490,7 @@ async def file_diff(path: str = Query(...)):
         original = snap_val
     else:
         original = ""
-    b = _backend or LocalBackend(wd)
+    b = _state._backend or LocalBackend(wd)
     try:
         current = await asyncio.to_thread(b.read_file, safe)
     except FileNotFoundError:
@@ -514,7 +514,7 @@ async def api_search(
     include: str = Query(""),
 ):
     """Search for a regex pattern across the project. Returns structured results."""
-    b = _backend or LocalBackend(os.path.abspath(_working_directory))
+    b = _state._backend or LocalBackend(os.path.abspath(_state._working_directory))
     try:
         raw = await asyncio.to_thread(b.search, pattern, path or ".", include or None, ".")
         if not raw:
@@ -552,7 +552,7 @@ async def api_search(
 @router.post("/api/replace")
 async def api_replace(request: Request):
     """Search-and-replace across specified files."""
-    b = _backend or LocalBackend(os.path.abspath(_working_directory))
+    b = _state._backend or LocalBackend(os.path.abspath(_state._working_directory))
     body = await request.json()
     pattern = body.get("pattern", "")
     replacement = body.get("replacement", "")

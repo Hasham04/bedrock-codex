@@ -106,8 +106,21 @@ class AppConfig:
     # Enterprise: semantic codebase index (Cursor-style)
     codebase_index_enabled: bool = os.getenv("CODEBASE_INDEX_ENABLED", "true").lower() == "true"
     embedding_model_id: str = os.getenv("EMBEDDING_MODEL_ID", "cohere.embed-english-v3")
-    # Server-side context editing (Anthropic beta) — offloads tool/thinking compaction to the API
-    context_editing_enabled: bool = os.getenv("CONTEXT_EDITING_ENABLED", "true").lower() == "true"
+    # Extended context window (1M tokens via Anthropic beta flag).
+    # When enabled and the model supports it, uses 1M context instead of 200K.
+    # Set to false if your Bedrock account/region doesn't support the 1M context beta.
+    enable_extended_context: bool = os.getenv("ENABLE_EXTENDED_CONTEXT", "true").lower() == "true"
+    # Server-side context editing (Anthropic beta) — offloads tool/thinking compaction to the API.
+    # Default false: Bedrock often rejects "context" with "Extra inputs are not permitted" unless the beta is enabled for your account.
+    context_editing_enabled: bool = os.getenv("CONTEXT_EDITING_ENABLED", "false").lower() == "true"
+    # Bedrock Guardrails — optional content filtering and PII redaction
+    guardrail_id: str = os.getenv("BEDROCK_GUARDRAIL_ID", "")
+    guardrail_version: str = os.getenv("BEDROCK_GUARDRAIL_VERSION", "DRAFT")
+    # Bedrock Knowledge Bases — optional RAG augmentation for semantic_retrieve
+    knowledge_base_id: str = os.getenv("BEDROCK_KNOWLEDGE_BASE_ID", "")
+    # Bedrock Prompt Management — optional server-managed system prompts
+    prompt_id: str = os.getenv("BEDROCK_PROMPT_ID", "")
+    prompt_version: str = os.getenv("BEDROCK_PROMPT_VERSION", "")
 
 
 # ============================================================
@@ -122,9 +135,10 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "id": "us.anthropic.claude-opus-4-6-v1",
         "base_id": "anthropic.claude-opus-4-6-v1",
         "name": "Claude Opus 4.6 (Latest)",
-        "description": "Most intelligent model for agents and coding, 200K ctx, 128K output",
+        "description": "Most intelligent model for agents and coding, 200K ctx (1M extended), 128K output",
         "provider": "anthropic",
         "context_window": 200000,
+        "extended_context_window": 1000000,
         "max_output_tokens": 128000,
         "default_max_tokens": 128000,
         "supports_both_sampling": False,
@@ -145,9 +159,10 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "id": "us.anthropic.claude-opus-4-5-20251101-v1:0",
         "base_id": "anthropic.claude-opus-4-5-20251101-v1:0",
         "name": "Claude Opus 4.5",
-        "description": "Flagship model with extended thinking, 200K ctx, 128K output",
+        "description": "Flagship model with extended thinking, 200K ctx (1M extended), 128K output",
         "provider": "anthropic",
         "context_window": 200000,
+        "extended_context_window": 1000000,
         "max_output_tokens": 128000,
         "default_max_tokens": 128000,
         "supports_both_sampling": False,
@@ -166,9 +181,10 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "id": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         "base_id": "anthropic.claude-sonnet-4-5-20250929-v1:0",
         "name": "Claude Sonnet 4.5",
-        "description": "Best for coding and complex agents, 200K ctx, 64K output",
+        "description": "Best for coding and complex agents, 200K ctx (1M extended), 64K output",
         "provider": "anthropic",
         "context_window": 200000,
+        "extended_context_window": 1000000,
         "max_output_tokens": 64000,
         "default_max_tokens": 64000,
         "supports_both_sampling": False,
@@ -187,9 +203,10 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
         "base_id": "anthropic.claude-haiku-4-5-20251001-v1:0",
         "name": "Claude Haiku 4.5",
-        "description": "Fastest with near-frontier intelligence, 200K ctx, 64K output",
+        "description": "Fastest with near-frontier intelligence, 200K ctx (1M extended), 64K output",
         "provider": "anthropic",
         "context_window": 200000,
+        "extended_context_window": 1000000,
         "max_output_tokens": 64000,
         "default_max_tokens": 64000,
         "supports_both_sampling": False,
@@ -209,9 +226,10 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "id": "us.anthropic.claude-opus-4-1-20250805-v1:0",
         "base_id": "anthropic.claude-opus-4-1-20250805-v1:0",
         "name": "Claude Opus 4.1",
-        "description": "Highly capable with extended thinking, 200K ctx, 128K output",
+        "description": "Highly capable with extended thinking, 200K ctx (1M extended), 128K output",
         "provider": "anthropic",
         "context_window": 200000,
+        "extended_context_window": 1000000,
         "max_output_tokens": 128000,
         "default_max_tokens": 128000,
         "supports_both_sampling": False,
@@ -230,9 +248,10 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "id": "us.anthropic.claude-opus-4-20250514-v1:0",
         "base_id": "anthropic.claude-opus-4-20250514-v1:0",
         "name": "Claude Opus 4",
-        "description": "First Claude 4 Opus with extended thinking, 200K ctx",
+        "description": "First Claude 4 Opus with extended thinking, 200K ctx (1M extended)",
         "provider": "anthropic",
         "context_window": 200000,
+        "extended_context_window": 1000000,
         "max_output_tokens": 128000,
         "default_max_tokens": 128000,
         "supports_both_sampling": False,
@@ -251,9 +270,10 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "id": "us.anthropic.claude-sonnet-4-20250514-v1:0",
         "base_id": "anthropic.claude-sonnet-4-20250514-v1:0",
         "name": "Claude Sonnet 4",
-        "description": "Balanced performance with extended thinking, 200K ctx, 64K output",
+        "description": "Balanced performance with extended thinking, 200K ctx (1M extended), 64K output",
         "provider": "anthropic",
         "context_window": 200000,
+        "extended_context_window": 1000000,
         "max_output_tokens": 64000,
         "default_max_tokens": 64000,
         "supports_both_sampling": False,
@@ -273,9 +293,10 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "id": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
         "base_id": "anthropic.claude-3-7-sonnet-20250219-v1:0",
         "name": "Claude 3.7 Sonnet",
-        "description": "Extended thinking Sonnet, 200K ctx, 16K output",
+        "description": "Extended thinking Sonnet, 200K ctx (1M extended), 16K output",
         "provider": "anthropic",
         "context_window": 200000,
+        "extended_context_window": 1000000,
         "max_output_tokens": 16000,
         "default_max_tokens": 16000,
         "supports_both_sampling": False,
@@ -294,9 +315,10 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "id": "anthropic.claude-3-5-haiku-20241022-v1:0",
         "base_id": "anthropic.claude-3-5-haiku-20241022-v1:0",
         "name": "Claude 3.5 Haiku",
-        "description": "Fast and efficient, 200K ctx, 8K output",
+        "description": "Fast and efficient, 200K ctx (1M extended), 8K output",
         "provider": "anthropic",
         "context_window": 200000,
+        "extended_context_window": 1000000,
         "max_output_tokens": 8192,
         "default_max_tokens": 8192,
         "supports_both_sampling": True,
@@ -315,9 +337,10 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
         "base_id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
         "name": "Claude 3.5 Sonnet v2",
-        "description": "Solid performance, 200K ctx, 8K output",
+        "description": "Solid performance, 200K ctx (1M extended), 8K output",
         "provider": "anthropic",
         "context_window": 200000,
+        "extended_context_window": 1000000,
         "max_output_tokens": 8192,
         "default_max_tokens": 8192,
         "supports_both_sampling": True,
@@ -368,6 +391,7 @@ def get_model_config(model_id: str) -> Dict[str, Any]:
         "name": model_id,
         "provider": "anthropic",
         "context_window": 200000,
+        "extended_context_window": 1000000,
         "max_output_tokens": 128000,
         "default_max_tokens": 128000,
         "supports_both_sampling": False,
@@ -385,7 +409,18 @@ def get_model_config(model_id: str) -> Dict[str, Any]:
 
 
 def get_context_window(model_id: str) -> int:
-    return get_model_config(model_id).get("context_window", 200000)
+    """Return the effective context window for a model.
+
+    Priority: CONTEXT_WINDOW env override > extended context (if enabled and
+    supported) > standard context_window from model config.
+    """
+    override = os.getenv("CONTEXT_WINDOW")
+    if override:
+        return int(override)
+    cfg = get_model_config(model_id)
+    if app_config.enable_extended_context and cfg.get("supports_extended_context"):
+        return cfg.get("extended_context_window", cfg.get("context_window", 200000))
+    return cfg.get("context_window", 200000)
 
 
 def get_max_output_tokens(model_id: str) -> int:
