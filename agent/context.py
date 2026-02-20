@@ -6,6 +6,7 @@ Handles memory, todos, file snapshots, approval tracking, checkpoints, and state
 import json
 import logging
 import os
+import queue as _queue
 import time
 from typing import Dict, List, Any, Optional
 from pathlib import Path
@@ -440,7 +441,20 @@ class ContextMixin:
             "deterministic_verification_done": self._deterministic_verification_done,
             "todos": list(self._todos),
             "memory": dict(self._memory),
+            "pending_guidance": list(self._drain_guidance_snapshot()),
         }
+
+    def _drain_guidance_snapshot(self) -> List[str]:
+        """Non-destructively snapshot the pending guidance queue for serialization."""
+        items: List[str] = []
+        while True:
+            try:
+                items.append(self._pending_guidance.get_nowait())
+            except _queue.Empty:
+                break
+        for item in items:
+            self._pending_guidance.put(item)
+        return items
 
     def from_dict(self, data: Dict[str, Any]) -> None:
         """Restore agent state from a persisted session. Unknown keys are ignored."""
@@ -508,6 +522,13 @@ class ContextMixin:
         raw_memory = data.get("memory")
         self._memory = dict(raw_memory) if isinstance(raw_memory, dict) else {}
         self._cancelled = False
+
+        # Restore pending guidance
+        pending_guidance = data.get("pending_guidance")
+        if isinstance(pending_guidance, list):
+            for g in pending_guidance:
+                if isinstance(g, str) and g.strip():
+                    self._pending_guidance.put(g)
 
         # Restore file snapshots
         raw_snapshots = data.get("file_snapshots", {})

@@ -670,28 +670,37 @@ class BedrockService:
             raise BedrockError(f"Streaming error: {error_message}")
     
     def generate_title(self, first_message: str) -> str:
-        """Generate a conversation title"""
+        """Generate a conversation title from the user's first message."""
         messages = [{
             "role": "user",
-            "content": f"Generate a very short title (max 6 words) for this conversation. Return ONLY the title:\n\n{first_message[:500]}"
+            "content": (
+                "Generate a short, descriptive title (3-6 words) that captures the intent of this coding task. "
+                "The title should read like a task name, e.g. 'Fix auth middleware bug', 'Add dark mode toggle', "
+                "'Refactor database connection pool'. Do NOT include quotes, prefixes, or explanations. "
+                "Return ONLY the title.\n\n"
+                f"{first_message[:500]}"
+            ),
         }]
-        
+
         title_config = GenerationConfig(
             max_tokens=50,
-            temperature=0.7,
+            temperature=0.3,
             enable_thinking=False,
             throughput_mode="cross-region"
         )
-        
+
         try:
             result = self.generate_response(
                 messages,
                 model_id="us.anthropic.claude-haiku-4-5-20251001-v1:0",
                 config=title_config
             )
-            title = result.content.strip().strip('"\'')
+            title = result.content.strip().strip('"\'').strip('*').strip()
+            for prefix in ["Title:", "title:", "Task:", "task:"]:
+                if title.startswith(prefix):
+                    title = title[len(prefix):].strip()
             words = title.split()
-            return ' '.join(words[:6]) if len(words) > 6 else title
+            return ' '.join(words[:8]) if len(words) > 8 else title
         except Exception as e:
             logger.warning(f"Failed to generate title: {e}")
             return first_message[:40] + "..." if len(first_message) > 40 else first_message

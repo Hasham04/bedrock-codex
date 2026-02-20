@@ -443,7 +443,7 @@
                             return { id: String(i + 1), content: s, status: "pending" };
                         });
                         BX.showAgentChecklist(BX.currentChecklistItems);
-                        BX.showPlan(steps, planFile, planText, true, true, evt.plan_title || "");
+                        BX.showPlan(steps, planFile, planText, true, !BX.isRunning, evt.plan_title || "");
                         var notif = document.createElement("div");
                         notif.className = "info-msg plan-updated-msg";
                         notif.textContent = "Plan updated \u2014 " + steps.length + " steps";
@@ -488,10 +488,18 @@
             case "no_changes": BX.showInfo("No file changes."); BX.setRunning(false); break;
             case "no_plan": BX.showInfo("Completed directly."); BX.setRunning(false); break;
             case "guidance_queued":
+                BX._guidancePending = true;
                 BX.showInfo("Guidance sent \u2014 agent will incorporate it.");
                 break;
             case "guidance_applied":
+                BX._guidancePending = false;
                 BX.showInfo("Agent received your guidance.");
+                break;
+            case "guidance_interrupt":
+                BX._stopThinkingTick();
+                document.querySelectorAll(".thinking-block .thinking-spinner").forEach(function (el) { el.remove(); });
+                document.querySelectorAll(".thinking-block").forEach(function (el) { BX.updateThinkingHeader(el, true); });
+                BX.showInfo(evt.content || "Incorporating your guidance\u2026");
                 break;
             case "done":
                 BX.setRunning(false);
@@ -509,6 +517,10 @@
                 });
                 document.querySelectorAll(".phase-indicator:not(.done)").forEach(function (el) { el.classList.add("done"); });
                 if (BX.scoutEl && !BX.scoutEl.classList.contains("scout-done")) BX.endScout();
+                if (BX._guidancePending) {
+                    BX.showInfo("⚠ Guidance was not incorporated — task completed before it could be applied.");
+                    BX._guidancePending = false;
+                }
                 break;
             case "kept":
                 BX.hideActionBar();
@@ -553,6 +565,7 @@
             case "cancelled":
                 BX.showInfo("Cancelled.");
                 BX.setRunning(false);
+                BX.hideActionBar();
                 document.querySelectorAll(".tool-status-running").forEach(function (el) {
                     el.className = "tool-status tool-status-error";
                     el.title = "Cancelled";
@@ -617,6 +630,7 @@
             case "error":
                 BX.showError(evt.content || "Unknown error");
                 BX.setRunning(false);
+                BX.hideActionBar();
                 document.querySelectorAll(".tool-block-loading").forEach(function (b) {
                     b.classList.remove("tool-block-loading");
                     var st = b.querySelector(".tool-status");
@@ -636,6 +650,9 @@
             // ── Replay events (history restore on reconnect) ──
             case "replay_user":
                 BX.addUserMessage(evt.content || "");
+                break;
+            case "replay_guidance":
+                BX.addGuidanceMessage(evt.content || "");
                 break;
             case "replay_text":
                 if (evt.content) {
@@ -770,6 +787,14 @@
         if (BX.isRunning) {
             if (!text) return;
             if (text.startsWith("/") && /^\/[a-zA-Z]/.test(text)) { handleCommand(text); $input.value = ""; autoResizeInput(); return; }
+            // Debounce guidance — 500ms cooldown
+            var now = Date.now();
+            if (now - (BX._lastGuidanceSendTime || 0) < 500) {
+                BX.showInfo("Please wait before sending more guidance.");
+                return;
+            }
+            BX._lastGuidanceSendTime = now;
+            BX.hideActionBar();
             BX.addGuidanceMessage(text);
             $input.value = ""; autoResizeInput();
             send({ type: "guidance", content: text });
@@ -799,6 +824,14 @@
         BX.addUserMessage(text, imagesPayload);
         $input.value = ""; autoResizeInput();
         BX.clearPendingImages();
+        // Clear stale keep/revert UI if user sends a new task instead of clicking Keep/Revert
+        BX.hideActionBar();
+        var existingDiff = document.getElementById("cumulative-diff-container");
+        if (existingDiff) {
+            existingDiff.querySelectorAll(".diff-block").forEach(function(b) { b.classList.add("collapsed"); });
+        }
+        // Clear stale plan Build/Feedback/Reject buttons
+        document.querySelectorAll(".plan-actions").forEach(function(el) { el.remove(); });
         BX.setRunning(true);
         BX.addAssistantMessage();
         var editorCtx = gatherEditorContext();

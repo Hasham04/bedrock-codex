@@ -8,7 +8,9 @@ Inherits capabilities from multiple mixins for a modular architecture:
 import asyncio
 import logging
 import os
+import queue as _queue
 import re
+import threading
 from typing import List, Dict, Any, Optional
 
 from bedrock_service import BedrockService, GenerationConfig
@@ -84,8 +86,8 @@ class CodingAgent(
         self._detected_language = _detect_project_language(self.working_directory)
         self.system_prompt = _compose_system_prompt("direct", self.working_directory, AVAILABLE_TOOL_NAMES, language=self._detected_language)
         self._cancelled = False
-        self._pending_guidance: List[str] = []
-        self._guidance_interrupt = False
+        self._pending_guidance: _queue.Queue[str] = _queue.Queue()
+        self._guidance_interrupt = threading.Event()
 
         # Initialize mixins (ContextMixin, VerificationMixin, ExecutionMixin, etc.)
         super().__init__()
@@ -119,25 +121,31 @@ class CodingAgent(
     def inject_guidance(self, text: str):
         """Thread-safe: queue a user guidance message to be injected at the next iteration.
         Also sets _guidance_interrupt to abort any in-progress Bedrock stream."""
-        self._pending_guidance.append(text)
-        self._guidance_interrupt = True
+        self._pending_guidance.put(text)
+        self._guidance_interrupt.set()
 
     def _consume_guidance(self) -> Optional[str]:
-        """Pop all queued guidance messages and combine into one string.
+        """Drain all queued guidance messages and combine into one string.
         Also clears the interrupt flag so the next stream proceeds normally."""
-        if not self._pending_guidance:
-            return None
-        msgs = list(self._pending_guidance)
-        self._pending_guidance.clear()
-        self._guidance_interrupt = False
-        return "\n\n".join(msgs)
+        msgs: list[str] = []
+        while True:
+            try:
+                msgs.append(self._pending_guidance.get_nowait())
+            except _queue.Empty:
+                break
+        self._guidance_interrupt.clear()
+        return "\n\n".join(msgs) if msgs else None
 
     def reset(self):
         """Reset conversation history and all agent state."""
         self.history = []
         self._cancelled = False
-        self._pending_guidance = []
-        self._guidance_interrupt = False
+        while not self._pending_guidance.empty():
+            try:
+                self._pending_guidance.get_nowait()
+            except _queue.Empty:
+                break
+        self._guidance_interrupt.clear()
         self._total_input_tokens = 0
         self._total_output_tokens = 0
         self._cache_read_tokens = 0
@@ -165,7 +173,11 @@ class CodingAgent(
         self._memory = {}
         self._consecutive_stream_errors = 0
         self._last_stream_error_sig = ""
-        self._pending_guidance = []
+        while not self._pending_guidance.empty():
+            try:
+                self._pending_guidance.get_nowait()
+            except _queue.Empty:
+                break
 
     # ------------------------------------------------------------------
     # File cache helpers

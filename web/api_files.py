@@ -35,52 +35,6 @@ router = APIRouter()
 # File tree
 # ------------------------------------------------------------------
 
-def _build_file_tree(root: str, rel: str = "") -> List[Dict[str, Any]]:
-    """Recursively build a file tree, skipping ignored dirs/files. Uses shared gitignore helper."""
-    from tools import _load_gitignore, _is_ignored
-    abs_dir = os.path.join(root, rel) if rel else root
-    gi = _load_gitignore(root)
-    entries: List[Dict[str, Any]] = []
-
-    try:
-        items = sorted(os.listdir(abs_dir))
-    except PermissionError:
-        return entries
-
-    dirs_list = []
-    files_list = []
-
-    for name in items:
-        full = os.path.join(abs_dir, name)
-        child_rel = os.path.join(rel, name) if rel else name
-        is_dir = os.path.isdir(full)
-
-        if _is_ignored(child_rel, name, is_dir, gi):
-            continue
-        if name in _IGNORE_DIRS:
-            continue
-
-        if is_dir:
-            dirs_list.append({
-                "name": name,
-                "path": child_rel,
-                "type": "directory",
-                "children": None,
-            })
-        elif os.path.isfile(full):
-            _, ext = os.path.splitext(name)
-            if ext in _IGNORE_EXTENSIONS:
-                continue
-            files_list.append({
-                "name": name,
-                "path": child_rel,
-                "type": "file",
-                "ext": ext.lstrip("."),
-            })
-
-    return dirs_list + files_list
-
-
 @router.get("/api/files")
 async def list_files(path: str = "", recursive: bool = False):
     """Return file tree entries for a directory.
@@ -216,10 +170,12 @@ def _list_all_files_recursive(root: str, is_ssh: bool = False, backend: Optional
 # ------------------------------------------------------------------
 
 def _safe_path(wd: str, rel: str) -> Optional[str]:
-    """Resolve a relative path and ensure it stays inside the working directory."""
+    """Resolve a relative path and ensure it stays inside the working directory.
+    Uses posixpath for SSH backends (remote paths are always POSIX)."""
     if not rel:
         return wd
-    resolved = os.path.normpath(os.path.join(wd, rel))
+    pmod = posixpath if _state._ssh_info else os.path
+    resolved = pmod.normpath(pmod.join(wd, rel))
     if not resolved.startswith(wd):
         return None
     return resolved
@@ -288,9 +244,11 @@ async def api_find_symbol(symbol: str = Query(...), kind: str = Query("definitio
     """Find symbol definitions for Go to Definition in the editor."""
     from tools import find_symbol as _find_symbol
     try:
+        wd = _get_effective_wd()
         result = await asyncio.wait_for(
             asyncio.to_thread(
-                _find_symbol, symbol, kind=kind, working_directory=_state._working_directory
+                _find_symbol, symbol, kind=kind,
+                working_directory=wd, backend=_state._backend,
             ),
             timeout=10.0,
         )

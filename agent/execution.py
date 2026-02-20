@@ -26,6 +26,12 @@ from .events import AgentEvent
 logger = logging.getLogger(__name__)
 _PATH_RE = re.compile(r'"path"\s*:\s*"([^"]+)"')
 
+_GUIDANCE_PREFIX = (
+    "[USER GUIDANCE — mid-task correction from the user. "
+    "Incorporate this into your current work immediately.]"
+)
+_POLL_TIMEOUT = object()  # sentinel for chunk polling timeout
+
 
 # ---------------------------------------------------------------------------
 # Native tool classification helpers
@@ -103,10 +109,7 @@ class ExecutionMixin:
             if guidance:
                 self.history.append({
                     "role": "user",
-                    "content": (
-                        f"[USER GUIDANCE — mid-task correction from the user. "
-                        f"Incorporate this into your current work immediately.]\n\n{guidance}"
-                    ),
+                    "content": f"{_GUIDANCE_PREFIX}\n\n{guidance}",
                 })
                 await on_event(AgentEvent(
                     type="guidance_applied",
@@ -173,7 +176,8 @@ class ExecutionMixin:
                             data={"attempt": attempt, "max_retries": max_retries},
                         ))
 
-                    chunk_queue: queue.Queue = queue.Queue()
+                    chunk_queue: queue.Queue = queue.Queue(maxsize=256)
+                    _stop_producer = threading.Event()
 
                     build_tools = (TOOL_DEFINITIONS + [ASK_USER_QUESTION_DEFINITION]) if request_question_answer else TOOL_DEFINITIONS
 
@@ -187,6 +191,8 @@ class ExecutionMixin:
                                 config=gen_config,
                                 tools=build_tools,
                             ):
+                                if _stop_producer.is_set():
+                                    break
                                 chunk_queue.put(c)
                             chunk_queue.put(None)  # sentinel: stream complete
                         except Exception as exc:
@@ -198,14 +204,26 @@ class ExecutionMixin:
                     # Consume chunks from the queue in the async loop
                     loop = asyncio.get_event_loop()
                     _guidance_interrupted = False
+
+                    def _poll_chunk():
+                        """Block up to 0.25s for a chunk, returning _POLL_TIMEOUT sentinel on timeout."""
+                        try:
+                            return chunk_queue.get(timeout=0.25)
+                        except queue.Empty:
+                            return _POLL_TIMEOUT
+
                     while True:
                         if self._cancelled:
+                            _stop_producer.set()
                             break
-                        if self._guidance_interrupt:
+                        if self._guidance_interrupt.is_set():
+                            _stop_producer.set()
                             _guidance_interrupted = True
                             break
 
-                        chunk = await loop.run_in_executor(None, chunk_queue.get)
+                        chunk = await loop.run_in_executor(None, _poll_chunk)
+                        if chunk is _POLL_TIMEOUT:
+                            continue
 
                         if chunk is None:
                             break  # stream complete
@@ -368,6 +386,7 @@ class ExecutionMixin:
 
                     # If guidance arrived mid-stream, discard partial response and restart
                     if _guidance_interrupted:
+                        discarded_len = len(current_text)
                         assistant_content = []
                         tool_calls = []
                         current_text = ""
@@ -375,6 +394,7 @@ class ExecutionMixin:
                         await on_event(AgentEvent(
                             type="guidance_interrupt",
                             content="Guidance received — restarting with your correction.",
+                            data={"discarded_chars": discarded_len, "iteration": iteration},
                         ))
                         break  # exit retry loop — will be caught below
 
@@ -504,16 +524,16 @@ class ExecutionMixin:
                     await asyncio.sleep(wait_secs)
                     continue  # next attempt
 
+            # Guidance interrupt — discard partial response, loop back so _consume_guidance picks it up
+            if _guidance_interrupted:
+                continue
+
             if not stream_succeeded:
                 break  # exit the outer agent loop
 
             if self._cancelled:
                 await on_event(AgentEvent(type="cancelled"))
                 break
-
-            # Guidance interrupt — discard partial response, loop back so _consume_guidance picks it up
-            if _guidance_interrupted:
-                continue
 
             # Add assistant message to history (includes thinking blocks for continuity)
             if assistant_content:
@@ -601,9 +621,11 @@ class ExecutionMixin:
                             self.history.append({
                                 "role": "user",
                                 "content": (
-                                    "[SYSTEM] Verification found issues. Try to fix them, but if the issues "
-                                    "are pre-existing or unrelated to your changes, just confirm the task is "
-                                    "complete and move on. Do NOT loop — one fix attempt only.\n\n"
+                                    "[SYSTEM — VERIFICATION FOR CURRENT TASK ONLY] "
+                                    "Verification found issues in the code you just modified. "
+                                    "Try to fix them, but if the issues are pre-existing or unrelated "
+                                    "to your changes, just confirm the task is complete and move on. "
+                                    "Do NOT loop — one fix attempt only.\n\n"
                                     + gate_summary
                                 ),
                             })
@@ -617,9 +639,12 @@ class ExecutionMixin:
                         self.history.append({
                             "role": "user",
                             "content": (
-                                "[SYSTEM] Verification complete:\n\n"
+                                "[SYSTEM — VERIFICATION FOR CURRENT TASK ONLY] "
+                                "The following verification results are for the task you just completed. "
+                                "Do NOT carry these forward to any future tasks.\n\n"
                                 + gate_summary
-                                + "\n\nProvide final completion update and finish."
+                                + "\n\nProvide a brief final completion summary and finish. "
+                                "Do not reference this verification in any subsequent tasks."
                             ),
                         })
                         continue
@@ -682,10 +707,7 @@ class ExecutionMixin:
             if mid_guidance:
                 capped_results.append({
                     "type": "text",
-                    "text": (
-                        f"[USER GUIDANCE — mid-task correction from the user. "
-                        f"Incorporate this into your current work immediately.]\n\n{mid_guidance}"
-                    ),
+                    "text": f"{_GUIDANCE_PREFIX}\n\n{mid_guidance}",
                 })
                 await on_event(AgentEvent(type="guidance_applied", content=mid_guidance))
 

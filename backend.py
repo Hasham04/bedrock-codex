@@ -673,6 +673,15 @@ class SSHBackend(Backend):
             attr = self._sftp.stat(remote)
             return attr.st_size or 0
 
+    def stat(self, path: str) -> Dict[str, Any]:
+        """Return file stat info (st_size, st_mtime) via SFTP."""
+        remote = self._remote_path(path)
+        self._ensure_under_working(remote)
+        with self._lock:
+            self._reconnect_if_needed()
+            attr = self._sftp.stat(remote)
+            return {"st_size": attr.st_size or 0, "st_mtime": float(attr.st_mtime or 0)}
+
     def remove_file(self, path: str) -> None:
         remote = self._remote_path(path)
         self._ensure_under_working(remote)
@@ -686,12 +695,9 @@ class SSHBackend(Backend):
                 "Command contains disallowed shell metacharacters (e.g. & | ; $ `). "
                 "Use a single command with arguments only."
             )
-        # Always use _remote_path for consistency with file operations
         full_cwd = self._remote_path(cwd)
-        # Source shell profile to get full environment (aliases, functions, PATH)
-        # Try common profile files in order of precedence
-        profile_sources = "source ~/.bash_profile 2>/dev/null || source ~/.bashrc 2>/dev/null || source ~/.profile 2>/dev/null || true"
-        cmd = f"bash -c '{profile_sources}; cd {full_cwd!r} && {command}'"
+        # _exec wraps in `bash -l -c` which sources login profiles automatically
+        cmd = f"cd {full_cwd!r} && {command}"
         return self._exec(cmd, timeout=timeout)
 
     def run_command_stream(
@@ -706,12 +712,10 @@ class SSHBackend(Backend):
                 "Command contains disallowed shell metacharacters (e.g. & | ; $ `). "
                 "Use a single command with arguments only."
             )
-        # Always use _remote_path for consistency with file operations
         full_cwd = self._remote_path(cwd)
-        # Source shell profile to get full environment (aliases, functions, PATH)
-        # Try common profile files in order of precedence
-        profile_sources = "source ~/.bash_profile 2>/dev/null || source ~/.bashrc 2>/dev/null || source ~/.profile 2>/dev/null || true"
-        cmd = f"bash -c '{profile_sources}; cd {full_cwd!r} && {command}'"
+        # Wrap in bash -l -c to source login profiles (same as _exec)
+        inner = f"cd {full_cwd!r} && {command}"
+        cmd = f"bash -l -c {shlex.quote(inner)}"
 
         with self._lock:
             self._reconnect_if_needed()
@@ -786,14 +790,22 @@ class SSHBackend(Backend):
 
     def glob_find(self, pattern: str, cwd: str) -> List[str]:
         full_cwd = self._remote_path(cwd) if cwd != "." else self._working_directory
-        # Use find on remote
-        stdout, _, _ = self._exec(
-            f"cd {full_cwd!r} && find . -path './{pattern}' -not -path '*/node_modules/*' "
-            f"-not -path '*/__pycache__/*' -not -path '*/.git/*' 2>/dev/null | head -200 | sort",
-            timeout=15,
+        # Use bash globstar for proper ** support and brace expansion
+        glob_cmd = (
+            f"cd {full_cwd!r} && bash -c "
+            f"'shopt -s globstar nullglob; printf \"%s\\n\" {pattern}' 2>/dev/null"
+            f" | grep -v -E '/(node_modules|__pycache__|\\.git)/' | head -200 | sort"
         )
-        if not stdout.strip():
-            return []
+        stdout, _, rc = self._exec(glob_cmd, timeout=15)
+        if rc != 0 or not stdout.strip():
+            # Fallback to find for systems without globstar
+            stdout, _, _ = self._exec(
+                f"cd {full_cwd!r} && find . -path './{pattern}' -not -path '*/node_modules/*' "
+                f"-not -path '*/__pycache__/*' -not -path '*/.git/*' 2>/dev/null | head -200 | sort",
+                timeout=15,
+            )
+            if not stdout.strip():
+                return []
         return [line.lstrip("./") for line in stdout.strip().split("\n") if line.strip()]
 
     def close(self):

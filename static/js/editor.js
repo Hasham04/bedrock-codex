@@ -571,6 +571,12 @@
         });
     }
 
+    // Save button handler
+    var $saveFileBtn = BX.$saveFileBtn;
+    if ($saveFileBtn) {
+        $saveFileBtn.addEventListener("click", saveCurrentFile);
+    }
+
     // ================================================================
     // EXPORTS
     // ================================================================

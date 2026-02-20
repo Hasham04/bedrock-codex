@@ -74,10 +74,13 @@
     function addGuidanceMessage(text) {
         var div = document.createElement("div");
         div.className = "message user guidance-msg";
+        div.setAttribute("role", "status");
+        div.setAttribute("aria-label", "Guidance message: " + text);
         var bubble = document.createElement("div");
         bubble.className = "msg-bubble guidance-bubble";
         var label = document.createElement("span");
         label.className = "guidance-label";
+        label.setAttribute("aria-hidden", "true");
         label.textContent = "Guidance";
         bubble.appendChild(label);
         var textEl = document.createElement("div");
@@ -1283,7 +1286,7 @@
             if (cmd === "view") return "Read";
             if (cmd === "create") return "Write";
             if (cmd === "str_replace" || cmd === "insert") return "Edit";
-            return "str_replace_based_edit_tool"; // preserve original name when command unknown
+            return "Edit"; // fallback to Edit for unknown sub-commands
         }
         if (n === "bash") return "Bash";
         if (n === "web_search") return "WebSearch";
@@ -1294,6 +1297,7 @@
             glob_find: "Glob",
             run_command: "Bash",
             SemanticRetrieve: "semantic_retrieve",
+            AskUserQuestion: "AskUserQuestion",
         };
         return map[n] || n;
     }
@@ -1499,6 +1503,9 @@
     function showPlan(steps, planFile, planText, skipChecklist, showButtons, planTitle) {
         showButtons = showButtons !== false; // default to true
         currentPlanSteps = [...steps];
+        // Remove any previous plan block so only one #active-plan exists at a time
+        var oldPlan = document.getElementById("active-plan");
+        if (oldPlan) oldPlan.remove();
         var bubble = getOrCreateBubble();
         var block = document.createElement("div"); block.className = "plan-block plan-block--tab"; block.id = "active-plan";
 
@@ -1543,12 +1550,15 @@
         }
 
         var buildBtn = block.querySelector(".plan-build-btn");
-        if (buildBtn) buildBtn.addEventListener("click", function() {
-            buildBtn.closest(".plan-actions").remove();
-            var editorCtx = BX.gatherEditorContext();
-            BX.send({ type: "build", steps: currentPlanSteps, ...(editorCtx ? { context: editorCtx } : {}) });
-            BX.setRunning(true);
-        });
+        if (buildBtn) {
+            var stepsForBuild = [...steps]; // capture at creation time, not module-level
+            buildBtn.addEventListener("click", function() {
+                buildBtn.closest(".plan-actions").remove();
+                var editorCtx = BX.gatherEditorContext();
+                BX.send({ type: "build", steps: stepsForBuild, ...(editorCtx ? { context: editorCtx } : {}) });
+                BX.setRunning(true);
+            });
+        }
         var fbBtn = block.querySelector(".plan-feedback-btn");
         if (fbBtn) fbBtn.addEventListener("click", () => showPlanFeedbackInput());
         var rejectBtn = block.querySelector(".plan-reject-btn");
@@ -1706,7 +1716,7 @@
         container.appendChild(summary);
 
         files.forEach(function(f) {
-            var block = document.createElement("div"); block.className = isCumulative ? "diff-block" : "diff-block collapsed";
+            var block = document.createElement("div"); block.className = "diff-block collapsed";
             var labelCls = f.label === "new file" ? "new-file" : "modified";
             block.innerHTML = `<div class="diff-file-header"><div style="display:flex;align-items:center;gap:8px"><span class="diff-chevron">\u25B6</span><span class="diff-file-name">${BX.escapeHtml(f.path)}</span><span class="diff-file-label ${labelCls}">${BX.escapeHtml(f.label)}</span></div><div class="diff-stats"><span class="add">+${f.additions}</span><span class="del">-${f.deletions}</span></div></div><div class="diff-content">${renderDiff(f.diff)}</div>`;
 
@@ -1813,8 +1823,20 @@
             if (lbl) lbl.textContent = `${phaseDoneLabel(name)} \u2014 ${elapsed}s`;
         }
     }
-    function phaseLabel(n) { return {plan:"Planning\u2026",build:"Building\u2026",direct:"Running\u2026"}[n]||n; }
-    function phaseDoneLabel(n) { return {plan:"Planned",build:"Built",direct:"Completed"}[n]||n; }
+    function phaseLabel(n) {
+        var m = {plan:"Planning\u2026",build:"Building\u2026",direct:"Running\u2026"}[n];
+        if (m) return m;
+        var bp = n.match(/^build_phase_(\d+)$/);
+        if (bp) return "Building phase " + bp[1] + "\u2026";
+        return n;
+    }
+    function phaseDoneLabel(n) {
+        var m = {plan:"Planned",build:"Built",direct:"Completed"}[n];
+        if (m) return m;
+        var bp = n.match(/^build_phase_(\d+)$/);
+        if (bp) return "Phase " + bp[1] + " complete";
+        return n;
+    }
 
     var _scoutTickInterval = null;
     var _scoutStartedAt = 0;

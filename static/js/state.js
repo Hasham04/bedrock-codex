@@ -91,6 +91,7 @@
     BX.$replaceInput  = document.getElementById("replace-input");
     BX.$replaceAllBtn = document.getElementById("replace-all-btn");
     BX.$replaceToggle = document.getElementById("search-replace-toggle");
+    BX.$saveFileBtn = document.getElementById("save-file-btn");
     BX.$terminalToggleBtn = document.getElementById("terminal-toggle-btn");
     BX.$terminalPanel = document.getElementById("terminal-panel");
     BX.$terminalXtermContainer = document.getElementById("terminal-xterm-container");

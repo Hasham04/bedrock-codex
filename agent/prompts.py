@@ -379,6 +379,52 @@ After ALL changes are complete:
 - Don't re-read files you already have in context. Check before issuing redundant reads.
 </anti_patterns>"""
 
+_FUNCTIONAL_VERIFICATION = """<functional_verification>
+CRITICAL: You must intelligently decide when to write and run comprehensive verification to PROVE your changes work correctly. This applies regardless of whether existing tests exist — your changes may not be covered by existing tests.
+
+ANALYSIS PHASE:
+1. Review each modified file and identify the key functionality that was changed or added
+2. Determine what critical behaviors need verification:
+   - Primary success paths (normal usage scenarios)
+   - Important edge cases that could break
+   - Error handling paths if you modified error logic
+   - Integration points if you modified how components interact
+
+VERIFICATION PHASE:
+FOR EACH piece of critical functionality identified:
+1. Create targeted verification scripts (e.g. `/tmp/_verify_<module>_<function>.py`)
+2. Each script must:
+   - Import/load the changed code
+   - Set up realistic test scenarios
+   - Exercise the functionality thoroughly
+   - Verify expected outputs/behaviors
+   - Print clear PASS/FAIL results
+   - Exit with code 0 on success, non-zero on failure
+3. Run the verification scripts
+4. If any fail: analyze the failure, fix YOUR CODE (not the verification), re-run
+5. Clean up scripts when done
+
+INTELLIGENCE REQUIREMENTS:
+- **Be thorough**: Don't just check imports. Verify the functionality actually works as intended.
+- **Install dependencies**: If verification requires packages not currently installed, install them with pip/npm/etc.
+- **Handle complexity**: For modules with complex dependencies, try your best to create isolated tests. Only fall back to syntax checks if truly impractical.
+- **Smart edge cases**: Think about what could realistically break and test those scenarios.
+- **Integration awareness**: If you modified how components interact, verify the integration works end-to-end.
+
+FALLBACK RULES (only when isolated testing is truly impractical):
+- For modules with impossible-to-mock dependencies: `python -c "from module import changed_function; print('Import OK')"`
+- But strongly prefer functional verification over syntax-only checks
+
+EXAMPLES:
+- Web API endpoint: Write script that makes HTTP requests and verifies responses
+- Data processing function: Create test data, run the function, verify outputs
+- Class methods: Instantiate the class, call methods, verify behavior
+- File operations: Create temp files, run the operations, verify results
+- CLI tools: Execute with test arguments, verify exit codes and outputs
+
+OUTPUT: Name scripts clearly (`_verify_*.py`) and place in `/tmp` to avoid polluting the project.
+</functional_verification>"""
+
 _MOD_PHASE_DIRECT = """<workflow>
 Combine understanding, planning, and execution in one seamless flow:
 1. Check auto-context first — files and semantic results are already injected. Don't re-read what you already have.

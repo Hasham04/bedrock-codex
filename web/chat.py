@@ -247,13 +247,24 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         if not text or not text.strip():
             return None
         # Skip system-injected messages (any case)
-        if text.upper().startswith("[SYSTEM]"):
+        if text.upper().startswith("[SYSTEM]") or text.startswith("[SYSTEM —"):
+            return None
+        # Skip internal phase tracking and editor context
+        if text.startswith("<completed_phases>") or "<completed_phases>" in text:
+            return None
+        if text.startswith("**Phase ") and "— type:" in text:
+            return None
+        if text.startswith("[Editor context:") or "[Editor context:" in text:
             return None
         # Skip compressed / trimmed markers
         if "(earlier context compressed)" in text or "(earlier work trimmed)" in text:
             return None
         # Skip verification nudges
         if text.startswith("Verification pass") or text.startswith("Quick check"):
+            return None
+        if text.startswith("Quick verification") or text.startswith("[VERIFICATION FOR CURRENT"):
+            return None
+        if text.startswith("[Previous task verification"):
             return None
         if text.startswith("You have completed all plan steps"):
             return None
@@ -325,6 +336,12 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
             if role == "user":
                 if isinstance(content, str):
+                    # Detect guidance messages and replay with correct styling
+                    if "[USER GUIDANCE" in content and "]\n\n" in content:
+                        guidance_text = content.split("]\n\n", 1)[-1].strip()
+                        if guidance_text:
+                            await wsr.send_json({"type": "replay_guidance", "content": guidance_text})
+                            continue
                     cleaned = _strip_internal_replay_content(content)
                     if cleaned:
                         await wsr.send_json({"type": "replay_user", "content": cleaned})
@@ -332,7 +349,14 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     image_count = 0
                     for block in content:
                         if block.get("type") == "text":
-                            cleaned = _strip_internal_replay_content(block.get("text", ""))
+                            block_text = block.get("text", "")
+                            # Detect guidance messages inlined in tool results
+                            if "[USER GUIDANCE" in block_text and "]\n\n" in block_text:
+                                guidance_text = block_text.split("]\n\n", 1)[-1].strip()
+                                if guidance_text:
+                                    await wsr.send_json({"type": "replay_guidance", "content": guidance_text})
+                                continue
+                            cleaned = _strip_internal_replay_content(block_text)
                             if cleaned:
                                 await wsr.send_json({"type": "replay_user", "content": cleaned})
                         elif block.get("type") == "image":
@@ -465,6 +489,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
         elif event.type == "text":
             _current_text_buffer += (event.content or "")
         elif event.type in ("text_end", "done", "error", "cancelled"):
+            _current_text_buffer = ""
+        elif event.type == "guidance_interrupt":
+            _current_thinking_text = ""
             _current_text_buffer = ""
 
         msg: Dict[str, Any] = {"type": event.type}
@@ -652,10 +679,28 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             # ── Guidance (mid-task user correction) ─────────────────
             if msg_type == "guidance":
                 guidance_text = data.get("content", "").strip()
-                if guidance_text and _agent_task and not _agent_task.done():
+                if not guidance_text:
+                    continue
+                # Length limit
+                _MAX_GUIDANCE_LEN = 10_000
+                if len(guidance_text) > _MAX_GUIDANCE_LEN:
+                    await wsr.send_json({
+                        "type": "error",
+                        "content": f"Guidance too long ({len(guidance_text)} chars, max {_MAX_GUIDANCE_LEN}).",
+                    })
+                    continue
+                # Rate limit — at most one guidance message every 2 seconds
+                _GUIDANCE_COOLDOWN = 2.0
+                now = time.time()
+                if now - _state._last_guidance_time < _GUIDANCE_COOLDOWN:
+                    await wsr.send_json({"type": "info", "content": "Please wait before sending more guidance."})
+                    continue
+                _state._last_guidance_time = now
+
+                if _agent_task and not _agent_task.done():
                     agent.inject_guidance(guidance_text)
                     await wsr.send_json({"type": "guidance_queued", "content": guidance_text})
-                elif guidance_text:
+                else:
                     await wsr.send_json({"type": "info", "content": "No task is running. Send as a normal message instead."})
                 continue
 
@@ -788,8 +833,14 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     await wsr.send_json({"type": "info", "content": "Empty feedback — please provide details."})
                     continue
                 awaiting_build = False
+                # Use the original task, not accumulated feedback chains
                 original_task = pending_task or ""
+                # Strip any previous feedback annotations to avoid growing chains
+                if "\n\n[User feedback on plan]:" in original_task:
+                    original_task = original_task.split("\n\n[User feedback on plan]:")[0]
                 combined = f"{original_task}\n\n[User feedback on plan]: {feedback_text}"
+                pending_task = None  # Clear to prevent further accumulation
+                pending_plan = None
                 _cancel_ack_sent = False
                 _agent_task = asyncio.create_task(
                     _run_task_bg(combined, pending_images, editor_context=data.get("context"))
@@ -866,6 +917,20 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                 if _agent_task and not _agent_task.done():
                     await wsr.send_json({"type": "error", "content": "Agent is already running. Cancel first."})
                     continue
+
+                # If user sends a new task instead of clicking Keep/Revert,
+                # auto-keep the changes and dismiss the keep/revert state.
+                if awaiting_keep_revert:
+                    awaiting_keep_revert = False
+                    await wsr.send_json({"type": "clear_keep_revert"})
+
+                # If user sends a new task while plan Build/Feedback/Reject is pending,
+                # dismiss the plan gate (the new task supersedes it).
+                if awaiting_build:
+                    awaiting_build = False
+                    pending_task = None
+                    pending_plan = None
+                    pending_images = None
 
                 # Preserve snapshots whenever any exist so diffs stay cumulative
                 # across multiple plan/build/Keep cycles in the same session.
@@ -1341,13 +1406,13 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
 
         # ── Background file watcher ────────────────────────────
         _file_mtimes: Dict[str, float] = {}
-        async def _file_watcher():
-            """Lightweight polling watcher that detects external file changes."""
+        async def _file_watcher_local():
+            """Lightweight polling watcher that detects external file changes (local)."""
             POLL_INTERVAL = 3  # seconds
             IGNORE_DIRS = {".git", "node_modules", "__pycache__", ".bedrock-codex", ".venv", "venv"}
             try:
                 # Initial scan
-                for root, dirs, files in os.walk(wd):
+                for root, dirs, files in os.walk(agent_wd):
                     dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith(".")]
                     for fname in files[:200]:  # cap per directory
                         fpath = os.path.join(root, fname)
@@ -1360,7 +1425,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                     await asyncio.sleep(POLL_INTERVAL)
                     agent_busy = _agent_task is not None and not _agent_task.done()
                     changed = []
-                    for root, dirs, files in os.walk(wd):
+                    for root, dirs, files in os.walk(agent_wd):
                         dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith(".")]
                         for fname in files[:200]:
                             fpath = os.path.join(root, fname)
@@ -1370,7 +1435,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
                                 if prev is None or mtime > prev + 0.1:
                                     _file_mtimes[fpath] = mtime
                                     if not agent_busy and prev is not None:
-                                        changed.append(os.path.relpath(fpath, wd))
+                                        changed.append(os.path.relpath(fpath, agent_wd))
                             except OSError:
                                 pass
 
@@ -1384,9 +1449,65 @@ async def websocket_endpoint(ws: WebSocket, session_id: Optional[str] = None):
             except Exception:
                 pass  # watcher failure is non-fatal
 
-        # Only enable file watcher for local backends
+        async def _file_watcher_ssh():
+            """Polling watcher for SSH backends using remote `find -newer`."""
+            POLL_INTERVAL = 5  # slightly longer for SSH to reduce overhead
+            REF_FILE = ".bedrock-codex/.watcher_ref"
+            PRUNE = "-name .git -prune -o -name node_modules -prune -o -name __pycache__ -prune -o -name .venv -prune -o -name venv -prune -o"
+            try:
+                # Create the reference marker file on the remote
+                await asyncio.to_thread(
+                    backend.run_command,
+                    f"mkdir -p .bedrock-codex && touch {REF_FILE}", ".", 5,
+                )
+                # Let the ref file settle so first poll doesn't report everything
+                await asyncio.sleep(1)
+                await asyncio.to_thread(
+                    backend.run_command, f"touch {REF_FILE}", ".", 5,
+                )
+
+                while True:
+                    await asyncio.sleep(POLL_INTERVAL)
+                    agent_busy = _agent_task is not None and not _agent_task.done()
+                    if agent_busy:
+                        # Touch ref so agent edits don't flood on next poll
+                        await asyncio.to_thread(
+                            backend.run_command, f"touch {REF_FILE}", ".", 5,
+                        )
+                        continue
+
+                    out, _, rc = await asyncio.to_thread(
+                        backend.run_command,
+                        f"find . {PRUNE} -newer {REF_FILE} -type f -print 2>/dev/null | head -20",
+                        ".", 10,
+                    )
+                    # Touch ref immediately so next poll measures from now
+                    await asyncio.to_thread(
+                        backend.run_command, f"touch {REF_FILE}", ".", 5,
+                    )
+                    if rc != 0 or not out:
+                        continue
+
+                    changed = []
+                    for line in out.strip().splitlines():
+                        rel = line.strip().lstrip("./")
+                        if rel and not rel.startswith(".bedrock-codex/"):
+                            changed.append(rel)
+
+                    for rel in changed[:10]:
+                        try:
+                            await wsr.send_json({"type": "file_changed", "path": rel})
+                        except Exception:
+                            return
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                pass  # watcher failure is non-fatal
+
         if isinstance(backend, LocalBackend):
-            _watcher_task = asyncio.create_task(_file_watcher())
+            _watcher_task = asyncio.create_task(_file_watcher_local())
+        else:
+            _watcher_task = asyncio.create_task(_file_watcher_ssh())
 
         # ── Message loop ───────────────────────────────────────
         await _message_loop()

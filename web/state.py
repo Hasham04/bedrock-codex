@@ -33,6 +33,9 @@ _ssh_info: Optional[Dict[str, Any]] = None  # Saved SSH details for current conn
 # Shared agent reference so REST endpoints can access snapshots
 _active_agent: Optional[CodingAgent] = None
 
+# Rate-limit guidance submissions (timestamp of last accepted guidance)
+_last_guidance_time: float = 0.0
+
 # Directories/files to always skip in the file tree
 _IGNORE_DIRS = {
     ".git", "node_modules", "__pycache__", ".venv", "venv", "env",

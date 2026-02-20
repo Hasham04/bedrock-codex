@@ -29,18 +29,29 @@ def _extract_plan_title(plan_text: str) -> str:
         stripped = line.strip()
         if stripped.startswith("#"):
             title = stripped.lstrip("#").strip()
+            # Strip common boilerplate prefixes the LLM tends to add
             for prefix in [
                 "Implementation Plan:", "Implementation Plan —",
-                "Plan:", "Audit Findings:", "Audit:",
+                "Implementation Plan for", "Implementation Plan",
+                "Plan:", "Plan —", "Plan for",
+                "Audit Findings:", "Audit:",
+                "Phase 1:", "Step 1:",
+                "Summary:", "Overview:",
             ]:
                 if title.lower().startswith(prefix.lower()):
                     title = title[len(prefix):].strip().lstrip("—-:").strip()
                     break
-            return title[:80] if title else "Plan"
+            # Strip wrapping quotes or backticks
+            title = title.strip('"\'`')
+            if title:
+                return title[:80]
+    # Fallback: use first non-empty, non-tag line
     for line in plan_text.split("\n")[:5]:
         stripped = line.strip()
-        if stripped and not stripped.startswith("<"):
-            return stripped[:60]
+        if stripped and not stripped.startswith("<") and not stripped.startswith("```"):
+            cleaned = stripped.lstrip("#").strip().strip('"\'`')
+            if cleaned:
+                return cleaned[:60]
     return "Plan"
 
 

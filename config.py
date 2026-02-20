@@ -84,6 +84,8 @@ class AppConfig:
     deterministic_verification_gate: bool = os.getenv("DETERMINISTIC_VERIFICATION_GATE", "true").lower() == "true"
     # Run targeted tests in deterministic gate when test files are discovered
     deterministic_verification_run_tests: bool = os.getenv("DETERMINISTIC_VERIFICATION_RUN_TESTS", "true").lower() == "true"
+    # Always run intelligent functional verification to prove changes work correctly
+    verification_functional_testing: bool = os.getenv("VERIFICATION_FUNCTIONAL_TESTING", "true").lower() == "true"
     # Language/framework-aware verification orchestrator
     verification_orchestrator_enabled: bool = os.getenv("VERIFICATION_ORCHESTRATOR_ENABLED", "true").lower() == "true"
     # Human review gate before build execution starts

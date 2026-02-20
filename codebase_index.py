@@ -377,11 +377,9 @@ class CodebaseIndex:
                 try:
                     # Get current file mtime via backend
                     if hasattr(backend, 'stat'):
-                        stat = backend.stat(rel_path)
-                        current_mtime = stat.mtime if hasattr(stat, 'mtime') else stat.st_mtime
+                        st = backend.stat(rel_path)
+                        current_mtime = st.get("st_mtime", 0) if isinstance(st, dict) else getattr(st, "st_mtime", 0)
                     else:
-                        # Fallback for backends without stat method
-                        import os.path
                         abs_path = os.path.join(self.working_directory, rel_path)
                         current_mtime = os.path.getmtime(abs_path)
                     
@@ -506,16 +504,13 @@ class CodebaseIndex:
             # Track file modification time
             try:
                 if hasattr(backend, 'stat'):
-                    stat = backend.stat(rel)
-                    mtime = stat.mtime if hasattr(stat, 'mtime') else stat.st_mtime
+                    st = backend.stat(rel)
+                    mtime = st.get("st_mtime", 0) if isinstance(st, dict) else getattr(st, "st_mtime", 0)
                 else:
-                    import os.path
                     abs_path = os.path.join(self.working_directory, rel)
                     mtime = os.path.getmtime(abs_path)
                 self.file_mtimes[rel] = mtime
             except Exception:
-                # If we can't get mtime, store current time as fallback
-                import time
                 self.file_mtimes[rel] = time.time()
         # Drop chunks for files we're re-indexing
         reindex_paths = {p for p, _ in to_index}

@@ -12,7 +12,7 @@ from bedrock_service import GenerationConfig
 from config import app_config
 
 from .events import AgentEvent
-from .prompts import _format_build_system_prompt
+from .prompts import _format_build_system_prompt, _FUNCTIONAL_VERIFICATION
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,7 @@ class BuildMixin:
             self._file_snapshots = {}
         self._deterministic_verification_done = False
         self._verification_gate_attempts = 0
+        self._compact_stale_verification_messages()
         self._phase_summaries: List[str] = []
 
         saved_prompt = self.system_prompt
@@ -357,34 +358,55 @@ class BuildMixin:
         if len(modified) > 10:
             files_str += f" (+{len(modified) - 10} more)"
 
+        include_functional_verification = app_config.verification_functional_testing
+
         if is_trivial:
-            verify_msg = (
-                f"Quick verification — Modified files: {files_str}\n\n"
-                "Run lint_file on changed files. If clean, confirm the task is complete. "
-                "Do NOT re-implement or re-do anything — the task is done. "
-                "Just verify and report briefly."
-            )
-            max_extra_iters = 3
+            if include_functional_verification:
+                verify_msg = (
+                    "[VERIFICATION FOR CURRENT BUILD ONLY]\n"
+                    f"Quick verification — Modified files: {files_str}\n\n"
+                    "Run lint_file on changed files. Then write a quick functional verification:\n"
+                    "For simple changes, a focused test that proves the change works correctly.\n"
+                    "If the change is very minor, at minimum: "
+                    'python -c "from <module> import <changed_thing>; print(\'Import + basic usage OK\')"\n'
+                    "Confirm the task is complete."
+                )
+                max_extra_iters = 8
+            else:
+                verify_msg = (
+                    "[VERIFICATION FOR CURRENT BUILD ONLY]\n"
+                    f"Quick verification — Modified files: {files_str}\n\n"
+                    "Run lint_file on changed files. If clean, confirm the task is complete. "
+                    "Do NOT re-implement or re-do anything — the task is done. "
+                    "Just verify and report briefly."
+                )
+                max_extra_iters = 3
         else:
+            functional_section = _FUNCTIONAL_VERIFICATION if include_functional_verification else ""
+
             test_files_found = self._select_impacted_tests(modified)
-            test_section = ""
             if test_files_found:
                 test_section = (
                     f"\n\nImpacted tests selected:\n"
                     + "\n".join(f"  - {tf}" for tf in test_files_found[:10])
                     + "\nRun these impacted tests first, then run broader suite if needed."
                 )
+            else:
+                test_section = "\n\nNo existing tests found for the modified code."
 
             verify_msg = (
+                "[VERIFICATION FOR CURRENT BUILD ONLY]\n"
                 f"Verification pass — Modified files: {files_str}\n\n"
                 "1. Re-read each modified file and check for typos, missing imports, logic errors\n"
                 "2. Run lint_file on each changed file and fix any errors\n"
                 f"3. Run relevant tests if applicable{test_section}\n"
-                "4. Briefly confirm the task is complete or flag concerns\n\n"
+                "4. Write and run functional verification to prove your changes work correctly\n"
+                "5. Briefly confirm the task is complete or flag concerns\n\n"
+                f"{functional_section}\n"
                 "IMPORTANT: Do NOT re-implement anything. The task is done. "
-                "This is only a lint-and-review pass. If everything looks good, just say so and stop."
+                "This is a verification pass — lint, test, verify functionality, and confirm."
             )
-            max_extra_iters = 8
+            max_extra_iters = 20 if include_functional_verification else 8
 
         self.history.append({"role": "user", "content": verify_msg})
         self._deterministic_verification_done = True
@@ -415,6 +437,7 @@ class BuildMixin:
             self._file_snapshots = {}
         self._deterministic_verification_done = False
         self._verification_gate_attempts = 0
+        self._compact_stale_verification_messages()
 
         if len(self.history) > 0 and self._detect_context_loss_risk(task):
             await on_event(AgentEvent(
@@ -448,6 +471,32 @@ class BuildMixin:
         self.history.append({"role": "user", "content": self._compose_user_content(user_content, user_images)})
 
         await self._agent_loop(on_event, request_approval, config, request_question_answer=request_question_answer)
+
+    def _compact_stale_verification_messages(self):
+        """Replace verbose verification messages from prior tasks with a compact note.
+
+        Called at the start of run() and run_build() so the model doesn't confuse
+        previous-task verification results with the new task.
+        """
+        markers = (
+            "[SYSTEM — VERIFICATION",
+            "[SYSTEM] Verification complete",
+            "[SYSTEM] Verification found issues",
+            "[VERIFICATION FOR CURRENT BUILD ONLY]",
+            "Verification pass —",
+            "Quick verification —",
+        )
+        for i, msg in enumerate(self.history):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            if any(content.startswith(m) for m in markers):
+                self.history[i] = {
+                    "role": "user",
+                    "content": "[Previous task verification — completed. Ignore for current task.]",
+                }
 
     def _extract_assistant_text(self, assistant_content: List[Dict[str, Any]]) -> str:
         """Concatenate assistant text blocks for lightweight output validation."""

@@ -321,10 +321,12 @@
             $input.disabled = false;
             if (running) {
                 $input.placeholder = "Guide the agent\u2026 (Enter to send correction)";
+                $input.setAttribute("aria-label", "Guide the running agent");
                 var wrapper = $input.closest(".chat-input-wrapper");
                 if (wrapper) wrapper.classList.add("guidance-mode");
             } else {
                 $input.placeholder = "Ask anything\u2026 (@ to mention files) (Enter to send)";
+                $input.setAttribute("aria-label", "Message input");
                 var wrapper2 = $input.closest(".chat-input-wrapper");
                 if (wrapper2) wrapper2.classList.remove("guidance-mode");
                 $input.focus();
